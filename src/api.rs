@@ -117,6 +117,7 @@ pub fn router(bot: Arc<Bot>, cfg: AdminConfig) -> Router {
             get(|| async { Json(json!({"ts": now_ms(), "exchanges": {}})) }),
         )
         .route("/discovery", get(discovery))
+        .route("/discovery/refresh", axum::routing::post(discovery_refresh))
         .route("/market", get(market))
         .route("/strategies", get(strategies))
         .route("/arbitrage", get(arbitrage))
@@ -322,14 +323,8 @@ fn status_json(bot: &Bot) -> Value {
     Value::Object(m)
 }
 
-fn discovery_json(_bot: &Bot) -> Value {
-    json!({
-        "status": "Подбор тикеров в Rust-бэкенде ещё не реализован",
-        "running": false,
-        "refreshSeconds": 0,
-        "chosenExchanges": [],
-        "availableExchanges": data::exchange_ids().into_iter().filter(|x| x != "uniswapv2").collect::<Vec<_>>(),
-    })
+fn discovery_json(bot: &Bot) -> Value {
+    bot.discovery_json()
 }
 
 fn topic_json(bot: &Bot, topic: &str) -> Option<Value> {
@@ -350,6 +345,13 @@ async fn control_status(State(a): State<App>) -> Json<Value> {
 
 async fn status(State(a): State<App>) -> Json<Value> {
     Json(status_json(&a.bot))
+}
+
+async fn discovery_refresh(State(a): State<App>) -> Result<Json<Value>, ApiError> {
+    a.bot.discovery_refresh().map_err(bad)?;
+    Ok(Json(
+        json!({"результат": "ок", "сообщение": "Пересчёт запущен"}),
+    ))
 }
 
 async fn discovery(State(a): State<App>) -> Json<Value> {

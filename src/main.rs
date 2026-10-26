@@ -14,6 +14,7 @@ mod live;
 mod market;
 mod paper;
 mod rest;
+mod screener;
 mod signed;
 mod spotarb;
 mod spread;
@@ -56,6 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let bot = Arc::new(state::Bot::load(env("STATE_FILE", "state.json").into()));
+    bot.spawn_screener();
     let addr: SocketAddr = format!("{bind}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("Админка: http://{addr}/control/status (заголовок X-Admin-Token)");

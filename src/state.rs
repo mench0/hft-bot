@@ -55,6 +55,9 @@ pub struct Bot {
     statarbs: Mutex<HashMap<String, crate::statarb::StatArb>>,
     /// Межбиржевой арбитраж на споте (один на процесс).
     spotarb: Mutex<crate::spotarb::SpotArb>,
+    /// Скринер (подбор тикеров).
+    pub screener: Arc<Mutex<crate::screener::Screener>>,
+    pub screener_sources: crate::screener::Sources,
     /// Последнее учтённое время funding по (биржа, символ).
     funding_applied: Mutex<HashMap<(String, String), u64>>,
 }
@@ -106,6 +109,8 @@ impl Bot {
             spreads: Mutex::default(),
             statarbs: Mutex::default(),
             spotarb: Mutex::default(),
+            screener: Arc::default(),
+            screener_sources: crate::screener::Sources::default(),
             funding_applied: Mutex::default(),
         };
         bot.persist();
@@ -638,6 +643,96 @@ impl Bot {
             })
             .collect();
         self.spotarb.lock().unwrap().step(&mut venues, &sp, now);
+    }
+
+    /// Биржи подбора (discoveryExchanges) и период автопересчёта.
+    fn discovery_settings(&self) -> (Vec<String>, u64) {
+        let st = self.settings();
+        let chosen = st
+            .get("discoveryExchanges")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .split(',')
+            .map(|x| x.trim().to_lowercase())
+            .filter(|x| !x.is_empty())
+            .collect();
+        let sec = st
+            .get("discoveryRefreshSec")
+            .and_then(|v| {
+                v.as_f64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
+            .unwrap_or(0.0) as u64;
+        (chosen, sec)
+    }
+
+    /// Ответ /discovery.
+    pub fn discovery_json(&self) -> Value {
+        let (chosen, sec) = self.discovery_settings();
+        self.screener.lock().unwrap().json(&chosen, sec)
+    }
+
+    /// Запустить пересчёт подбора в фоне; false — уже идёт или биржи не выбраны.
+    pub fn discovery_refresh(&self) -> ActionResult<()> {
+        let (chosen, sec) = self.discovery_settings();
+        if chosen.is_empty() {
+            return Err("Сначала выберите биржи для подбора (discoveryExchanges)".into());
+        }
+        {
+            let mut s = self.screener.lock().unwrap();
+            if s.running {
+                return Err("Пересчёт уже идёт".into());
+            }
+            s.running = true;
+        }
+        let (scr, src, p) = (
+            self.screener.clone(),
+            self.screener_sources.clone(),
+            crate::screener::Params::from(&self.settings()),
+        );
+        tokio::spawn(async move {
+            let t0 = std::time::Instant::now();
+            let (ex, strategies) = crate::screener::run(&src, &chosen, &p).await;
+            let mut s = scr.lock().unwrap();
+            s.exchanges = ex;
+            s.strategies = strategies;
+            s.running = false;
+            s.duration_ms = t0.elapsed().as_millis() as u64;
+            s.updated_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            s.next_at = (sec > 0).then(|| s.updated_at + sec * 1000);
+            tracing::info!("[screener] пересчёт за {} мс", s.duration_ms);
+        });
+        Ok(())
+    }
+
+    /// Автопересчёт подбора (discoveryRefreshSec): проверка раз в секунду.
+    pub fn spawn_screener(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                let Some(bot) = weak.upgrade() else { return };
+                let (chosen, sec) = bot.discovery_settings();
+                if sec == 0 || chosen.is_empty() {
+                    continue;
+                }
+                let due = {
+                    let s = bot.screener.lock().unwrap();
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    !s.running && s.updated_at + sec * 1000 <= now
+                };
+                if due {
+                    let _ = bot.discovery_refresh();
+                }
+            }
+        });
     }
 
     /// Межбиржевые стратегии для /arbitrage (как в Java): spotPrice — арбитраж на споте; перп-арбитража и
