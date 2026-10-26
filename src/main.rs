@@ -32,6 +32,7 @@ mod spread;
 mod statarb;
 mod state;
 mod transfer;
+mod upbit_api;
 mod util;
 
 use std::net::SocketAddr;

@@ -2008,6 +2008,234 @@ mod tests {
         call(&r, "POST", "/control/stop", "").await;
     }
 
+    /// Живой спот Upbit за USDT против макета: JWT (HS256, query_hash SHA512) в REST и в рукопожатии потока,
+    /// рыночная покупка на сумму, шаг цены лимитного ордера, myOrder по identifier, готовность по {"status":"UP"}.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::result_large_err)] // колбэк рукопожатия tungstenite
+    async fn live_upbit_spot_against_mock() {
+        use axum::extract::RawQuery;
+        use axum::http::HeaderMap;
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::Mutex;
+        use tokio_tungstenite::tungstenite::Message;
+        const SECRET: &str = "up-secret";
+        #[derive(Default)]
+        struct Ex {
+            orders: Vec<Value>,
+            bad: u32,
+            bought: f64,
+        }
+        let ex = Arc::new(Mutex::new(Ex::default()));
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        // JWT: подпись HMAC-SHA256 и query_hash = SHA512 строки параметров
+        fn ok(h: &HeaderMap, query: &str) -> bool {
+            use hmac::Mac;
+            use sha2::Digest;
+            let Some(t) = h
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+            else {
+                return false;
+            };
+            let p: Vec<&str> = t.split('.').collect();
+            let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(SECRET.as_bytes()).unwrap();
+            mac.update(format!("{}.{}", p[0], p[1]).as_bytes());
+            // base64url без выравнивания
+            let dec = |s: &str| -> Vec<u8> {
+                const A: &[u8] =
+                    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+                let (mut out, mut acc, mut bits) = (Vec::new(), 0u32, 0);
+                for c in s.bytes() {
+                    acc = acc << 6 | A.iter().position(|&x| x == c).unwrap() as u32;
+                    bits += 6;
+                    if bits >= 8 {
+                        bits -= 8;
+                        out.push((acc >> bits) as u8);
+                    }
+                }
+                out
+            };
+            let enc = |b: &[u8]| {
+                crate::util::base64(b)
+                    .trim_end_matches('=')
+                    .replace('+', "-")
+                    .replace('/', "_")
+            };
+            let body: Value = serde_json::from_slice(&dec(p[1])).unwrap();
+            let qh = if query.is_empty() {
+                Value::Null
+            } else {
+                json!(hex::encode(sha2::Sha512::digest(query.as_bytes())))
+            };
+            enc(&mac.finalize().into_bytes()) == p[2]
+                && body["access_key"] == "up-key"
+                && body["query_hash"] == qh
+        }
+        let (e1, e2) = (ex.clone(), ex.clone());
+        let rest = Router::new()
+            .route("/v1/orderbook/instruments", get(|| async { Json(json!([{"market": "USDT-X", "tick_size": "0.001"}])) }))
+            .route("/v1/accounts", get(move |h: HeaderMap| async move {
+                let mut x = e1.lock().unwrap();
+                if !ok(&h, "") { x.bad += 1; }
+                Json(json!([{"currency": "USDT", "balance": "1000", "locked": "0"}, {"currency": "X", "balance": format!("{}", x.bought), "locked": "0"}]))
+            }))
+            .route("/v1/orders", axum::routing::post(move |h: HeaderMap, Json(b): Json<Value>| async move {
+                let mut x = e2.lock().unwrap();
+                // query_hash — по параметрам в порядке тела
+                let q: Vec<String> = b.as_object().unwrap().iter().map(|(k, v)| format!("{k}={}", v.as_str().unwrap())).collect();
+                if !ok(&h, &q.join("&")) { x.bad += 1; }
+                let n = x.orders.len();
+                if b["ord_type"] == "price" {
+                    x.bought += 2.0;
+                    let _ = ev_tx.send(json!({"type": "myOrder", "code": "USDT-X", "uuid": "u0", "identifier": b["identifier"], "state": "done",
+                        "executed_volume": 2, "executed_funds": 20}).to_string());
+                }
+                x.orders.push(b);
+                Json(json!({"uuid": format!("u{n}"), "state": "wait", "executed_volume": "0"}))
+            }))
+            .route("/v1/order", get(|RawQuery(q): RawQuery| async move {
+                let q = q.unwrap_or_default();
+                Json(if q == "uuid=u0" {
+                    json!({"uuid": "u0", "state": "done", "executed_volume": "2", "executed_funds": "20"})
+                } else {
+                    json!({"uuid": "u1", "state": "wait", "executed_volume": "0"})
+                })
+            }));
+        let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let raddr = rl.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(rl, rest).await.unwrap() });
+        let wl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let waddr = wl.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = wl.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            for _ in 1..500u64 {
+                let m = br#"{"type":"orderbook","code":"USDT-X","timestamp":9,"orderbook_units":[{"ask_price":10,"bid_price":9.99,"ask_size":100,"bid_size":100}]}"#;
+                if ws.send(Message::binary(m.to_vec())).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            loop {
+                let _ = wl.accept().await;
+            }
+        });
+        let seen = Arc::new(Mutex::new((false, String::new())));
+        let sn = seen.clone();
+        let sl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let saddr = sl.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = sl.accept().await.unwrap();
+            let sn2 = sn.clone();
+            let cb = move |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                           resp| {
+                sn2.lock().unwrap().0 = ok(req.headers(), "");
+                Ok(resp)
+            };
+            let mut ws = tokio_tungstenite::accept_hdr_async(tcp, cb).await.unwrap();
+            if let Some(Ok(Message::Text(t))) = ws.next().await {
+                sn.lock().unwrap().1 = t.to_string();
+            }
+            ws.send(Message::binary(br#"{"status":"UP"}"#.to_vec()))
+                .await
+                .unwrap();
+            while let Some(e) = ev_rx.recv().await {
+                if ws.send(Message::binary(e.into_bytes())).await.is_err() {
+                    break;
+                }
+            }
+            loop {
+                let _ = sl.accept().await;
+            }
+        });
+        crate::util::set_env("UPBIT_STREAM_URL", &format!("ws://{saddr}/"));
+        crate::util::set_env("UPBIT_API_KEY", "up-key");
+        crate::util::set_env("UPBIT_API_SECRET", SECRET);
+        let (_d, r) = app("");
+        let sel = format!(
+            "/control/select?exchange=upbit&symbols=XUSDT&live=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
+        );
+        assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
+        call(&r, "POST", "/control/start", "").await;
+        call(&r, "POST", "/trading/start", "").await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let (_, b) = call(&r, "GET", "/balances?exchange=upbit", "").await;
+            let (_, s) = call(&r, "GET", "/status", "").await;
+            let (_, m) = call(&r, "GET", "/market?exchange=upbit", "").await;
+            if b["свободно"]["USDT"] == json!(1000.0)
+                && s["upbit"]["поток_событий_счёта"] == json!(true)
+                && m["XUSDT"]["лучший_аск"].is_number()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "баланс, поток или стакан: {b} {s} {m}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let (c, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=upbit&symbol=XUSDT&side=BUY&type=MARKET&qty=2",
+            "",
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let (_, a) = call(&r, "GET", "/status", "").await;
+            if a["upbit"]["событий_счёта"].as_u64().unwrap_or(0) >= 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "событие не учтено: {a}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let (c, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=upbit&symbol=XUSDT&side=SELL&type=LIMIT&qty=1&price=11.12345",
+            "",
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        while ex.lock().unwrap().orders.len() < 2 {
+            assert!(
+                tokio::time::Instant::now() < until,
+                "лимитный ордер не дошёл"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let x = ex.lock().unwrap();
+        assert_eq!(x.bad, 0, "все подписи верны");
+        // рыночная покупка — на сумму 2 × 10 × 1.005; лимит — по шагу цены 0.001
+        assert_eq!(
+            x.orders[0],
+            json!({"market": "USDT-X", "side": "bid", "price": "20.1", "ord_type": "price", "identifier": x.orders[0]["identifier"]})
+        );
+        assert_eq!(
+            (
+                x.orders[1]["side"].as_str(),
+                x.orders[1]["price"].as_str(),
+                x.orders[1]["volume"].as_str()
+            ),
+            (Some("ask"), Some("11.123"), Some("1"))
+        );
+        let seen = seen.lock().unwrap();
+        assert!(seen.0, "JWT в рукопожатии потока");
+        assert!(
+            seen.1.contains("myOrder") && seen.1.contains("myAsset"),
+            "{}",
+            seen.1
+        );
+    }
+
     /// Живой спот LBank против макета: подпись (MD5 → HMAC-SHA256, служебные поля в заголовках), рыночная покупка на
     /// сумму, ключ подписки, поток orderUpdate по customerID, pong на ping сервера.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

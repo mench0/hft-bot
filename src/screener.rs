@@ -356,7 +356,8 @@ impl Sources {
             "bybit" => format!("{base}/v5/market/tickers?category=spot"),
             "okx" => format!("{base}/api/v5/market/tickers?instType=SPOT"),
             "gate" => format!("{base}/api/v4/spot/tickers"),
-            "upbit" => format!("{base}/v1/ticker/all?quote_currencies=KRW,BTC,USDT"),
+            // торговля на Upbit — за USDT (KRW нужен только для поиска листингов)
+            "upbit" => format!("{base}/v1/ticker/all?quote_currencies=USDT"),
             "lbank" => format!("{base}/v2/ticker/24hr.do?symbol=all"),
             _ => return Err(format!("{ex}: сводок в Rust-скринере нет")),
         };

@@ -495,6 +495,7 @@ pub enum Venue {
     Mexc(crate::mexc_api::Client),
     Hyperliquid(crate::hyperliquid_api::Client),
     Lbank(crate::lbank_api::Client),
+    Upbit(crate::upbit_api::Client),
 }
 
 impl Venue {
@@ -510,6 +511,7 @@ impl Venue {
             Venue::Mexc(c) => c.sync_time().await,
             Venue::Hyperliquid(c) => c.sync_time().await,
             Venue::Lbank(c) => c.sync_time().await,
+            Venue::Upbit(c) => c.sync_time().await,
         }
     }
     async fn place(
@@ -528,6 +530,7 @@ impl Venue {
             Venue::Mexc(c) => c.place(local, symbol, side, qty, price).await,
             Venue::Hyperliquid(c) => c.place(local, symbol, side, qty, price, ref_px).await,
             Venue::Lbank(c) => c.place(local, symbol, side, qty, price, ref_px).await,
+            Venue::Upbit(c) => c.place(local, symbol, side, qty, price, ref_px).await,
             Venue::Binance(c) => c.place(local, symbol, side, qty, price).await,
             Venue::Bybit(c) => c.place(local, symbol, side, qty, price).await,
             Venue::Aster(c) => c.place(local, symbol, side, qty, price).await,
@@ -546,6 +549,7 @@ impl Venue {
             Venue::Mexc(c) => c.query(symbol, id).await,
             Venue::Hyperliquid(c) => c.query(symbol, id).await,
             Venue::Lbank(c) => c.query(symbol, id).await,
+            Venue::Upbit(c) => c.query(symbol, id).await,
         }
     }
     async fn cancel(&self, symbol: &str, id: &str) -> Result<OrderState, String> {
@@ -560,6 +564,7 @@ impl Venue {
             Venue::Mexc(c) => c.cancel(symbol, id).await,
             Venue::Hyperliquid(c) => c.cancel(symbol, id).await,
             Venue::Lbank(c) => c.cancel(symbol, id).await,
+            Venue::Upbit(c) => c.cancel(symbol, id).await,
         }
     }
     fn perp(&self) -> bool {
@@ -573,7 +578,7 @@ impl Venue {
             Venue::Bingx(c) => c.perp,
             Venue::Mexc(c) => c.perp,
             Venue::Hyperliquid(c) => c.perp,
-            Venue::Lbank(_) => false,
+            Venue::Lbank(_) | Venue::Upbit(_) => false,
         }
     }
     async fn positions(&self) -> Result<Vec<(String, f64, f64)>, String> {
@@ -587,7 +592,7 @@ impl Venue {
             Venue::Bingx(c) => c.positions().await,
             Venue::Mexc(c) => c.positions().await,
             Venue::Hyperliquid(c) => c.positions().await,
-            Venue::Lbank(_) => Ok(Vec::new()),
+            Venue::Lbank(_) | Venue::Upbit(_) => Ok(Vec::new()),
         }
     }
     async fn set_leverage(&self, symbol: &str, lev: f64) -> Result<(), String> {
@@ -601,7 +606,7 @@ impl Venue {
             Venue::Bingx(c) => c.set_leverage(symbol, lev).await,
             Venue::Mexc(c) => c.set_leverage(symbol, lev).await,
             Venue::Hyperliquid(c) => c.set_leverage(symbol, lev).await,
-            Venue::Lbank(_) => Ok(()),
+            Venue::Lbank(_) | Venue::Upbit(_) => Ok(()),
         }
     }
     async fn networks(&self, coin: &str) -> Result<Vec<crate::transfer::Net>, String> {
@@ -644,6 +649,7 @@ impl Venue {
             Venue::Mexc(c) => c.balances().await,
             Venue::Hyperliquid(c) => c.balances().await,
             Venue::Lbank(c) => c.balances().await,
+            Venue::Upbit(c) => c.balances().await,
         }
     }
 }
@@ -786,6 +792,7 @@ impl Venue {
             Venue::Bingx(c) => c.stream_url().await,
             Venue::Mexc(c) => c.stream_url().await,
             Venue::Lbank(c) => c.stream_url().await,
+            Venue::Upbit(_) => Ok(crate::upbit_api::stream_url()),
             Venue::Hyperliquid(_) => Ok(crate::hyperliquid_api::stream_url(testnet)),
             Venue::Aster(c) => {
                 let k = c
@@ -815,8 +822,26 @@ impl Venue {
             Venue::Mexc(c) => Some(c.hello()),
             Venue::Hyperliquid(c) => Some(c.hello()),
             Venue::Lbank(c) => Some(c.hello()),
+            Venue::Upbit(c) => Some(c.hello()),
             _ => None,
         }
+    }
+
+    /// Запрос подключения потока: Upbit — с JWT в заголовке Authorization.
+    fn stream_request(
+        &self,
+        url: &str,
+    ) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request, String> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut r = url.into_client_request().map_err(|e| e.to_string())?;
+        if let Venue::Upbit(c) = self {
+            let h = c
+                .auth("")
+                .parse()
+                .map_err(|_| "JWT не годится для заголовка".to_owned())?;
+            r.headers_mut().insert("Authorization", h);
+        }
+        Ok(r)
     }
 
     /// Пинг приложения раз в 20 с.
@@ -828,6 +853,7 @@ impl Venue {
             Venue::Kucoin(c) => Some(c.ping()),
             Venue::Mexc(c) => Some(c.ping()),
             Venue::Lbank(c) => Some(c.ping()),
+            Venue::Upbit(_) => Some("PING".into()),
             Venue::Hyperliquid(_) => Some(r#"{"method":"ping"}"#.into()),
             _ => None,
         }
@@ -857,6 +883,9 @@ impl Venue {
             return c.stream_parse(text);
         }
         if let Venue::Lbank(c) = self {
+            return c.stream_parse(text);
+        }
+        if let Venue::Upbit(c) = self {
             return c.stream_parse(text);
         }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
@@ -987,10 +1016,14 @@ async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) 
         };
         let mut pings = 0u32;
         // зависшее рукопожатие не держит поток вечно
-        let conn = match tokio::time::timeout(
-            Duration::from_secs(10),
-            tokio_tungstenite::connect_async(url.as_str()),
-        )
+        let conn = match tokio::time::timeout(Duration::from_secs(10), async {
+            match venue.stream_request(&url) {
+                Ok(r) => tokio_tungstenite::connect_async(r).await,
+                Err(e) => Err(tokio_tungstenite::tungstenite::Error::Io(
+                    std::io::Error::other(e),
+                )),
+            }
+        })
         .await
         {
             Ok(c) => c,

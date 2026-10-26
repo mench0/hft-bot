@@ -126,6 +126,10 @@
 - **Реальные ордера LBank** (спот): POST формой, подпись — параметры по алфавиту → MD5 (заглавные) → HMAC-SHA256,
   timestamp/signature_method/echostr ещё и в заголовках; рыночная покупка — на сумму (объём × опорная × 1.005);
   поток по ключу подписки (продлевается) — orderUpdate и assetUpdate. Ключи LBANK_API_KEY/LBANK_API_SECRET. Проверено на заглушках.
+- **Реальные ордера Upbit** (спот за USDT, рынки USDT-XXX; KRW — только для поиска листингов): JWT HS256 с query_hash
+  (SHA512 параметров) в Authorization; рыночная покупка на сумму (ord_type=price), цена лимита — по tick_size из
+  /v1/orderbook/instruments; приватный поток /websocket/v1/private (JWT в рукопожатии) — myOrder и myAsset. Ключи UPBIT_API_KEY/
+  UPBIT_API_SECRET. Проверено на заглушках.
 - **Перпы (USDT)** — параметр `market=perp`, плечо — `leverage`. Бумага: лонг и шорт, изолированная маржа, комиссии
   перпов из каталога, funding по ставке биржи в момент списания (ставки — Binance `/fapi/v1/premiumIndex`, Bybit
   `/v5/market/tickers`, раз в 30 с; видны в `/market` как `funding_проц`), ликвидация при марже ниже 0.5% объёма.
