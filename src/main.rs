@@ -7,6 +7,7 @@
 mod account;
 mod api;
 mod aster_api;
+mod bingx_api;
 mod book;
 mod bybit_api;
 mod data;

@@ -15,6 +15,19 @@ pub fn default_url(perp: bool, testnet: bool) -> &'static str {
     }
 }
 
+/// Кадр gzip в текст; несжатый — как есть.
+pub fn gunzip(data: &[u8]) -> Option<String> {
+    if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
+        let mut s = String::new();
+        flate2::read::GzDecoder::new(data)
+            .read_to_string(&mut s)
+            .ok()?;
+        Some(s)
+    } else {
+        String::from_utf8(data.to_vec()).ok()
+    }
+}
+
 pub struct Bingx {
     url: String,
     perp: bool,
@@ -59,15 +72,7 @@ impl Dialect for Bingx {
     }
 
     fn binary(&self, data: &[u8]) -> Option<String> {
-        if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
-            let mut s = String::new();
-            flate2::read::GzDecoder::new(data)
-                .read_to_string(&mut s)
-                .ok()?;
-            Some(s)
-        } else {
-            String::from_utf8(data.to_vec()).ok()
-        }
+        gunzip(data)
     }
 
     fn reply(&self, text: &str) -> Option<String> {

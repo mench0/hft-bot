@@ -112,6 +112,10 @@
   ключи `KUCOIN_API_KEY`/`_SECRET` и `KUCOIN_PASSPHRASE`; перпы — XBTUSDTM, целые лоты (× multiplier), CROSS, плечо в
   каждом ордере. Поток: токен bullet-private, подписки после welcome (спот — tradeOrdersV2 и balance; перпы — tradeOrders,
   positionAll, wallet); средняя цена — по сделкам match (`KUCOIN_WS_PRIVATE_URL` — свой адрес).
+- **Реальные ордера BingX** (спот и перпы USDT-M): ключ X-BX-APIKEY, подпись hex(HMAC-SHA256) параметров по алфавиту,
+  ключи `BINGX_API_KEY`/`_SECRET`; перпы — positionSide=BOTH, объём в монетах. Поток по listenKey, кадры gzip: спот —
+  подписка spot.executionReport, перпы — ORDER_TRADE_UPDATE и ACCOUNT_UPDATE; пинг сервера Ping → Pong
+  (`BINGX_STREAM_URL` — свой адрес без ключа).
 - **Перпы (USDT)** — параметр `market=perp`, плечо — `leverage`. Бумага: лонг и шорт, изолированная маржа, комиссии
   перпов из каталога, funding по ставке биржи в момент списания (ставки — Binance `/fapi/v1/premiumIndex`, Bybit
   `/v5/market/tickers`, раз в 30 с; видны в `/market` как `funding_проц`), ликвидация при марже ниже 0.5% объёма.

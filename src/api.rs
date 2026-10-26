@@ -2008,6 +2008,200 @@ mod tests {
         call(&r, "POST", "/control/stop", "").await;
     }
 
+    /// Живые перпы BingX против макета: подпись (параметры по алфавиту), positionSide=BOTH, плечо, поток по listenKey
+    /// с кадрами gzip (ORDER_TRADE_UPDATE, ACCOUNT_UPDATE), ответ Pong на пинг сервера.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_bingx_perp_against_mock() {
+        use axum::extract::RawQuery;
+        use axum::http::HeaderMap;
+        use futures_util::{SinkExt, StreamExt};
+        use std::io::Write;
+        use std::sync::Mutex;
+        use tokio_tungstenite::tungstenite::Message;
+        const SECRET: &str = "bx-secret";
+        #[derive(Default)]
+        struct Ex {
+            orders: Vec<String>,
+            leverage: Vec<String>,
+            bad: u32,
+            pos: f64,
+        }
+        let ex = Arc::new(Mutex::new(Ex::default()));
+        // подпись — по строке до &signature=, параметры по алфавиту
+        fn ok(q: &str, h: &HeaderMap) -> bool {
+            let (body, sig) = q.rsplit_once("&signature=").unwrap_or((q, ""));
+            let keys: Vec<&str> = body
+                .split('&')
+                .map(|kv| kv.split('=').next().unwrap())
+                .collect();
+            let mut sorted = keys.clone();
+            sorted.sort();
+            h.get("x-bx-apikey").is_some_and(|k| k == "bx-key")
+                && keys == sorted
+                && crate::signed::sign(SECRET, body) == sig
+        }
+        fn param(q: &str, k: &str) -> Option<String> {
+            q.split('&').find_map(|kv| {
+                kv.split_once('=')
+                    .filter(|(a, _)| *a == k)
+                    .map(|(_, v)| v.to_owned())
+            })
+        }
+        let (e1, e2, e3, e4, e5) = (ex.clone(), ex.clone(), ex.clone(), ex.clone(), ex.clone());
+        let rest = Router::new()
+            .route("/openApi/swap/v2/server/time", get(|| async { Json(json!({"code": 0, "data": {"serverTime": now_ms()}})) }))
+            .route("/openApi/swap/v2/user/balance", get(move |RawQuery(q): RawQuery, h: HeaderMap| async move {
+                if !ok(&q.unwrap_or_default(), &h) { e1.lock().unwrap().bad += 1; }
+                Json(json!({"code": 0, "data": {"balance": {"asset": "USDT", "balance": "1000", "availableMargin": "1000"}}}))
+            }))
+            .route("/openApi/swap/v2/user/positions", get(move |RawQuery(q): RawQuery, h: HeaderMap| async move {
+                let x = e2.lock().unwrap();
+                let _ = ok(&q.unwrap_or_default(), &h);
+                Json(json!({"code": 0, "data": [{"symbol": "BTC-USDT", "positionSide": "BOTH", "positionAmt": format!("{}", x.pos), "avgPrice": "100"}]}))
+            }))
+            .route("/openApi/swap/v2/trade/leverage", axum::routing::post(move |RawQuery(q): RawQuery, h: HeaderMap| async move {
+                let q = q.unwrap_or_default();
+                let mut x = e3.lock().unwrap();
+                if !ok(&q, &h) { x.bad += 1; }
+                x.leverage.push(format!("{}:{}", param(&q, "side").unwrap(), param(&q, "leverage").unwrap()));
+                Json(json!({"code": 0, "data": {}}))
+            }))
+            .route("/openApi/swap/v2/trade/order", axum::routing::post(move |RawQuery(q): RawQuery, h: HeaderMap| async move {
+                let q = q.unwrap_or_default();
+                let mut x = e4.lock().unwrap();
+                if !ok(&q, &h) { x.bad += 1; }
+                let qty: f64 = param(&q, "quantity").unwrap().parse().unwrap();
+                x.pos += if param(&q, "side").as_deref() == Some("SELL") { -qty } else { qty };
+                x.orders.push(q);
+                Json(json!({"code": 0, "data": {"order": {"orderId": 777, "status": "FILLED", "executedQty": format!("{qty}"), "avgPrice": "100"}}}))
+            }).get(move |RawQuery(q): RawQuery, h: HeaderMap| async move {
+                let _ = ok(&q.unwrap_or_default(), &h);
+                let _ = &e5;
+                Json(json!({"code": 0, "data": {"order": {"orderId": 777, "status": "FILLED", "executedQty": "0.5", "avgPrice": "100"}}}))
+            }))
+            .route("/openApi/user/auth/userDataStream", axum::routing::post(|h: HeaderMap| async move {
+                assert_eq!(h.get("x-bx-apikey").unwrap(), "bx-key");
+                Json(json!({"listenKey": "bx1"}))
+            }));
+        let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let raddr = rl.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(rl, rest).await.unwrap() });
+        let gz = |t: String| {
+            let mut g = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            g.write_all(t.as_bytes()).unwrap();
+            g.finish().unwrap()
+        };
+        let wl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let waddr = wl.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = wl.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            for _ in 1..500u64 {
+                let m = r#"{"code":0,"dataType":"BTC-USDT@depth20@500ms","data":{"bids":[["99.9","100"]],"asks":[["100","100"]]}}"#.to_string();
+                if ws.send(Message::binary(gz(m))).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            loop {
+                let _ = wl.accept().await;
+            }
+        });
+        // поток: путь ?listenKey=bx1, пинг сервера — ждём Pong, затем события
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let pong = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pg = pong.clone();
+        let sl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let saddr = sl.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = sl.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.send(Message::binary(gz("Ping".into()))).await.unwrap();
+            if let Some(Ok(Message::Text(t))) = ws.next().await {
+                pg.store(t.as_str() == "Pong", std::sync::atomic::Ordering::SeqCst);
+            }
+            while let Some(e) = ev_rx.recv().await {
+                if ws.send(Message::binary(gz(e))).await.is_err() {
+                    break;
+                }
+            }
+            loop {
+                let _ = sl.accept().await;
+            }
+        });
+        crate::util::set_env("BINGX_STREAM_URL", &format!("ws://{saddr}/"));
+        crate::util::set_env("BINGX_TESTNET_API_KEY", "bx-key");
+        crate::util::set_env("BINGX_TESTNET_API_SECRET", SECRET);
+        let (_d, r) = app("");
+        let sel = format!(
+            "/control/select?exchange=bingx&symbols=BTCUSDT&market=perp&leverage=4&testnet=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
+        );
+        assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
+        call(&r, "POST", "/control/start", "").await;
+        call(&r, "POST", "/trading/start", "").await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let (_, b) = call(&r, "GET", "/balances?exchange=bingx", "").await;
+            let (_, s) = call(&r, "GET", "/status", "").await;
+            let (_, m) = call(&r, "GET", "/market?exchange=bingx", "").await;
+            if b["свободно"]["USDT"] == json!(1000.0)
+                && s["bingx"]["поток_событий_счёта"] == json!(true)
+                && m["BTCUSDT"]["лучший_аск"].is_number()
+                && pong.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "баланс, поток, стакан или Pong: {b} {s} {m}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let (c, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=bingx&symbol=BTCUSDT&side=SELL&type=MARKET&qty=0.5",
+            "",
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let (_, a) = call(&r, "GET", "/status", "").await;
+            if a["bingx"]["тестовый_счёт"]["positions"][0]["qty"] == json!(-0.5) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < until, "шорт не учтён: {a}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        {
+            let x = ex.lock().unwrap();
+            assert_eq!(param(&x.orders[0], "positionSide").as_deref(), Some("BOTH"));
+            assert!(
+                param(&x.orders[0], "clientOrderID")
+                    .unwrap()
+                    .starts_with("hft")
+            );
+            assert_eq!(x.leverage, vec!["BOTH:4".to_string()]);
+        }
+        // позиция закрыта — ACCOUNT_UPDATE (gzip)
+        ev_tx.send(json!({"e": "ACCOUNT_UPDATE", "a": {"B": [], "P": [{"s": "BTC-USDT", "pa": "0", "ep": "0", "ps": "BOTH"}]}}).to_string()).unwrap();
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let (_, a) = call(&r, "GET", "/status", "").await;
+            if a["bingx"]["тестовый_счёт"]["positions"] == json!([]) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "событие не учтено: {a}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(ex.lock().unwrap().bad, 0, "все подписи верны");
+        call(&r, "POST", "/control/stop", "").await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn live_perp_flow_against_mock_binance_futures() {
         use axum::extract::RawQuery;

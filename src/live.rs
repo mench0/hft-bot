@@ -491,6 +491,7 @@ pub enum Venue {
     Okx(crate::okx_api::Client),
     Gate(crate::gate_api::Client),
     Kucoin(crate::kucoin_api::Client),
+    Bingx(crate::bingx_api::Client),
 }
 
 impl Venue {
@@ -502,6 +503,7 @@ impl Venue {
             Venue::Okx(c) => c.sync_time().await,
             Venue::Gate(c) => c.sync_time().await,
             Venue::Kucoin(c) => c.sync_time().await,
+            Venue::Bingx(c) => c.sync_time().await,
         }
     }
     async fn place(
@@ -516,6 +518,7 @@ impl Venue {
         match self {
             Venue::Gate(c) => c.place(local, symbol, side, qty, price, ref_px).await,
             Venue::Kucoin(c) => c.place(local, symbol, side, qty, price).await,
+            Venue::Bingx(c) => c.place(local, symbol, side, qty, price).await,
             Venue::Binance(c) => c.place(local, symbol, side, qty, price).await,
             Venue::Bybit(c) => c.place(local, symbol, side, qty, price).await,
             Venue::Aster(c) => c.place(local, symbol, side, qty, price).await,
@@ -530,6 +533,7 @@ impl Venue {
             Venue::Okx(c) => c.query(symbol, id).await,
             Venue::Gate(c) => c.query(symbol, id).await,
             Venue::Kucoin(c) => c.query(symbol, id).await,
+            Venue::Bingx(c) => c.query(symbol, id).await,
         }
     }
     async fn cancel(&self, symbol: &str, id: &str) -> Result<OrderState, String> {
@@ -540,6 +544,7 @@ impl Venue {
             Venue::Okx(c) => c.cancel(symbol, id).await,
             Venue::Gate(c) => c.cancel(symbol, id).await,
             Venue::Kucoin(c) => c.cancel(symbol, id).await,
+            Venue::Bingx(c) => c.cancel(symbol, id).await,
         }
     }
     fn perp(&self) -> bool {
@@ -550,6 +555,7 @@ impl Venue {
             Venue::Okx(c) => c.perp,
             Venue::Gate(c) => c.perp,
             Venue::Kucoin(c) => c.perp,
+            Venue::Bingx(c) => c.perp,
         }
     }
     async fn positions(&self) -> Result<Vec<(String, f64, f64)>, String> {
@@ -560,6 +566,7 @@ impl Venue {
             Venue::Okx(c) => c.positions().await,
             Venue::Gate(c) => c.positions().await,
             Venue::Kucoin(c) => c.positions().await,
+            Venue::Bingx(c) => c.positions().await,
         }
     }
     async fn set_leverage(&self, symbol: &str, lev: f64) -> Result<(), String> {
@@ -570,6 +577,7 @@ impl Venue {
             Venue::Okx(c) => c.set_leverage(symbol, lev).await,
             Venue::Gate(c) => c.set_leverage(symbol, lev).await,
             Venue::Kucoin(c) => c.set_leverage(symbol, lev).await,
+            Venue::Bingx(c) => c.set_leverage(symbol, lev).await,
         }
     }
     async fn networks(&self, coin: &str) -> Result<Vec<crate::transfer::Net>, String> {
@@ -608,6 +616,7 @@ impl Venue {
             Venue::Okx(c) => c.balances().await,
             Venue::Gate(c) => c.balances().await,
             Venue::Kucoin(c) => c.balances().await,
+            Venue::Bingx(c) => c.balances().await,
         }
     }
 }
@@ -747,6 +756,7 @@ impl Venue {
             Venue::Okx(_) => Ok(crate::okx_api::private_url(testnet)),
             Venue::Gate(c) => c.stream_url().await,
             Venue::Kucoin(c) => c.stream_url().await,
+            Venue::Bingx(c) => c.stream_url().await,
             Venue::Aster(c) => {
                 let k = c
                     .listen_key(reqwest::Method::POST)
@@ -771,6 +781,7 @@ impl Venue {
             Venue::Okx(c) => Some(vec![c.login()]),
             Venue::Gate(c) => Some(c.subscriptions()),
             Venue::Kucoin(_) => Some(Vec::new()),
+            Venue::Bingx(c) if !c.perp => Some(vec![c.subscription()]),
             _ => None,
         }
     }
@@ -791,12 +802,16 @@ impl Venue {
         match self {
             Venue::Binance(c) if c.perp => c.listen_key(reqwest::Method::PUT).await.map(|_| ()),
             Venue::Aster(c) => c.listen_key(reqwest::Method::PUT).await.map(|_| ()),
+            Venue::Bingx(c) => c.keepalive().await,
             _ => Ok(()),
         }
     }
 
     /// Разбор сообщения приватного потока.
     fn stream_parse(&self, text: &str, sub: &str) -> StreamMsg {
+        if let Venue::Bingx(c) = self {
+            return c.stream_parse(text);
+        }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
             return StreamMsg::Ignore;
         };
@@ -975,6 +990,14 @@ async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) 
                             }
                             continue;
                         }
+                    };
+                    // бинарные кадры (BingX — gzip) — в текст
+                    let msg = match msg {
+                        Some(Ok(Message::Binary(b))) => match crate::feed::bingx::gunzip(&b) {
+                            Some(t) => Some(Ok(Message::text(t))),
+                            None => continue,
+                        },
+                        m => m,
                     };
                     match msg {
                         Some(Ok(Message::Text(t))) => match venue.stream_parse(&t, &sub) {
