@@ -1,6 +1,7 @@
 //! Состояние бота: выбранные биржи и монеты, привязка монет к стратегиям, параметры бирж, настройки процесса.
 //! Хранится в JSON-файле (запись через временный файл и rename — файл не бывает наполовину записан).
 
+use crate::account::Account;
 use crate::book::Book;
 use crate::data;
 use crate::feed;
@@ -45,7 +46,7 @@ pub struct Bot {
     /// Задачи фидов по биржам (пока соединения подняты).
     feeds: Mutex<HashMap<String, JoinHandle<()>>>,
     /// Бумажные счета подключённых бирж.
-    pub accounts: Arc<Mutex<HashMap<String, Paper>>>,
+    pub accounts: Arc<Mutex<HashMap<String, Account>>>,
     /// Исполнение стоящих бумажных заявок по стакану (пока соединения подняты).
     matcher: Mutex<Option<JoinHandle<()>>>,
     /// «Сбор спреда» по биржам.
@@ -375,7 +376,38 @@ impl Bot {
         }
     }
 
-    /// Бумажный счёт биржи: создать со стартовым балансом или добавить валюту новой монеты.
+    /// Режим счёта биржи по параметрам и ключам, как в Java: paper — бумага; live или testnet с ключами — реальные
+    /// ордера (в Rust пока только Binance спот); иначе — бумага. Возвращает ключи и testnet для живого счёта.
+    fn live_mode(&self, ex: &str) -> Option<(crate::signed::Keys, bool)> {
+        let p = self.params(ex);
+        let flag = |k: &str| p.get(k).and_then(Value::as_bool).unwrap_or(false);
+        let testnet = flag("testnet");
+        if flag("paper") || !(flag("live") || testnet) {
+            return None;
+        }
+        if ex != "binance" || p.get("market").and_then(Value::as_str) == Some("perp") {
+            tracing::warn!(
+                "[{ex}] реальные ордера в Rust-бэкенде пока только для Binance спот — бумажный режим"
+            );
+            return None;
+        }
+        match crate::signed::Keys::from_env(ex, testnet) {
+            Some(k) => Some((k, testnet)),
+            None => {
+                tracing::warn!(
+                    "[{ex}] ключи {}_API_KEY/_SECRET не заданы — бумажный режим",
+                    format!(
+                        "{}{}",
+                        ex.to_uppercase(),
+                        if testnet { "_TESTNET" } else { "" }
+                    )
+                );
+                None
+            }
+        }
+    }
+
+    /// Счёт биржи: создать (бумажный со стартовым балансом или живой) или добавить валюту новой монеты.
     fn ensure_account(&self, ex: &str, symbols: &[String]) {
         let p = self.params(ex);
         let start = p
@@ -383,12 +415,46 @@ impl Bot {
             .and_then(Value::as_f64)
             .unwrap_or(1000.0);
         let fee = |k: &str| fee(ex, k);
-        let mut acc = self.accounts.lock().unwrap();
-        let a = acc
-            .entry(ex.to_owned())
-            .or_insert_with(|| Paper::new(symbols, start, fee("makerFeePct"), fee("takerFeePct")));
-        for s in symbols {
-            a.ensure_quote(s, start);
+        if !self.accounts.lock().unwrap().contains_key(ex) {
+            let account = match self.live_mode(ex) {
+                Some((keys, testnet)) => {
+                    let base = p
+                        .get("restUrl")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| crate::rest::default_url(false, testnet).to_owned());
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                    let mode = if testnet { "TESTNET" } else { "LIVE" };
+                    tracing::warn!("[{ex}] режим {mode}: ордера пойдут на биржу ({base})");
+                    let client = Arc::new(crate::signed::Client::new(&base, keys));
+                    tokio::spawn(crate::live::worker(
+                        self.accounts.clone(),
+                        ex.to_owned(),
+                        client,
+                        rx,
+                    ));
+                    Account::Live(crate::live::Live::new(
+                        symbols,
+                        fee("makerFeePct"),
+                        fee("takerFeePct"),
+                        mode,
+                        tx,
+                    ))
+                }
+                None => Account::Paper(Paper::new(
+                    symbols,
+                    start,
+                    fee("makerFeePct"),
+                    fee("takerFeePct"),
+                )),
+            };
+            self.accounts.lock().unwrap().insert(ex.to_owned(), account);
+        }
+        if let Some(a) = self.accounts.lock().unwrap().get_mut(ex) {
+            for s in symbols {
+                a.ensure_quote(s, start);
+            }
         }
     }
 
@@ -548,10 +614,22 @@ impl Bot {
         Ok(self.accounts.lock().unwrap()[ex].balances())
     }
 
-    /// Сбросить бумажный счёт к стартовому балансу.
+    /// Сбросить тестовый счёт: бумажный — к стартовому балансу, живой — начать учёт результата заново
+    /// (балансы на бирже не меняются).
     pub fn reset_account(&self, ex: &str) -> ActionResult<Value> {
         self.running_exchange(ex)?;
-        self.accounts.lock().unwrap().remove(ex);
+        {
+            let mut acc = self.accounts.lock().unwrap();
+            if let Some(Account::Live(l)) = acc.get_mut(ex) {
+                let b = l.ledger.balances();
+                let (m, t) = l.ledger.fees();
+                l.ledger = Paper::new(&[], 0.0, m * 100.0, t * 100.0);
+                l.ledger.set_balances(b);
+                drop(acc);
+                return Ok(self.account_json(ex).unwrap_or(Value::Null));
+            }
+            acc.remove(ex);
+        }
         let symbols = self
             .snapshot()
             .selection
@@ -581,7 +659,7 @@ impl Bot {
             .lock()
             .unwrap()
             .get_mut(ex)
-            .map(|a| a.account_json(&mids))
+            .and_then(|a| a.account_json(&mids))
     }
 
     /// Биржи для команды торговли: «all» — все выбранные.
@@ -605,7 +683,7 @@ impl Bot {
             m.insert("tradingEnabled".into(), Value::String(on.to_string()));
             self.update_params(ex, &m)?;
             if on && let Some(a) = self.accounts.lock().unwrap().get_mut(ex) {
-                a.kill_switch = false;
+                a.reset_kill_switch();
             }
         }
         Ok(())

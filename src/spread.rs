@@ -9,8 +9,11 @@
 //! - Стоп: цена ниже средней покупки на `scStopLossPercent` или монета не продалась за `scMaxHoldMinutes` —
 //!   продажа рыночным ордером. Выключили стратегию или торговлю — заявки снимаются, купленное продаётся.
 
+use crate::account::Account;
 use crate::book::Book;
-use crate::paper::{Amount, Exec, Limits, Paper, Side};
+#[cfg(test)]
+use crate::paper::Paper;
+use crate::paper::{Amount, Exec, Limits, Side};
 use crate::rest::Filter;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -178,7 +181,7 @@ impl SpreadCapture {
         }
     }
 
-    fn cancel(&mut self, paper: &mut Paper, sym: &str, buy: bool) {
+    fn cancel(&mut self, paper: &mut Account, sym: &str, buy: bool) {
         let s = self.states.entry(sym.to_owned()).or_default();
         let q = if buy { s.bid.take() } else { s.ask.take() };
         if let Some(q) = q {
@@ -192,13 +195,13 @@ impl SpreadCapture {
     }
 
     /// Снять заявки символа.
-    pub fn cancel_quotes(&mut self, paper: &mut Paper, sym: &str) {
+    pub fn cancel_quotes(&mut self, paper: &mut Account, sym: &str) {
         self.cancel(paper, sym, true);
         self.cancel(paper, sym, false);
     }
 
     /// Продать купленное рыночным ордером (стоп, таймаут, выключение).
-    fn dump(&mut self, paper: &mut Paper, sym: &str, book: Option<&Book>, why: &str) {
+    fn dump(&mut self, paper: &mut Account, sym: &str, book: Option<&Book>, why: &str) {
         let inv = self.states.get(sym).map_or(0.0, |s| s.inv);
         if inv <= 0.0 {
             return;
@@ -207,14 +210,14 @@ impl SpreadCapture {
         match paper.sell_exit(sym, inv, book) {
             Ok(f) => {
                 self.own.insert(f.order_id, sym.to_owned());
-                self.absorb(&paper.execs.clone());
+                self.absorb(&paper.execs().clone());
             }
             Err(e) => tracing::warn!("[spread-capture] {sym}: продать не удалось — {e}"),
         }
     }
 
     /// Выключить по символу: заявки снять, купленное продать.
-    pub fn stop_symbol(&mut self, paper: &mut Paper, sym: &str, book: Option<&Book>, why: &str) {
+    pub fn stop_symbol(&mut self, paper: &mut Account, sym: &str, book: Option<&Book>, why: &str) {
         self.cancel_quotes(paper, sym);
         self.dump(paper, sym, book, why);
     }
@@ -238,14 +241,14 @@ impl SpreadCapture {
         &mut self,
         sym: &str,
         book: Option<&Book>,
-        paper: &mut Paper,
+        paper: &mut Account,
         p: &Params,
         lim: &Limits,
         now: Instant,
         minutes: Option<&[f64]>,
         filter: Option<Filter>,
     ) {
-        self.absorb(&paper.execs.clone());
+        self.absorb(&paper.execs().clone());
         let ready =
             book.filter(|b| b.is_ready() && b.age_ms().is_some_and(|a| a <= lim.max_data_age_ms));
         let Some(b) = ready else {
@@ -410,7 +413,7 @@ impl SpreadCapture {
     #[allow(clippy::too_many_arguments)]
     fn requote(
         &mut self,
-        paper: &mut Paper,
+        paper: &mut Account,
         sym: &str,
         side: Side,
         want: bool,
@@ -454,7 +457,7 @@ impl SpreadCapture {
                     s.q_ask.ahead = None;
                 }
                 if f.executed > 0.0 {
-                    self.absorb(&paper.execs.clone());
+                    self.absorb(&paper.execs().clone());
                 }
             }
             Err(e) => {
@@ -699,7 +702,7 @@ mod tests {
 
     #[test]
     fn quote_buy_sell_profit() {
-        let mut paper = Paper::new(&["XYZUSDT".into()], 1000.0, 0.1, 0.1);
+        let mut paper = Account::Paper(Paper::new(&["XYZUSDT".into()], 1000.0, 0.1, 0.1));
         let mut sc = SpreadCapture::new(0.1);
         let p = params();
         let t = Instant::now();
@@ -758,7 +761,7 @@ mod tests {
 
     #[test]
     fn narrow_spread_pulls_quotes_and_stop_dumps() {
-        let mut paper = Paper::new(&["XYZUSDT".into()], 1000.0, 0.1, 0.1);
+        let mut paper = Account::Paper(Paper::new(&["XYZUSDT".into()], 1000.0, 0.1, 0.1));
         let mut sc = SpreadCapture::new(0.1);
         let p = params();
         let t = Instant::now();
@@ -818,7 +821,7 @@ mod tests {
 
     #[test]
     fn thin_book_blocks_buys() {
-        let mut paper = Paper::new(&["XYZUSDT".into()], 1000.0, 0.1, 0.1);
+        let mut paper = Account::Paper(Paper::new(&["XYZUSDT".into()], 1000.0, 0.1, 0.1));
         let mut sc = SpreadCapture::new(0.1);
         let mut p = params();
         p.min_book_levels = 3;
@@ -847,7 +850,7 @@ mod tests {
 
     #[test]
     fn jump_one_tick_and_price_war_pause() {
-        let mut paper = Paper::new(&["XYZUSDT".into()], 1000.0, 0.1, 0.1);
+        let mut paper = Account::Paper(Paper::new(&["XYZUSDT".into()], 1000.0, 0.1, 0.1));
         paper.set_filters(&HashMap::from([("XYZUSDT".to_owned(), filt().unwrap())]));
         let mut sc = SpreadCapture::new(0.1);
         let mut p = params();
@@ -905,7 +908,7 @@ mod tests {
         );
         // узкий спред — перебивать нельзя: встаёт по лучшей цене
         let mut sc2 = SpreadCapture::new(0.1);
-        let mut paper2 = Paper::new(&["XYZUSDT".into()], 1000.0, 0.1, 0.1);
+        let mut paper2 = Account::Paper(Paper::new(&["XYZUSDT".into()], 1000.0, 0.1, 0.1));
         sc2.step(
             "XYZUSDT",
             Some(&book(100.0, 100.31, 1)),
@@ -921,7 +924,7 @@ mod tests {
 
     #[test]
     fn minute_trades_check() {
-        let mut paper = Paper::new(&["XYZUSDT".into()], 1000.0, 0.1, 0.1);
+        let mut paper = Account::Paper(Paper::new(&["XYZUSDT".into()], 1000.0, 0.1, 0.1));
         let mut sc = SpreadCapture::new(0.1);
         let mut p = params();
         p.min_trade_minutes = 4.0;

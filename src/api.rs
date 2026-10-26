@@ -241,9 +241,19 @@ fn request_stats_json(bot: &Bot) -> Value {
             };
             let p = bot.params(ex);
             let testnet = p.get("testnet").and_then(Value::as_bool).unwrap_or(false);
+            let mode = bot
+                .accounts
+                .lock()
+                .unwrap()
+                .get(ex)
+                .map_or("PAPER", |a| a.mode());
             m.insert(ex.clone(), json!({
-                "mode": "PAPER",
-                "modeTitle": "Rust-бэкенд: только рыночные данные, ордеров пока нет",
+                "mode": mode,
+                "modeTitle": match mode {
+                    "LIVE" => "реальные ордера (основная сеть)",
+                    "TESTNET" => "ордера в тестовую сеть",
+                    _ => "бумажная торговля на живом стакане",
+                },
                 "network": if testnet { "TESTNET" } else { "LIVE" },
                 "market": p.get("market").cloned().unwrap_or(Value::Null),
                 "marketData": {"ws": {
@@ -279,15 +289,21 @@ fn status_json(bot: &Bot) -> Value {
                 "переподключений": f.reconnects,
                 "символы": f.symbols,
             });
-            if let Some(acc) = bot.account_json(ex) {
-                let a = bot.accounts.lock().unwrap();
-                if let Some(p) = a.get(ex) {
-                    e["kill_switch"] = Value::Bool(p.kill_switch);
-                    e["дневной_pnl"] = json!(p.daily_pnl);
-                    e["ордеров_принято"] = json!(p.accepted);
-                    e["ордеров_отклонено"] = json!(p.rejected);
-                    e["последний_отказ"] = Value::String(p.last_reject.clone());
+            let acc_stats = bot
+                .accounts
+                .lock()
+                .unwrap()
+                .get(ex)
+                .map(|a| (a.stats(), a.error().to_owned()));
+            if let Some((stats, err)) = acc_stats {
+                if let (Value::Object(m), Value::Object(s)) = (&mut e, stats) {
+                    m.extend(s);
                 }
+                if !err.is_empty() {
+                    e["ошибка_счёта"] = Value::String(err);
+                }
+            }
+            if let Some(acc) = bot.account_json(ex) {
                 e["тестовый_счёт"] = acc;
             }
             if !f.last_error.is_empty() {
@@ -893,6 +909,169 @@ mod tests {
         assert_eq!(s["binance"]["тестовый_счёт"]["openOrders"], json!(0), "{s}");
         let (_, b) = call(&r, "GET", "/balances?exchange=binance", "").await;
         assert!(b["свободно"].get("XYZ").is_none(), "{b}");
+        call(&r, "POST", "/control/stop", "").await;
+    }
+
+    /// Живой режим (testnet) против макета REST Binance: макет проверяет подпись каждого запроса, ведёт балансы и
+    /// статусы ордеров. Рыночная покупка учитывается, лимитная продажа стоит, паника снимает её на «бирже».
+    #[tokio::test]
+    async fn live_testnet_flow_against_mock_binance() {
+        use axum::extract::RawQuery;
+        use axum::http::HeaderMap;
+        use futures_util::SinkExt;
+        use std::sync::Mutex;
+        use tokio_tungstenite::tungstenite::Message;
+        const SECRET: &str = "test-secret";
+        #[derive(Default)]
+        struct Ex {
+            usdt: f64,
+            btc: f64,
+            orders: Vec<(u64, String, f64, f64)>,
+            bad_sig: u32,
+            cancels: u32,
+        }
+        let ex = Arc::new(Mutex::new(Ex {
+            usdt: 1000.0,
+            ..Default::default()
+        }));
+        fn param(q: &str, k: &str) -> Option<String> {
+            q.split('&').find_map(|kv| {
+                kv.split_once('=')
+                    .filter(|(a, _)| *a == k)
+                    .map(|(_, v)| v.to_owned())
+            })
+        }
+        // подпись: всё до &signature=
+        fn check(q: &str, h: &HeaderMap) -> bool {
+            let (body, sig) = q.rsplit_once("&signature=").unwrap_or((q, ""));
+            h.get("x-mbx-apikey").is_some_and(|k| k == "test-key")
+                && crate::signed::sign(SECRET, body) == sig
+        }
+        let (e1, e2, e3, e4) = (ex.clone(), ex.clone(), ex.clone(), ex.clone());
+        let rest = Router::new()
+            .route("/api/v3/time", get(|| async { Json(json!({"serverTime": now_ms()})) }))
+            .route("/api/v3/exchangeInfo", get(|| async { Json(json!({"symbols": [{"symbol": "BTCUSDT", "filters": [
+                {"filterType": "PRICE_FILTER", "tickSize": "0.01"}, {"filterType": "LOT_SIZE", "stepSize": "0.0001", "minQty": "0.0001"}]}]})) }))
+            .route("/api/v3/klines", get(|| async { Json(json!([])) }))
+            .route("/api/v3/account", get(move |RawQuery(q): RawQuery, h: HeaderMap| async move {
+                let q = q.unwrap_or_default();
+                let mut x = e1.lock().unwrap();
+                if !check(&q, &h) { x.bad_sig += 1; return (StatusCode::UNAUTHORIZED, Json(json!({"code": -1022, "msg": "Signature"}))); }
+                (StatusCode::OK, Json(json!({"balances": [{"asset": "USDT", "free": format!("{}", x.usdt)}, {"asset": "BTC", "free": format!("{}", x.btc)}]})))
+            }))
+            .route("/api/v3/order", axum::routing::post(move |RawQuery(q): RawQuery, h: HeaderMap| async move {
+                let q = q.unwrap_or_default();
+                let mut x = e2.lock().unwrap();
+                if !check(&q, &h) { x.bad_sig += 1; return (StatusCode::UNAUTHORIZED, Json(json!({"code": -1022, "msg": "Signature"}))); }
+                let qty: f64 = param(&q, "quantity").unwrap().parse().unwrap();
+                let id = 1000 + x.orders.len() as u64;
+                if param(&q, "type").as_deref() == Some("MARKET") {
+                    x.usdt -= qty * 101.0;
+                    x.btc += qty;
+                    x.orders.push((id, "FILLED".into(), qty, qty * 101.0));
+                    (StatusCode::OK, Json(json!({"orderId": id, "status": "FILLED", "executedQty": format!("{qty}"), "cummulativeQuoteQty": format!("{}", qty * 101.0)})))
+                } else {
+                    x.orders.push((id, "NEW".into(), 0.0, 0.0));
+                    (StatusCode::OK, Json(json!({"orderId": id, "status": "NEW", "executedQty": "0", "cummulativeQuoteQty": "0"})))
+                }
+            }).get(move |RawQuery(q): RawQuery, h: HeaderMap| async move {
+                let q = q.unwrap_or_default();
+                let x = e3.lock().unwrap();
+                if !check(&q, &h) { return (StatusCode::UNAUTHORIZED, Json(json!({"code": -1022, "msg": "Signature"}))); }
+                let id: u64 = param(&q, "orderId").unwrap().parse().unwrap();
+                let o = x.orders.iter().find(|o| o.0 == id).unwrap();
+                (StatusCode::OK, Json(json!({"orderId": id, "status": o.1, "executedQty": format!("{}", o.2), "cummulativeQuoteQty": format!("{}", o.3)})))
+            }).delete(move |RawQuery(q): RawQuery, h: HeaderMap| async move {
+                let q = q.unwrap_or_default();
+                let mut x = e4.lock().unwrap();
+                if !check(&q, &h) { return (StatusCode::UNAUTHORIZED, Json(json!({"code": -1022, "msg": "Signature"}))); }
+                let id: u64 = param(&q, "orderId").unwrap().parse().unwrap();
+                x.cancels += 1;
+                let o = x.orders.iter_mut().find(|o| o.0 == id).unwrap();
+                o.1 = "CANCELED".into();
+                (StatusCode::OK, Json(json!({"orderId": id, "status": "CANCELED", "executedQty": "0", "cummulativeQuoteQty": "0"})))
+            }));
+        let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let raddr = rl.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(rl, rest).await.unwrap() });
+        // стакан
+        let wl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let waddr = wl.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = wl.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            for i in 1..500u64 {
+                let m = format!(
+                    r#"{{"stream":"btcusdt@depth20@100ms","data":{{"lastUpdateId":{i},"bids":[["100","10"]],"asks":[["101","10"]]}}}}"#
+                );
+                if ws.send(Message::text(m)).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        // SAFETY: тест один задаёт эти переменные; остальные тесты ключей testnet не читают
+        unsafe {
+            std::env::set_var("BINANCE_TESTNET_API_KEY", "test-key");
+            std::env::set_var("BINANCE_TESTNET_API_SECRET", SECRET);
+        }
+        let (_d, r) = app("");
+        let sel = format!(
+            "/control/select?exchange=binance&symbols=BTCUSDT&market=spot&testnet=true&wsUrl=ws://{waddr}/stream&restUrl=http://{raddr}&spreadCaptureEnabled=false&maxPositionQuote=1000"
+        );
+        assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
+        call(&r, "POST", "/control/start", "").await;
+        call(&r, "POST", "/trading/start", "").await;
+        let (_, rs) = call(&r, "GET", "/exchanges/request-stats", "").await;
+        assert_eq!(rs["binance"]["mode"], json!("TESTNET"), "{rs}");
+        tokio::time::sleep(Duration::from_millis(800)).await; // стакан и балансы
+        let (c, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=binance&symbol=BTCUSDT&side=BUY&type=MARKET&qty=1",
+            "",
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        assert_eq!(v["статус"], json!("NEW"), "ордер ушёл на биржу в фоне");
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (_, b) = call(&r, "GET", "/balances?exchange=binance", "").await;
+            if b["свободно"]["BTC"] == json!(1.0) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "покупка не учтена: {b}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let (_, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=binance&symbol=BTCUSDT&side=SELL&type=LIMIT&qty=1&price=150",
+            "",
+        )
+        .await;
+        assert_eq!(v["статус"], json!("NEW"), "{v}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        call(&r, "POST", "/trading/panic", "").await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        while ex.lock().unwrap().cancels == 0 {
+            assert!(
+                tokio::time::Instant::now() < until,
+                "заявка не снята на бирже"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let (_, s) = call(&r, "GET", "/status", "").await;
+        assert_eq!(
+            s["binance"]["тестовый_счёт"]["mode"],
+            json!("TESTNET"),
+            "{s}"
+        );
+        assert_eq!(s["binance"]["ордеров_принято"], json!(2));
+        assert_eq!(ex.lock().unwrap().bad_sig, 0, "все запросы подписаны верно");
         call(&r, "POST", "/control/stop", "").await;
     }
 }

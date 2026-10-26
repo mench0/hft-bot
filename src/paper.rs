@@ -73,6 +73,19 @@ impl Limits {
     }
 }
 
+/// Рассчитанный ордер.
+#[derive(Clone, Debug)]
+pub struct Prepared {
+    pub base: String,
+    pub quote: String,
+    pub qty: f64,
+    pub ref_px: f64,
+    pub limit: Option<f64>,
+    pub crosses: bool,
+    pub filled: f64,
+    pub avg: f64,
+}
+
 /// Итог ордера (как OrderResult в Java).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Fill {
@@ -279,8 +292,9 @@ impl Paper {
         Ok(())
     }
 
-    /// Рыночный или лимитный ордер. Лимитный, который пересекает стакан, исполняется сразу как тейкер.
-    pub fn order(
+    /// Проверить и рассчитать ордер: риск, объём (доля, «весь»), округление по правилам пары, минимумы, лимит размера,
+    /// пересекает ли стакан и (для пересекающего) по какой средней цене исполнится, проскальзывание. Отказ учитывается.
+    pub fn prepare(
         &mut self,
         symbol: &str,
         side: Side,
@@ -288,13 +302,25 @@ impl Paper {
         limit: Option<f64>,
         book: Option<&Book>,
         lim: &Limits,
-    ) -> Result<Fill, String> {
-        if let Err(e) = self.precheck(lim, book) {
-            return self.reject(e);
-        }
-        let Some((base, quote)) = split(symbol) else {
-            return self.reject(format!("не разобрать символ {symbol}"));
-        };
+    ) -> Result<Prepared, String> {
+        self.prepare_inner(symbol, side, amount, limit, book, lim)
+            .inspect_err(|e| {
+                self.rejected += 1;
+                self.last_reject = e.clone();
+            })
+    }
+
+    fn prepare_inner(
+        &mut self,
+        symbol: &str,
+        side: Side,
+        amount: Amount,
+        limit: Option<f64>,
+        book: Option<&Book>,
+        lim: &Limits,
+    ) -> Result<Prepared, String> {
+        self.precheck(lim, book)?;
+        let (base, quote) = split(symbol).ok_or_else(|| format!("не разобрать символ {symbol}"))?;
         let b = book.expect("проверено в precheck");
         let (best_bid, best_ask) = (b.best_bid().unwrap().0, b.best_ask().unwrap().0);
         let filter = self.filters.get(&symbol.to_uppercase()).copied();
@@ -305,7 +331,7 @@ impl Paper {
             best_bid
         });
         if ref_px <= 0.0 {
-            return self.reject("цена должна быть больше нуля".into());
+            return Err("цена должна быть больше нуля".into());
         }
         let qty = match amount {
             Amount::Qty(q) => q,
@@ -326,17 +352,17 @@ impl Paper {
         };
         let qty = filter.map_or(qty, |f| f.round_qty(qty));
         if qty.is_nan() || qty <= 0.0 {
-            return self.reject("объём должен быть больше нуля".into());
+            return Err("объём должен быть больше нуля".into());
         }
         if let Some(f) = filter {
             if qty < f.min_qty - 1e-12 {
-                return self.reject(format!(
+                return Err(format!(
                     "объём {qty} меньше минимального {} для {symbol}",
                     f.min_qty
                 ));
             }
             if qty * ref_px < f.min_notional - 1e-9 {
-                return self.reject(format!(
+                return Err(format!(
                     "сумма ордера {:.4} меньше минимальной {} для {symbol}",
                     qty * ref_px,
                     f.min_notional
@@ -345,7 +371,7 @@ impl Paper {
         }
         let notional = qty * ref_px;
         if notional > lim.max_order_quote + 1e-9 {
-            return self.reject(format!(
+            return Err(format!(
                 "ордер {notional:.2} {quote} больше лимита {} (maxPositionQuote)",
                 lim.max_order_quote
             ));
@@ -355,30 +381,80 @@ impl Paper {
             (Side::Buy, Some(p)) => p >= best_ask,
             (Side::Sell, Some(p)) => p <= best_bid,
         };
+        let (filled, avg) = if crosses {
+            walk(b, side, qty, limit)
+        } else {
+            (0.0, 0.0)
+        };
+        if crosses && limit.is_none() {
+            if filled < qty * (1.0 - 1e-9) {
+                return Err("в стакане не хватает объёма".into());
+            }
+            let best = if side == Side::Buy {
+                best_ask
+            } else {
+                best_bid
+            };
+            let slip = (avg - best).abs() / best * 100.0;
+            if slip > lim.max_slippage_percent {
+                return Err(format!(
+                    "проскальзывание {slip:.3}% больше {}%",
+                    lim.max_slippage_percent
+                ));
+            }
+        }
+        Ok(Prepared {
+            base,
+            quote,
+            qty,
+            ref_px,
+            limit,
+            crosses,
+            filled,
+            avg,
+        })
+    }
+
+    /// Ордер принят (для частоты и счётчика).
+    pub fn note_accepted(&mut self) {
+        self.recent.push_back(Instant::now());
+        self.accepted += 1;
+    }
+
+    /// Учесть отказ, пришедший от биржи.
+    pub fn note_rejected(&mut self, why: &str) {
+        self.rejected += 1;
+        self.last_reject = why.to_owned();
+    }
+
+    /// Рыночный или лимитный ордер. Лимитный, который пересекает стакан, исполняется сразу как тейкер.
+    pub fn order(
+        &mut self,
+        symbol: &str,
+        side: Side,
+        amount: Amount,
+        limit: Option<f64>,
+        book: Option<&Book>,
+        lim: &Limits,
+    ) -> Result<Fill, String> {
+        let pr = self.prepare(symbol, side, amount, limit, book, lim)?;
+        let Prepared {
+            base,
+            quote,
+            qty,
+            ref_px,
+            limit,
+            crosses,
+            filled,
+            avg,
+        } = pr;
         if !crosses {
             return self.rest(symbol, &base, &quote, side, qty, ref_px);
-        }
-        let (filled, avg) = walk(b, side, qty, limit);
-        if filled < qty * (1.0 - 1e-9) && limit.is_none() {
-            return self.reject("в стакане не хватает объёма".into());
-        }
-        let best = if side == Side::Buy {
-            best_ask
-        } else {
-            best_bid
-        };
-        let slip = (avg - best).abs() / best * 100.0;
-        if limit.is_none() && slip > lim.max_slippage_percent {
-            return self.reject(format!(
-                "проскальзывание {slip:.3}% больше {}%",
-                lim.max_slippage_percent
-            ));
         }
         if let Err(e) = self.settle(&base, &quote, side, filled, avg, self.taker) {
             return self.reject(e);
         }
-        self.recent.push_back(Instant::now());
-        self.accepted += 1;
+        self.note_accepted();
         self.check_loss(lim);
         let id = self.next_id;
         self.next_id += 1;
@@ -406,6 +482,67 @@ impl Paper {
             executed: filled,
             avg_price: avg,
         })
+    }
+
+    /// Учесть реальное исполнение (живой счёт): балансы, средняя цена, результат, журнал. Баланс биржи главный —
+    /// нехватка в учёте не ошибка.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ledger_fill(
+        &mut self,
+        order_id: u64,
+        symbol: &str,
+        side: Side,
+        qty: f64,
+        px: f64,
+        fee: f64,
+        maker: bool,
+        lim: &Limits,
+    ) {
+        let Some((base, quote)) = split(symbol) else {
+            return;
+        };
+        let notional = qty * px;
+        match side {
+            Side::Buy => {
+                self.add(&quote, -(notional + fee));
+                self.add(&base, qty);
+                let lot = self.lots.entry(base.clone()).or_default();
+                lot.avg = (lot.avg * lot.qty + notional + fee) / (lot.qty + qty);
+                lot.qty += qty;
+            }
+            Side::Sell => {
+                self.add(&base, -qty);
+                self.add(&quote, notional - fee);
+                let lot = self.lots.entry(base.clone()).or_default();
+                let sold = qty.min(lot.qty);
+                let pnl = sold * px - fee * (sold / qty.max(1e-18)) - sold * lot.avg;
+                lot.qty -= sold;
+                self.realized += pnl;
+                self.daily_pnl += pnl;
+                self.closed += 1;
+                if pnl > 0.0 {
+                    self.wins += 1;
+                }
+            }
+        }
+        if maker {
+            self.maker_fees += fee
+        } else {
+            self.taker_fees += fee
+        }
+        self.exec(order_id, symbol, side, qty, px, fee);
+        self.check_loss(lim);
+    }
+
+    /// Балансы с биржи (живой счёт): заменяют учётные.
+    pub fn set_balances(&mut self, b: BTreeMap<String, f64>) {
+        self.free = b;
+        self.locked.clear();
+    }
+
+    /// Комиссии мейкера и тейкера, доли.
+    pub fn fees(&self) -> (f64, f64) {
+        (self.maker, self.taker)
     }
 
     fn lock_for(

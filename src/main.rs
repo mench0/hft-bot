@@ -4,13 +4,16 @@
 //! Переменные окружения: `ADMIN_PORT` (8080), `ADMIN_BIND` (127.0.0.1), `ADMIN_TOKEN`, `ADMIN_CORS_ORIGINS`
 //! (через запятую), `STATE_FILE` (state.json), `RUST_LOG` (info).
 
+mod account;
 mod api;
 mod book;
 mod data;
 mod feed;
+mod live;
 mod market;
 mod paper;
 mod rest;
+mod signed;
 mod spread;
 mod state;
 
