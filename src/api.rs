@@ -2008,6 +2008,185 @@ mod tests {
         call(&r, "POST", "/control/stop", "").await;
     }
 
+    /// Живой спот LBank против макета: подпись (MD5 → HMAC-SHA256, служебные поля в заголовках), рыночная покупка на
+    /// сумму, ключ подписки, поток orderUpdate по customerID, pong на ping сервера.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_lbank_spot_against_mock() {
+        use axum::http::HeaderMap;
+        use futures_util::{SinkExt, StreamExt};
+        use std::collections::BTreeMap;
+        use std::sync::Mutex;
+        use tokio_tungstenite::tungstenite::Message;
+        const SECRET: &str = "lb-secret";
+        #[derive(Default)]
+        struct Ex {
+            orders: Vec<BTreeMap<String, String>>,
+            bad: u32,
+            bought: f64,
+        }
+        let ex = Arc::new(Mutex::new(Ex::default()));
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        // подпись: тело без sign + служебные поля из заголовков
+        fn ok(f: &BTreeMap<String, String>, h: &HeaderMap) -> bool {
+            let mut p = f.clone();
+            let sig = p.remove("sign").unwrap_or_default();
+            for k in ["timestamp", "signature_method", "echostr"] {
+                p.insert(
+                    k.into(),
+                    h.get(k)
+                        .map(|v| v.to_str().unwrap().to_owned())
+                        .unwrap_or_default(),
+                );
+            }
+            p["api_key"] == "lb-key"
+                && p["echostr"].len() == 35
+                && crate::lbank_api::sign(SECRET, &p) == sig
+        }
+        type Form = axum::extract::Form<BTreeMap<String, String>>;
+        let (e1, e2, e3) = (ex.clone(), ex.clone(), ex.clone());
+        let rest = Router::new()
+            .route("/v2/timestamp.do", get(|| async { Json(json!({"result": "true", "data": now_ms(), "error_code": 0})) }))
+            .route("/v2/accuracy.do", get(|| async { Json(json!({"result": "true", "error_code": 0, "data": [{"symbol": "x_usdt", "quantityAccuracy": "2", "priceAccuracy": "4"}]})) }))
+            .route("/v2/supplement/user_info_account.do", axum::routing::post(move |h: HeaderMap, axum::extract::Form(f): Form| async move {
+                let mut x = e1.lock().unwrap();
+                if !ok(&f, &h) { x.bad += 1; }
+                Json(json!({"result": "true", "error_code": 0, "data": {"balances": [{"asset": "usdt", "free": "1000", "locked": "0"}, {"asset": "x", "free": format!("{}", x.bought), "locked": "0"}]}}))
+            }))
+            .route("/v2/subscribe/get_key.do", axum::routing::post(move |h: HeaderMap, axum::extract::Form(f): Form| async move {
+                if !ok(&f, &h) { e2.lock().unwrap().bad += 1; }
+                Json(json!({"result": "true", "error_code": 0, "data": "sk1"}))
+            }))
+            .route("/v2/supplement/create_order.do", axum::routing::post(move |h: HeaderMap, axum::extract::Form(f): Form| async move {
+                let mut x = e3.lock().unwrap();
+                if !ok(&f, &h) { x.bad += 1; }
+                x.bought += 2.0;
+                let _ = ev_tx.send(json!({"type": "orderUpdate", "pair": "x_usdt", "orderUpdate": {"uuid": "o1", "customerID": f["custom_id"],
+                    "orderStatus": 2, "accAmt": "2", "avgPrice": "10", "type": "buy_market"}}).to_string());
+                x.orders.push(f);
+                Json(json!({"result": "true", "error_code": 0, "data": {"order_id": "o1"}}))
+            }))
+            .route("/v2/supplement/orders_info.do", axum::routing::post(|| async {
+                Json(json!({"result": "true", "error_code": 0, "data": {"orderId": "o1", "executedQty": "2", "cummulativeQuoteQty": "20", "status": 2}}))
+            }));
+        let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let raddr = rl.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(rl, rest).await.unwrap() });
+        let wl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let waddr = wl.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = wl.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            for _ in 1..500u64 {
+                let m = r#"{"depth":{"asks":[[10,100]],"bids":[[9.99,100]]},"count":50,"type":"depth","pair":"x_usdt","SERVER":"V2","TS":"2026"}"#;
+                if ws.send(Message::text(m)).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            loop {
+                let _ = wl.accept().await;
+            }
+        });
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sn = seen.clone();
+        let sl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let saddr = sl.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = sl.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            for _ in 0..2 {
+                if let Some(Ok(Message::Text(t))) = ws.next().await {
+                    sn.lock().unwrap().push(t.to_string());
+                }
+            }
+            ws.send(Message::text(r#"{"action":"ping","ping":"p1"}"#))
+                .await
+                .unwrap();
+            if let Some(Ok(Message::Text(t))) = ws.next().await {
+                sn.lock().unwrap().push(t.to_string());
+            }
+            ws.send(Message::text(
+                r#"{"action":"subscribe","subscribe":"orderUpdate","status":"success"}"#,
+            ))
+            .await
+            .unwrap();
+            while let Some(e) = ev_rx.recv().await {
+                if ws.send(Message::text(e)).await.is_err() {
+                    break;
+                }
+            }
+            loop {
+                let _ = sl.accept().await;
+            }
+        });
+        crate::util::set_env("LBANK_STREAM_URL", &format!("ws://{saddr}/"));
+        crate::util::set_env("LBANK_API_KEY", "lb-key");
+        crate::util::set_env("LBANK_API_SECRET", SECRET);
+        let (_d, r) = app("");
+        let sel = format!(
+            "/control/select?exchange=lbank&symbols=XUSDT&live=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
+        );
+        assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
+        call(&r, "POST", "/control/start", "").await;
+        call(&r, "POST", "/trading/start", "").await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let (_, b) = call(&r, "GET", "/balances?exchange=lbank", "").await;
+            let (_, s) = call(&r, "GET", "/status", "").await;
+            let (_, m) = call(&r, "GET", "/market?exchange=lbank", "").await;
+            if b["свободно"]["USDT"] == json!(1000.0)
+                && s["lbank"]["поток_событий_счёта"] == json!(true)
+                && m["XUSDT"]["лучший_аск"].is_number()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "баланс, поток или стакан: {b} {s} {m}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let (c, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=lbank&symbol=XUSDT&side=BUY&type=MARKET&qty=2",
+            "",
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let (_, a) = call(&r, "GET", "/status", "").await;
+            if a["lbank"]["событий_счёта"].as_u64().unwrap_or(0) >= 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "событие не учтено: {a}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let x = ex.lock().unwrap();
+        assert_eq!(x.bad, 0, "все подписи верны");
+        let o = &x.orders[0];
+        // рыночная покупка — на сумму: 2 × аск 10 × 1.005
+        assert_eq!(
+            (
+                o["symbol"].as_str(),
+                o["type"].as_str(),
+                o["price"].as_str()
+            ),
+            ("x_usdt", "buy_market", "20.1")
+        );
+        assert!(o["custom_id"].starts_with("hft") && !o.contains_key("amount"));
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen[0].contains(r#""subscribeKey":"sk1""#) && seen[0].contains("orderUpdate"),
+            "{seen:?}"
+        );
+        assert_eq!(seen[2], r#"{"action":"pong","pong":"p1"}"#);
+    }
+
     /// Живые перпы Hyperliquid против макета: подпись агента (EIP-712 по msgpack действия), плечо, IOC-ордер с cloid,
     /// подписка orderUpdates и позиция из события.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

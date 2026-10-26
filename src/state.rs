@@ -427,9 +427,10 @@ impl Bot {
                 | "bingx"
                 | "mexc"
                 | "hyperliquid"
+                | "lbank"
         ) {
             tracing::warn!(
-                "[{ex}] реальные ордера в Rust-бэкенде пока только для Binance, Bybit, Aster, OKX, Gate, KuCoin, BingX, MEXC и Hyperliquid (спот и USDT-перпы) — бумажный режим"
+                "[{ex}] реальные ордера в Rust-бэкенде пока только для Binance, Bybit, Aster, OKX, Gate, KuCoin, BingX, MEXC, Hyperliquid и LBank (спот и USDT-перпы) — бумажный режим"
             );
             return None;
         }
@@ -531,6 +532,7 @@ impl Bot {
                                 "bingx" => crate::bingx_api::REST,
                                 "mexc" => crate::mexc_api::rest_url(perp),
                                 "hyperliquid" => crate::hyperliquid_api::rest_url(testnet),
+                                "lbank" => crate::lbank_api::REST,
                                 _ => crate::rest::default_url(perp, testnet),
                             }
                             .to_owned()
@@ -538,7 +540,9 @@ impl Bot {
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                     let mode = if testnet { "TESTNET" } else { "LIVE" };
                     tracing::warn!("[{ex}] режим {mode}: ордера пойдут на биржу ({base})");
-                    let client = Arc::new(if ex == "hyperliquid" {
+                    let client = Arc::new(if ex == "lbank" {
+                        crate::live::Venue::Lbank(crate::lbank_api::Client::new(&base, keys))
+                    } else if ex == "hyperliquid" {
                         // ключи проверены в live_mode
                         crate::live::Venue::Hyperliquid(
                             crate::hyperliquid_api::Client::new(
