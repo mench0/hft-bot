@@ -108,6 +108,10 @@
   стакана с запасом 0.5%); перпы — size в контрактах со знаком (монеты / quanto_multiplier). Поток: подписки с подписью
   spot.orders + spot.balances, у перпов — futures.orders + futures.positions по номеру пользователя
   (`GATE_WS_PRIVATE_URL` — свой адрес).
+- **Реальные ордера KuCoin** (спот и перпы): подпись KC-API-SIGN = base64(HMAC-SHA256), passphrase — тоже HMAC (ключ v2),
+  ключи `KUCOIN_API_KEY`/`_SECRET` и `KUCOIN_PASSPHRASE`; перпы — XBTUSDTM, целые лоты (× multiplier), CROSS, плечо в
+  каждом ордере. Поток: токен bullet-private, подписки после welcome (спот — tradeOrdersV2 и balance; перпы — tradeOrders,
+  positionAll, wallet); средняя цена — по сделкам match (`KUCOIN_WS_PRIVATE_URL` — свой адрес).
 - **Перпы (USDT)** — параметр `market=perp`, плечо — `leverage`. Бумага: лонг и шорт, изолированная маржа, комиссии
   перпов из каталога, funding по ставке биржи в момент списания (ставки — Binance `/fapi/v1/premiumIndex`, Bybit
   `/v5/market/tickers`, раз в 30 с; видны в `/market` как `funding_проц`), ликвидация при марже ниже 0.5% объёма.

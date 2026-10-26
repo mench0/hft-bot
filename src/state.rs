@@ -416,9 +416,12 @@ impl Bot {
         if flag("paper") || !(flag("live") || testnet) {
             return None;
         }
-        if !matches!(ex, "binance" | "bybit" | "aster" | "okx" | "gate") {
+        if !matches!(
+            ex,
+            "binance" | "bybit" | "aster" | "okx" | "gate" | "kucoin"
+        ) {
             tracing::warn!(
-                "[{ex}] реальные ордера в Rust-бэкенде пока только для Binance, Bybit, Aster, OKX и Gate (спот и USDT-перпы) — бумажный режим"
+                "[{ex}] реальные ордера в Rust-бэкенде пока только для Binance, Bybit, Aster, OKX, Gate и KuCoin (спот и USDT-перпы) — бумажный режим"
             );
             return None;
         }
@@ -449,6 +452,14 @@ impl Bot {
                 tracing::warn!(
                     "[okx] нужен OKX_PASSPHRASE (testnet — OKX_TESTNET_PASSPHRASE) — бумажный режим"
                 );
+                None
+            }
+            Some(_)
+                if ex == "kucoin"
+                    && crate::util::env("KUCOIN_PASSPHRASE").is_ok_and(|v| v.trim().is_empty())
+                    || ex == "kucoin" && crate::util::env("KUCOIN_PASSPHRASE").is_err() =>
+            {
+                tracing::warn!("[kucoin] нужен KUCOIN_PASSPHRASE — бумажный режим");
                 None
             }
             Some(k) => Some((k, testnet)),
@@ -497,6 +508,7 @@ impl Bot {
                                 "aster" => crate::aster_api::rest_url(perp, testnet),
                                 "okx" => crate::okx_api::REST,
                                 "gate" => crate::gate_api::rest_url(perp, testnet),
+                                "kucoin" => crate::kucoin_api::rest_url(perp),
                                 _ => crate::rest::default_url(perp, testnet),
                             }
                             .to_owned()
@@ -504,7 +516,12 @@ impl Bot {
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                     let mode = if testnet { "TESTNET" } else { "LIVE" };
                     tracing::warn!("[{ex}] режим {mode}: ордера пойдут на биржу ({base})");
-                    let client = Arc::new(if ex == "gate" {
+                    let client = Arc::new(if ex == "kucoin" {
+                        let pass = crate::util::env("KUCOIN_PASSPHRASE").unwrap_or_default();
+                        crate::live::Venue::Kucoin(crate::kucoin_api::Client::new(
+                            &base, keys, pass, perp,
+                        ))
+                    } else if ex == "gate" {
                         crate::live::Venue::Gate(crate::gate_api::Client::new(
                             &base, keys, perp, testnet, symbols,
                         ))

@@ -1798,6 +1798,216 @@ mod tests {
         call(&r, "POST", "/control/stop", "").await;
     }
 
+    /// Живой спот KuCoin против макета: подпись KC-API-SIGN и passphrase (HMAC), токен bullet-private, подписки после
+    /// welcome, исполнение лимитной заявки по событию tradeOrdersV2 (средняя цена — по сделкам match).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_kucoin_spot_against_mock() {
+        use axum::extract::OriginalUri;
+        use axum::http::HeaderMap;
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::Mutex;
+        use tokio_tungstenite::tungstenite::Message;
+        const SECRET: &str = "kc-secret";
+        #[derive(Default)]
+        struct Ex {
+            orders: Vec<Value>,
+            bad: u32,
+        }
+        let ex = Arc::new(Mutex::new(Ex::default()));
+        fn ok(h: &HeaderMap, method: &str, path: &str, body: &str) -> bool {
+            let g = |k: &str| {
+                h.get(k)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_owned()
+            };
+            g("kc-api-key") == "kc-key"
+                && g("kc-api-key-version") == "2"
+                && g("kc-api-passphrase") == crate::util::hmac_b64(SECRET, "kc-pass")
+                && crate::util::hmac_b64(
+                    SECRET,
+                    &format!("{}{method}{path}{body}", g("kc-api-timestamp")),
+                ) == g("kc-api-sign")
+        }
+        let pl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let paddr = pl.local_addr().unwrap();
+        let (e1, e2, e3, e4) = (ex.clone(), ex.clone(), ex.clone(), ex.clone());
+        let rest = Router::new()
+            .route("/api/v1/accounts", get(move |h: HeaderMap, u: OriginalUri| async move {
+                if !ok(&h, "GET", &u.0.to_string(), "") { e1.lock().unwrap().bad += 1; }
+                Json(json!({"code": "200000", "data": [{"currency": "USDT", "available": "1000", "type": "trade"}]}))
+            }))
+            .route("/api/v1/bullet-private", axum::routing::post(move |h: HeaderMap| async move {
+                if !ok(&h, "POST", "/api/v1/bullet-private", "") { e2.lock().unwrap().bad += 1; }
+                Json(json!({"code": "200000", "data": {"token": "t1", "instanceServers": [{"endpoint": format!("ws://{paddr}"), "pingInterval": 18000}]}}))
+            }))
+            .route("/api/v1/orders", axum::routing::post(move |h: HeaderMap, body: String| async move {
+                let mut x = e3.lock().unwrap();
+                if !ok(&h, "POST", "/api/v1/orders", &body) { x.bad += 1; }
+                let b: Value = serde_json::from_str(&body).unwrap();
+                let id = format!("k{}", x.orders.len());
+                x.orders.push(b);
+                Json(json!({"code": "200000", "data": {"orderId": id}}))
+            }))
+            .route("/api/v1/orders/{id}", get(move |h: HeaderMap, u: OriginalUri| async move {
+                let x = e4.lock().unwrap();
+                let _ = ok(&h, "GET", &u.0.to_string(), "");
+                let id = u.0.path().rsplit('/').next().unwrap().to_owned();
+                let n: usize = id.trim_start_matches('k').parse().unwrap();
+                let o = &x.orders[n];
+                let market = o["type"] == "market";
+                Json(json!({"code": "200000", "data": {"id": id, "isActive": !market, "cancelExist": false,
+                    "dealSize": if market { o["size"].clone() } else { json!("0") }, "dealFunds": if market { json!("20") } else { json!("0") }}}))
+            }));
+        let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let raddr = rl.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(rl, rest).await.unwrap() });
+        // публичный стакан: свой адрес wsUrl (без токена)
+        let wl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let waddr = wl.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = wl.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            for i in 1..500u64 {
+                let m = format!(
+                    r#"{{"type":"message","topic":"/spotMarket/level2Depth50:X-USDT","subject":"level2","data":{{"asks":[["10","100"]],"bids":[["9.99","100"]],"timestamp":{i}}}}}"#
+                );
+                if ws.send(Message::text(m)).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            loop {
+                let _ = wl.accept().await;
+            }
+        });
+        // приватный поток: welcome, подписки → ack, затем события
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let topics = Arc::new(Mutex::new(Vec::<String>::new()));
+        let tp = topics.clone();
+        tokio::spawn(async move {
+            let (tcp, _) = pl.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            ws.send(Message::text(r#"{"id":"w","type":"welcome"}"#))
+                .await
+                .unwrap();
+            for _ in 0..2 {
+                let Some(Ok(Message::Text(t))) = ws.next().await else {
+                    return;
+                };
+                let v: Value = serde_json::from_str(&t).unwrap();
+                tp.lock()
+                    .unwrap()
+                    .push(v["topic"].as_str().unwrap().to_owned());
+                ws.send(Message::text(
+                    json!({"id": v["id"], "type": "ack"}).to_string(),
+                ))
+                .await
+                .unwrap();
+            }
+            while let Some(e) = ev_rx.recv().await {
+                if ws.send(Message::text(e)).await.is_err() {
+                    break;
+                }
+            }
+            loop {
+                let _ = pl.accept().await;
+            }
+        });
+        crate::util::set_env("KUCOIN_API_KEY", "kc-key");
+        crate::util::set_env("KUCOIN_API_SECRET", SECRET);
+        crate::util::set_env("KUCOIN_PASSPHRASE", "kc-pass");
+        let (_d, r) = app("");
+        let sel = format!(
+            "/control/select?exchange=kucoin&symbols=XUSDT&market=spot&live=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
+        );
+        assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
+        call(&r, "POST", "/control/start", "").await;
+        call(&r, "POST", "/trading/start", "").await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let (_, b) = call(&r, "GET", "/balances?exchange=kucoin", "").await;
+            let (_, s) = call(&r, "GET", "/status", "").await;
+            let (_, m) = call(&r, "GET", "/market?exchange=kucoin", "").await;
+            if b["свободно"]["USDT"] == json!(1000.0)
+                && s["kucoin"]["поток_событий_счёта"] == json!(true)
+                && m["XUSDT"]["лучший_аск"].is_number()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "баланс, поток или стакан: {b} {s} {m}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            *topics.lock().unwrap(),
+            vec![
+                "/spotMarket/tradeOrdersV2".to_string(),
+                "/account/balance".to_string()
+            ]
+        );
+        let (c, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=kucoin&symbol=XUSDT&side=BUY&type=MARKET&qty=2",
+            "",
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        let (_, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=kucoin&symbol=XUSDT&side=BUY&type=LIMIT&qty=1&price=9.5",
+            "",
+        )
+        .await;
+        assert_eq!(v["статус"], json!("NEW"), "{v}");
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        let oid = loop {
+            if let Some(o) = ex.lock().unwrap().orders.get(1).cloned() {
+                assert_eq!(o["clientOid"], json!("hft2"));
+                break "k1".to_string();
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "лимитная заявка не дошла"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        ev_tx.send(json!({"type": "message", "topic": "/spotMarket/tradeOrdersV2", "subject": "orderChange", "data": {"orderId": oid, "clientOid": "hft2",
+            "symbol": "X-USDT", "type": "match", "status": "match", "matchSize": "1", "matchPrice": "9.5", "filledSize": "1", "size": "1"}}).to_string()).unwrap();
+        ev_tx.send(json!({"type": "message", "topic": "/spotMarket/tradeOrdersV2", "subject": "orderChange", "data": {"orderId": oid, "clientOid": "hft2",
+            "symbol": "X-USDT", "type": "filled", "status": "done", "filledSize": "1", "size": "1"}}).to_string()).unwrap();
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let (_, a) = call(&r, "GET", "/status", "").await;
+            if a["kucoin"]["тестовый_счёт"].is_null()
+                && a["kucoin"]["событий_счёта"].as_u64().unwrap_or(0) >= 2
+            {
+                break; // LIVE — тестового счёта нет
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "событие не учтено: {a}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // рыночная покупка учитывается опросом (раз в 5 с, пока поток работает)
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let (_, b) = call(&r, "GET", "/balances?exchange=kucoin", "").await;
+            if b["свободно"]["X"].as_f64().unwrap_or(0.0) >= 3.0 - 1e-9 {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < until, "куплено 2 + 1: {b}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(ex.lock().unwrap().bad, 0, "все подписи верны");
+        call(&r, "POST", "/control/stop", "").await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn live_perp_flow_against_mock_binance_futures() {
         use axum::extract::RawQuery;

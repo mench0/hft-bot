@@ -490,6 +490,7 @@ pub enum Venue {
     Aster(crate::aster_api::Client),
     Okx(crate::okx_api::Client),
     Gate(crate::gate_api::Client),
+    Kucoin(crate::kucoin_api::Client),
 }
 
 impl Venue {
@@ -500,6 +501,7 @@ impl Venue {
             Venue::Aster(_) => Ok(()),
             Venue::Okx(c) => c.sync_time().await,
             Venue::Gate(c) => c.sync_time().await,
+            Venue::Kucoin(c) => c.sync_time().await,
         }
     }
     async fn place(
@@ -513,6 +515,7 @@ impl Venue {
     ) -> Result<OrderState, String> {
         match self {
             Venue::Gate(c) => c.place(local, symbol, side, qty, price, ref_px).await,
+            Venue::Kucoin(c) => c.place(local, symbol, side, qty, price).await,
             Venue::Binance(c) => c.place(local, symbol, side, qty, price).await,
             Venue::Bybit(c) => c.place(local, symbol, side, qty, price).await,
             Venue::Aster(c) => c.place(local, symbol, side, qty, price).await,
@@ -526,6 +529,7 @@ impl Venue {
             Venue::Aster(c) => c.query(symbol, id).await,
             Venue::Okx(c) => c.query(symbol, id).await,
             Venue::Gate(c) => c.query(symbol, id).await,
+            Venue::Kucoin(c) => c.query(symbol, id).await,
         }
     }
     async fn cancel(&self, symbol: &str, id: &str) -> Result<OrderState, String> {
@@ -535,6 +539,7 @@ impl Venue {
             Venue::Aster(c) => c.cancel(symbol, id).await,
             Venue::Okx(c) => c.cancel(symbol, id).await,
             Venue::Gate(c) => c.cancel(symbol, id).await,
+            Venue::Kucoin(c) => c.cancel(symbol, id).await,
         }
     }
     fn perp(&self) -> bool {
@@ -544,6 +549,7 @@ impl Venue {
             Venue::Aster(c) => c.perp,
             Venue::Okx(c) => c.perp,
             Venue::Gate(c) => c.perp,
+            Venue::Kucoin(c) => c.perp,
         }
     }
     async fn positions(&self) -> Result<Vec<(String, f64, f64)>, String> {
@@ -553,6 +559,7 @@ impl Venue {
             Venue::Aster(c) => c.positions().await,
             Venue::Okx(c) => c.positions().await,
             Venue::Gate(c) => c.positions().await,
+            Venue::Kucoin(c) => c.positions().await,
         }
     }
     async fn set_leverage(&self, symbol: &str, lev: f64) -> Result<(), String> {
@@ -562,6 +569,7 @@ impl Venue {
             Venue::Aster(c) => c.set_leverage(symbol, lev).await,
             Venue::Okx(c) => c.set_leverage(symbol, lev).await,
             Venue::Gate(c) => c.set_leverage(symbol, lev).await,
+            Venue::Kucoin(c) => c.set_leverage(symbol, lev).await,
         }
     }
     async fn networks(&self, coin: &str) -> Result<Vec<crate::transfer::Net>, String> {
@@ -599,6 +607,7 @@ impl Venue {
             Venue::Aster(c) => c.balances().await,
             Venue::Okx(c) => c.balances().await,
             Venue::Gate(c) => c.balances().await,
+            Venue::Kucoin(c) => c.balances().await,
         }
     }
 }
@@ -715,6 +724,8 @@ pub enum StreamMsg {
     Ready,
     /// Отправить ответ (подписка после входа).
     Send(String),
+    /// Отправить несколько сообщений (подписки после приветствия).
+    SendMany(Vec<String>),
     Fail(String),
     /// Применить событие к живому счёту.
     Apply(Box<dyn FnOnce(&mut Live) + Send>),
@@ -735,6 +746,7 @@ impl Venue {
             Venue::Bybit(_) => Ok(crate::bybit_api::private_url(testnet)),
             Venue::Okx(_) => Ok(crate::okx_api::private_url(testnet)),
             Venue::Gate(c) => c.stream_url().await,
+            Venue::Kucoin(c) => c.stream_url().await,
             Venue::Aster(c) => {
                 let k = c
                     .listen_key(reqwest::Method::POST)
@@ -748,16 +760,18 @@ impl Venue {
         }
     }
 
-    /// Сообщения сразу после подключения (вход, подписка); пусто — поток готов сразу (listenKey).
-    fn stream_hello(&self, sub: &str) -> Vec<String> {
+    /// Сообщения сразу после подключения (вход, подписка); None — поток готов сразу (listenKey), пустой список —
+    /// ждать приветствия сервера (KuCoin).
+    fn stream_hello(&self, sub: &str) -> Option<Vec<String>> {
         match self {
-            Venue::Binance(c) if !c.perp => {
-                vec![c.ws_request(sub, "userDataStream.subscribe.signature")]
-            }
-            Venue::Bybit(c) => vec![c.auth_message()],
-            Venue::Okx(c) => vec![c.login()],
-            Venue::Gate(c) => c.subscriptions(),
-            _ => Vec::new(),
+            Venue::Binance(c) if !c.perp => Some(vec![
+                c.ws_request(sub, "userDataStream.subscribe.signature"),
+            ]),
+            Venue::Bybit(c) => Some(vec![c.auth_message()]),
+            Venue::Okx(c) => Some(vec![c.login()]),
+            Venue::Gate(c) => Some(c.subscriptions()),
+            Venue::Kucoin(_) => Some(Vec::new()),
+            _ => None,
         }
     }
 
@@ -767,6 +781,7 @@ impl Venue {
             Venue::Bybit(_) => Some(r#"{"op":"ping"}"#.into()),
             Venue::Okx(_) => Some("ping".into()),
             Venue::Gate(c) => Some(c.ping()),
+            Venue::Kucoin(c) => Some(c.ping()),
             _ => None,
         }
     }
@@ -812,6 +827,7 @@ impl Venue {
                 },
             },
             Venue::Gate(c) => c.stream_parse(&v),
+            Venue::Kucoin(c) => c.stream_parse(&v),
             Venue::Okx(c) => match v["event"].as_str() {
                 Some("login") if v["code"] == "0" => StreamMsg::Send(c.subscribe()),
                 Some("login") | Some("error") => {
@@ -935,11 +951,11 @@ async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) 
                     tracing::info!("[{ex}] поток событий счёта подключён");
                     with_live(acc, &ex, |l| l.stream_ok = true);
                 };
-                if hello.is_empty() {
+                if hello.is_none() {
                     backoff.reset();
                     ready(&acc);
                 }
-                for m in hello {
+                for m in hello.unwrap_or_default() {
                     if let Err(e) = ws.send(Message::text(m)).await {
                         err = e.to_string();
                     }
@@ -966,6 +982,13 @@ async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) 
                             StreamMsg::Ready => {
                                 backoff.reset();
                                 ready(&acc);
+                            }
+                            StreamMsg::SendMany(ms) => {
+                                for m in ms {
+                                    if let Err(e) = ws.send(Message::text(m)).await {
+                                        err = e.to_string();
+                                    }
+                                }
                             }
                             StreamMsg::Send(m) => {
                                 err = ws
