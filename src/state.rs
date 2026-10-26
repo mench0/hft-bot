@@ -4,6 +4,7 @@
 use crate::data;
 use crate::feed;
 use crate::market::Market;
+use crate::paper::{Amount, Fill, Limits, Paper, Side};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -41,6 +42,10 @@ pub struct Bot {
     pub market: Arc<Market>,
     /// Задачи фидов по биржам (пока соединения подняты).
     feeds: Mutex<HashMap<String, JoinHandle<()>>>,
+    /// Бумажные счета подключённых бирж.
+    pub accounts: Arc<Mutex<HashMap<String, Paper>>>,
+    /// Исполнение стоящих бумажных заявок по стакану (пока соединения подняты).
+    matcher: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Bot {
@@ -65,6 +70,8 @@ impl Bot {
             path,
             market: Arc::default(),
             feeds: Mutex::default(),
+            accounts: Arc::default(),
+            matcher: Mutex::default(),
         };
         bot.persist();
         bot
@@ -298,6 +305,7 @@ impl Bot {
         for ex in &exchanges {
             self.restart_feed(ex);
         }
+        *self.matcher.lock().unwrap() = Some(self.spawn_matcher());
         tracing::info!("Соединения подняты: {exchanges:?}");
         Ok(())
     }
@@ -308,7 +316,11 @@ impl Bot {
         for (_, t) in self.feeds.lock().unwrap().drain() {
             t.abort();
         }
+        if let Some(t) = self.matcher.lock().unwrap().take() {
+            t.abort();
+        }
         self.market.clear();
+        self.accounts.lock().unwrap().clear();
         tracing::info!("Соединения остановлены");
     }
 
@@ -332,6 +344,7 @@ impl Bot {
             self.market.with_feed(ex, |f| *f = Default::default());
             return;
         }
+        self.ensure_account(ex, &symbols);
         match feed::start(self.market.clone(), ex, symbols.clone(), &self.params(ex)) {
             feed::Plan::Run(h) => {
                 self.feeds.lock().unwrap().insert(ex.to_owned(), h);
@@ -345,6 +358,210 @@ impl Bot {
                 });
             }
         }
+    }
+
+    /// Бумажный счёт биржи: создать со стартовым балансом или добавить валюту новой монеты.
+    fn ensure_account(&self, ex: &str, symbols: &[String]) {
+        let p = self.params(ex);
+        let start = p
+            .get("paperStartBalance")
+            .and_then(Value::as_f64)
+            .unwrap_or(1000.0);
+        let fee = |k: &str| {
+            data::catalog()["exchanges"]
+                .as_array()
+                .and_then(|a| a.iter().find(|e| e["id"] == ex))
+                .and_then(|e| e[k].as_f64())
+                .unwrap_or(0.1)
+        };
+        let mut acc = self.accounts.lock().unwrap();
+        let a = acc
+            .entry(ex.to_owned())
+            .or_insert_with(|| Paper::new(symbols, start, fee("makerFeePct"), fee("takerFeePct")));
+        for s in symbols {
+            a.ensure_quote(s, start);
+        }
+    }
+
+    /// Раз в 50 мс исполнить стоящие бумажные заявки, через которые прошла цена.
+    fn spawn_matcher(&self) -> JoinHandle<()> {
+        let (accounts, market) = (self.accounts.clone(), self.market.clone());
+        let limits: HashMap<String, Limits> = self
+            .snapshot()
+            .selection
+            .keys()
+            .map(|ex| (ex.clone(), Limits::from_params(&self.params(ex))))
+            .collect();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
+            loop {
+                tick.tick().await;
+                let mut acc = accounts.lock().unwrap();
+                for (ex, a) in acc.iter_mut() {
+                    if a.open_orders() == 0 {
+                        continue;
+                    }
+                    let lim = limits
+                        .get(ex)
+                        .cloned()
+                        .unwrap_or_else(|| Limits::from_params(&Map::new()));
+                    for sym in market.feed(ex).map(|f| f.symbols).unwrap_or_default() {
+                        if let Some(b) = market.book(ex, &sym).filter(|b| b.is_ready()) {
+                            a.match_resting(&sym, &b, &lim);
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    fn running_exchange(&self, ex: &str) -> ActionResult<()> {
+        if !self.running() {
+            return Err("Соединения не подняты".into());
+        }
+        if !self.accounts.lock().unwrap().contains_key(ex) {
+            return Err(format!("биржа {ex} не запущена"));
+        }
+        Ok(())
+    }
+
+    /// Ручной ордер на бумажном счёте (спот).
+    pub fn place_order(
+        &self,
+        ex: &str,
+        symbol: &str,
+        side: Side,
+        amount: Amount,
+        price: Option<f64>,
+    ) -> ActionResult<Fill> {
+        self.running_exchange(ex)?;
+        let p = self.params(ex);
+        if p.get("market").and_then(Value::as_str) == Some("perp") {
+            return Err(
+                "бумажные перпы в Rust-бэкенде пока не поддерживаются — переключите рынок на spot"
+                    .into(),
+            );
+        }
+        let sym = symbol.trim().to_uppercase();
+        if !self
+            .snapshot()
+            .selection
+            .get(ex)
+            .is_some_and(|l| l.contains(&sym))
+        {
+            return Err(format!("{sym} не выбран на {ex}"));
+        }
+        let book = self.market.book(ex, &sym);
+        let res = self.accounts.lock().unwrap().get_mut(ex).unwrap().order(
+            &sym,
+            side,
+            amount,
+            price,
+            book.as_ref(),
+            &Limits::from_params(&p),
+        );
+        match &res {
+            Ok(f) => tracing::info!(
+                "[{ex}] ордер {sym} {side:?}: {} {} @ {}",
+                f.status,
+                f.executed,
+                f.avg_price
+            ),
+            Err(e) => tracing::warn!("[{ex}] ордер {sym} {side:?} отклонён: {e}"),
+        }
+        res
+    }
+
+    /// Снять бумажные заявки символа.
+    pub fn cancel_all(&self, ex: &str, symbol: &str) -> ActionResult<usize> {
+        self.running_exchange(ex)?;
+        Ok(self
+            .accounts
+            .lock()
+            .unwrap()
+            .get_mut(ex)
+            .unwrap()
+            .cancel_all(Some(symbol)))
+    }
+
+    /// Свободные балансы бумажного счёта.
+    pub fn balances(&self, ex: &str) -> ActionResult<std::collections::BTreeMap<String, f64>> {
+        self.running_exchange(ex)?;
+        Ok(self.accounts.lock().unwrap()[ex].balances())
+    }
+
+    /// Сбросить бумажный счёт к стартовому балансу.
+    pub fn reset_account(&self, ex: &str) -> ActionResult<Value> {
+        self.running_exchange(ex)?;
+        self.accounts.lock().unwrap().remove(ex);
+        let symbols = self
+            .snapshot()
+            .selection
+            .get(ex)
+            .cloned()
+            .unwrap_or_default();
+        self.ensure_account(ex, &symbols);
+        Ok(self.account_json(ex).unwrap_or(Value::Null))
+    }
+
+    /// Тестовый счёт биржи для админки; None — биржа не запущена.
+    pub fn account_json(&self, ex: &str) -> Option<Value> {
+        let mids: HashMap<String, f64> = self
+            .market
+            .feed(ex)
+            .map(|f| f.symbols)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|s| {
+                self.market
+                    .book(ex, &s)
+                    .and_then(|b| b.mid())
+                    .map(|m| (s, m))
+            })
+            .collect();
+        self.accounts
+            .lock()
+            .unwrap()
+            .get_mut(ex)
+            .map(|a| a.account_json(&mids))
+    }
+
+    /// Биржи для команды торговли: «all» — все выбранные.
+    fn targets(&self, target: &str) -> Vec<String> {
+        let sel = self.snapshot().selection;
+        if target == "all" {
+            sel.keys().cloned().collect()
+        } else {
+            sel.keys().filter(|k| *k == target).cloned().collect()
+        }
+    }
+
+    /// Включить или выключить торговлю (параметр tradingEnabled); включение снимает kill switch.
+    pub fn set_trading(&self, target: &str, on: bool) -> ActionResult<()> {
+        let t = self.targets(target);
+        if t.is_empty() {
+            return Err(format!("Нет выбранной биржи {target}"));
+        }
+        for ex in &t {
+            let mut m = Map::new();
+            m.insert("tradingEnabled".into(), Value::String(on.to_string()));
+            self.update_params(ex, &m)?;
+            if on && let Some(a) = self.accounts.lock().unwrap().get_mut(ex) {
+                a.kill_switch = false;
+            }
+        }
+        Ok(())
+    }
+
+    /// Аварийная остановка: торговля выключена, все бумажные заявки сняты.
+    pub fn panic(&self, target: &str) -> ActionResult<()> {
+        self.set_trading(target, false)?;
+        for ex in self.targets(target) {
+            if let Some(a) = self.accounts.lock().unwrap().get_mut(&ex) {
+                a.cancel_all(None);
+            }
+        }
+        Ok(())
     }
 }
 

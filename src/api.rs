@@ -2,6 +2,7 @@
 //! ответы — JSON с русскими ключами, ошибка — `{"результат": "ошибка", "сообщение": "..."}`.
 
 use crate::data;
+use crate::paper::{Amount, Side};
 use crate::state::Bot;
 use axum::extract::{Query, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
@@ -117,6 +118,14 @@ pub fn router(bot: Arc<Bot>, cfg: AdminConfig) -> Router {
         )
         .route("/discovery", get(discovery))
         .route("/market", get(market))
+        .route("/order", axum::routing::post(order))
+        .route("/cancel-all", axum::routing::post(cancel_all))
+        .route("/balances", get(balances))
+        .route("/paper/reset", axum::routing::post(reset_account))
+        .route("/account/reset", axum::routing::post(reset_account))
+        .route("/trading/start", axum::routing::post(trading_start))
+        .route("/trading/stop", axum::routing::post(trading_stop))
+        .route("/trading/panic", axum::routing::post(trading_panic))
         .route("/settings", get(settings).post(settings_update))
         .route(
             "/exchange/params/schema",
@@ -269,6 +278,17 @@ fn status_json(bot: &Bot) -> Value {
                 "переподключений": f.reconnects,
                 "символы": f.symbols,
             });
+            if let Some(acc) = bot.account_json(ex) {
+                let a = bot.accounts.lock().unwrap();
+                if let Some(p) = a.get(ex) {
+                    e["kill_switch"] = Value::Bool(p.kill_switch);
+                    e["дневной_pnl"] = json!(p.daily_pnl);
+                    e["ордеров_принято"] = json!(p.accepted);
+                    e["ордеров_отклонено"] = json!(p.rejected);
+                    e["последний_отказ"] = Value::String(p.last_reject.clone());
+                }
+                e["тестовый_счёт"] = acc;
+            }
             if !f.last_error.is_empty() {
                 e["ошибка"] = Value::String(f.last_error);
             }
@@ -313,6 +333,85 @@ async fn status(State(a): State<App>) -> Json<Value> {
 
 async fn discovery(State(a): State<App>) -> Json<Value> {
     Json(discovery_json(&a.bot))
+}
+
+fn num(q: &HashMap<String, String>, k: &str) -> Result<f64, ApiError> {
+    q.get(k).map_or(Ok(0.0), |v| {
+        v.trim()
+            .parse()
+            .map_err(|_| bad(format!("{k}: ожидается число")))
+    })
+}
+
+/// POST /order — ручной ордер на бумажном счёте: side BUY/SELL, type MARKET/LIMIT, qty, portion или all, price.
+async fn order(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiError> {
+    let ex = need(&q, "exchange")?;
+    let symbol = need(&q, "symbol")?;
+    let side = Side::parse(q.get("side").map_or("BUY", String::as_str))
+        .ok_or_else(|| bad("side: BUY или SELL"))?;
+    let limit = match q
+        .get("type")
+        .map_or("MARKET", String::as_str)
+        .to_uppercase()
+        .as_str()
+    {
+        "MARKET" => None,
+        "LIMIT" => Some(num(&q, "price")?),
+        _ => return Err(bad("Неподдерживаемая комбинация параметров")),
+    };
+    let amount = if q.get("all").is_some_and(|v| v == "true") {
+        Amount::All
+    } else if num(&q, "portion")? > 0.0 {
+        Amount::Portion(num(&q, "portion")?)
+    } else {
+        Amount::Qty(num(&q, "qty")?)
+    };
+    let f = a
+        .bot
+        .place_order(ex, symbol, side, amount, limit)
+        .map_err(bad)?;
+    Ok(Json(
+        json!({"биржа": ex, "orderId": f.order_id, "статус": f.status, "исполнено": f.executed, "средняя_цена": f.avg_price}),
+    ))
+}
+
+async fn cancel_all(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiError> {
+    let n = a
+        .bot
+        .cancel_all(need(&q, "exchange")?, need(&q, "symbol")?)
+        .map_err(bad)?;
+    Ok(ok(format!("Отменено ордеров: {n}")))
+}
+
+async fn balances(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        json!({"свободно": a.bot.balances(need(&q, "exchange")?).map_err(bad)?}),
+    ))
+}
+
+async fn reset_account(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        a.bot.reset_account(need(&q, "exchange")?).map_err(bad)?,
+    ))
+}
+
+fn target(q: &HashMap<String, String>) -> &str {
+    q.get("exchange").map_or("all", String::as_str)
+}
+
+async fn trading_start(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiError> {
+    a.bot.set_trading(target(&q), true).map_err(bad)?;
+    Ok(ok("Торговля включена"))
+}
+
+async fn trading_stop(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiError> {
+    a.bot.set_trading(target(&q), false).map_err(bad)?;
+    Ok(ok("Торговля остановлена"))
+}
+
+async fn trading_panic(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiError> {
+    a.bot.panic(target(&q)).map_err(bad)?;
+    Ok(ok("Все ордера отменены, торговля остановлена"))
 }
 
 async fn market(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiError> {
@@ -618,5 +717,99 @@ mod tests {
             call(&r, "GET", "/events?topics=/settings", "").await.0,
             StatusCode::BAD_REQUEST
         );
+    }
+
+    /// Сквозной сценарий бумажной торговли: стакан по WS → включить торговлю → рыночная покупка →
+    /// лимитная продажа исполняется, когда цена дошла → паника снимает заявки.
+    #[tokio::test]
+    async fn paper_trading_flow() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let price = Arc::new(std::sync::Mutex::new(100.0_f64));
+        let px = price.clone();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            for i in 1..400u64 {
+                let p = *px.lock().unwrap();
+                let msg = format!(
+                    r#"{{"stream":"btcusdt@depth20@100ms","data":{{"lastUpdateId":{i},"bids":[["{}","10"]],"asks":[["{}","10"]]}}}}"#,
+                    p - 0.5,
+                    p + 0.5
+                );
+                if ws.send(Message::text(msg)).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let (_d, r) = app("");
+        let sel = format!(
+            "/control/select?exchange=binance&symbols=BTCUSDT&market=spot&wsUrl=ws://{addr}/stream&maxPositionQuote=1000"
+        );
+        assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
+        assert_eq!(
+            call(&r, "POST", "/control/start", "").await.0,
+            StatusCode::OK
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // торговля выключена — отказ
+        let (c, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=binance&symbol=BTCUSDT&side=BUY&type=MARKET&qty=1",
+            "",
+        )
+        .await;
+        assert_eq!(c, StatusCode::BAD_REQUEST, "{v}");
+        assert!(v["сообщение"].as_str().unwrap().contains("выключена"));
+        call(&r, "POST", "/trading/start?exchange=binance", "").await;
+        let (c, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=binance&symbol=BTCUSDT&side=BUY&type=MARKET&qty=2",
+            "",
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        assert_eq!(v["статус"], json!("FILLED"));
+        assert_eq!(v["средняя_цена"], json!(100.5));
+        let (_, b) = call(&r, "GET", "/balances?exchange=binance", "").await;
+        assert_eq!(b["свободно"]["BTC"], json!(2.0));
+        // лимитная продажа выше рынка ждёт, цена дошла — исполнилась мейкером
+        let (_, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=binance&symbol=BTCUSDT&side=SELL&type=LIMIT&qty=1&price=103",
+            "",
+        )
+        .await;
+        assert_eq!(v["статус"], json!("NEW"), "{v}");
+        *price.lock().unwrap() = 104.0;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let (_, s) = call(&r, "GET", "/status", "").await;
+        let acc = &s["binance"]["тестовый_счёт"];
+        assert_eq!(acc["openOrders"], json!(0), "{s}");
+        assert_eq!(acc["closedTrades"], json!(1));
+        assert!(acc["realizedPnl"].as_f64().unwrap() > 0.0);
+        assert_eq!(s["binance"]["ордеров_отклонено"], json!(1));
+        // паника: заявки сняты, торговля выключена
+        call(
+            &r,
+            "POST",
+            "/order?exchange=binance&symbol=BTCUSDT&side=BUY&type=LIMIT&qty=1&price=50",
+            "",
+        )
+        .await;
+        call(&r, "POST", "/trading/panic", "").await;
+        let (_, s) = call(&r, "GET", "/status", "").await;
+        assert_eq!(s["binance"]["тестовый_счёт"]["openOrders"], json!(0));
+        assert_eq!(s["binance"]["торговля_включена"], json!(false));
+        // сброс счёта
+        let (_, a) = call(&r, "POST", "/paper/reset?exchange=binance", "").await;
+        assert_eq!(a["closedTrades"], json!(0));
+        call(&r, "POST", "/control/stop", "").await;
     }
 }

@@ -61,6 +61,11 @@ impl Book {
         true
     }
 
+    /// Уровни стороны от лучшей цены: аски (для покупки) или биды (для продажи).
+    pub fn levels(&self, asks: bool) -> impl Iterator<Item = (f64, f64)> + '_ {
+        (if asks { &self.asks } else { &self.bids }).iter().copied()
+    }
+
     /// Есть обе стороны и они не перекрещены.
     pub fn is_ready(&self) -> bool {
         matches!((self.bids.first(), self.asks.first()), (Some(b), Some(a)) if b.0 < a.0)
