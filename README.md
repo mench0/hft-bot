@@ -26,6 +26,8 @@
   - **KuCoin** — спот и перпы: токен `bullet-public`, `level2Depth50` (перпы — объём лота × multiplier);
   - **MEXC** — спот: `spot@public.limit.depth.v3.api.pb` (protobuf, свой разбор, до 30 подписок); перпы: `sub.depth.full`
     (JSON, объём × contractSize);
+  - **Uniswap V2** — нода Ethereum по WebSocket: `eth_subscribe` на событие Sync пулов из `uniPools` + `eth_call`
+    getReserves для первого снимка; синтетический стакан по x·y=k (комиссия 0.3%);
   - **LBank**, **Upbit** — спот: снимки `depth` / `orderbook` (у Upbit кадры бинарные);
   - funding перпов всех этих бирж — их REST (Hyperliquid — `metaAndAssetCtxs`, раз в час);
   - Перпы OKX и Gate: объёмы в контрактах переводятся в монеты по размеру контракта (OKX `ctVal`, Gate

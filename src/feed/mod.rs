@@ -11,6 +11,7 @@ pub mod kucoin;
 pub mod lbank;
 pub mod mexc;
 pub mod okx;
+pub mod uniswap;
 pub mod upbit;
 
 use crate::market::Market;
@@ -244,9 +245,33 @@ pub fn start(
                 if perp { "перпов" } else { "спота" }
             ));
         }
+        "uniswapv2" if !perp => {
+            let pools = match uniswap::parse_pools(
+                params.get("uniPools").and_then(Value::as_str).unwrap_or(""),
+            ) {
+                Ok(p) if !p.is_empty() => p,
+                Ok(_) => {
+                    return Plan::Unsupported(
+                        "uniswapv2: задайте пулы в параметре uniPools".into(),
+                    );
+                }
+                Err(e) => return Plan::Unsupported(e),
+            };
+            // нода: wsUrl, иначе restUrl с ws://, иначе публичная
+            let url = ws_url.unwrap_or_else(|| {
+                params
+                    .get("restUrl")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.replacen("http", "ws", 1))
+                    .unwrap_or_else(|| uniswap::DEFAULT_URL.into())
+            });
+            Arc::new(uniswap::Uniswap::new(url, pools, &symbols))
+        }
         _ => {
             return Plan::Unsupported(format!(
-                "{ex}: фида в Rust-бэкенде ещё нет (Uniswap — нода Ethereum)"
+                "{ex}: у этой биржи нет {}",
+                if perp { "перпов" } else { "фида" }
             ));
         }
     };
