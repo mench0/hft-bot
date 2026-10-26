@@ -9,6 +9,7 @@ pub mod gate_futures;
 pub mod hyperliquid;
 pub mod kucoin;
 pub mod lbank;
+pub mod mexc;
 pub mod okx;
 pub mod upbit;
 
@@ -69,6 +70,10 @@ pub trait Dialect: Send + Sync + 'static {
     }
     /// Бинарный кадр в текст (Upbit — JSON в UTF-8, BingX — gzip); None — пропустить.
     fn binary(&self, _data: &[u8]) -> Option<String> {
+        None
+    }
+    /// Разбор бинарного кадра прямо в обновления (MEXC — protobuf); None — кадр текстовый, см. binary.
+    fn parse_binary(&self, _data: &[u8]) -> Option<Parsed> {
         None
     }
     /// Адрес подключения, если для него нужен запрос (KuCoin — токен bullet-public).
@@ -197,6 +202,20 @@ pub fn start(
             &symbols,
             perp,
         )),
+        "mexc" if perp => Arc::new(mexc::MexcFutures::new(
+            params
+                .get("restUrl")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(mexc::FUTURES_REST)
+                .to_owned(),
+            ws_url.unwrap_or_else(|| mexc::FUTURES_URL.into()),
+            &symbols,
+        )),
+        "mexc" => Arc::new(mexc::MexcSpot::new(
+            ws_url.unwrap_or_else(|| mexc::SPOT_URL.into()),
+            &symbols,
+        )),
         "lbank" if !perp => Arc::new(lbank::Lbank::new(
             ws_url.unwrap_or_else(|| lbank::URL.into()),
             &symbols,
@@ -213,7 +232,7 @@ pub fn start(
         }
         _ => {
             return Plan::Unsupported(format!(
-                "{ex}: фида в Rust-бэкенде ещё нет (MEXC — protobuf, Uniswap — нода Ethereum)"
+                "{ex}: фида в Rust-бэкенде ещё нет (Uniswap — нода Ethereum)"
             ));
         }
     };
@@ -237,6 +256,7 @@ pub fn start(
                 "aster" if perp => "https://fapi.asterdex.com",
                 "aster" => "https://sapi.asterdex.com",
                 "bingx" => "https://open-api.bingx.com",
+                "mexc" if perp => mexc::FUTURES_REST,
                 "kucoin" => kucoin::rest_url(perp),
                 "hyperliquid" if testnet => "https://api.hyperliquid-testnet.xyz",
                 "hyperliquid" => "https://api.hyperliquid.xyz",
@@ -348,7 +368,18 @@ pub async fn run(market: Arc<Market>, ex: String, d: Arc<dyn Dialect>) {
                             Some(Ok(m @ (Message::Text(_) | Message::Binary(_)))) => {
                                 let t = match m {
                                     Message::Text(t) => Some(t.to_string()),
-                                    Message::Binary(b) => d.binary(&b),
+                                    // protobuf (MEXC) — сразу в обновления
+                                    Message::Binary(b) => match d.parse_binary(&b) {
+                                        Some(r) => {
+                                            market.with_feed(&ex, |f| f.messages += 1);
+                                            match r {
+                                                Ok(ups) => for u in ups { apply(&market, &ex, u); },
+                                                Err(e) => err = e,
+                                            }
+                                            None
+                                        }
+                                        None => d.binary(&b),
+                                    },
                                     _ => None,
                                 };
                                 if let Some(t) = t {
