@@ -308,6 +308,10 @@ fn status_json(bot: &Bot) -> Value {
             if let Some(acc) = bot.account_json(ex) {
                 e["тестовый_счёт"] = acc;
             }
+            let orph = bot.orphans_json(ex);
+            if orph["позиции"] != json!([]) || orph["закрыто"] != json!(0) {
+                e["без_стратегии"] = orph;
+            }
             if !f.last_error.is_empty() {
                 e["ошибка"] = Value::String(f.last_error);
             }
@@ -2663,7 +2667,8 @@ mod tests {
                     x.pos += if o["b"] == true { q } else { -q };
                     let _ = ev_tx.send(json!({"channel": "orderUpdates", "data": [{"status": "filled",
                         "order": {"oid": 9, "coin": "BTC", "cloid": o["c"], "origSz": o["s"], "sz": "0", "limitPx": o["p"]}}]}).to_string());
-                    return Json(json!({"status": "ok", "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 9}}]}}}));
+                    // IOC исполняется сразу: биржа отвечает объёмом и средней ценой
+                    return Json(json!({"status": "ok", "response": {"type": "order", "data": {"statuses": [{"filled": {"oid": 9, "totalSz": o["s"], "avgPx": "99.9"}}]}}}));
                 }
                 Json(json!({"status": "ok", "response": {"type": "default"}}))
             }));
@@ -2974,6 +2979,104 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert_eq!(ex.lock().unwrap().bad, 0, "все подписи верны");
+        call(&r, "POST", "/control/stop", "").await;
+    }
+
+    /// Сторож перпов на бумаге: ручная позиция — без стратегии, видна в /status; цена ушла против неё на 2 % — закрыта.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn orphan_guard_closes_paper_perp_position() {
+        use futures_util::SinkExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio_tungstenite::tungstenite::Message;
+        let rest = Router::new()
+            .route("/fapi/v1/exchangeInfo", get(|| async { Json(json!({"symbols": [{"symbol": "BTCUSDT", "filters": [
+                {"filterType": "PRICE_FILTER", "tickSize": "0.1"}, {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"}]}]})) }))
+            .route("/fapi/v1/premiumIndex", get(|| async {
+                Json(json!({"symbol": "BTCUSDT", "markPrice": "100", "lastFundingRate": "0", "nextFundingTime": now_ms() + 3_600_000}))
+            }));
+        let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let raddr = rl.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(rl, rest).await.unwrap() });
+        let up = Arc::new(AtomicBool::new(false));
+        let up2 = up.clone();
+        let wl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let waddr = wl.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = wl.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            for i in 1..2000u64 {
+                let (b, a) = if up2.load(Ordering::SeqCst) {
+                    ("102.9", "103")
+                } else {
+                    ("100", "100.1")
+                };
+                let m = format!(
+                    r#"{{"stream":"btcusdt@depth20@100ms","data":{{"lastUpdateId":{i},"bids":[["{b}","10"]],"asks":[["{a}","10"]]}}}}"#
+                );
+                if ws.send(Message::text(m)).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            loop {
+                let _ = wl.accept().await;
+            }
+        });
+        let (_d, r) = app("");
+        let sel = format!(
+            "/control/select?exchange=binance&symbols=BTCUSDT&market=perp&leverage=5&wsUrl=ws://{waddr}/stream&restUrl=http://{raddr}&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
+        );
+        assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
+        call(&r, "POST", "/control/start", "").await;
+        call(&r, "POST", "/trading/start", "").await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let (_, m) = call(&r, "GET", "/market?exchange=binance", "").await;
+            if m["BTCUSDT"]["лучший_аск"].is_number() {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < until, "стакан: {m}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let (c, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=binance&symbol=BTCUSDT&side=SELL&type=MARKET&qty=1",
+            "",
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        // шорт от 100 — без стратегии, под защитой; цена в пределах стопа — держится
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let (_, s) = call(&r, "GET", "/status", "").await;
+            if s["binance"]["без_стратегии"]["позиции"] == json!(["BTCUSDT"]) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "сирота не замечена: {s}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        up.store(true, Ordering::SeqCst);
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let (_, s) = call(&r, "GET", "/status", "").await;
+            if s["binance"]["тестовый_счёт"]["positions"] == json!([]) {
+                assert_eq!(
+                    s["binance"]["без_стратегии"],
+                    json!({"позиции": [], "закрыто": 1}),
+                    "{s}"
+                );
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "сирота не закрыта: {s}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         call(&r, "POST", "/control/stop", "").await;
     }
 

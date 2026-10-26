@@ -533,14 +533,17 @@ impl Client {
                     .filter_map(|e| {
                         let o = &e["order"];
                         let local = o["cloid"].as_str().and_then(local_of)?;
-                        Some((
-                            local,
-                            self.state(
-                                &o["oid"].to_string(),
-                                o,
-                                e["status"].as_str().unwrap_or(""),
-                            ),
-                        ))
+                        let oid = o["oid"].to_string();
+                        let st = self.state(&oid, o, e["status"].as_str().unwrap_or(""));
+                        // исполнение без своих сделок (userFills ещё не пришли): цена ордера — не цена сделки (у IOC
+                        // это предел ±5 %), такое событие пропускаем — сумму дадут userFills, итог — ответ или опрос
+                        let exact = self
+                            .fills
+                            .lock()
+                            .unwrap()
+                            .get(&oid)
+                            .is_some_and(|(q, _)| (*q - st.executed).abs() < 1e-9);
+                        (st.executed == 0.0 || exact).then_some((local, st))
                     })
                     .collect();
                 apply(ups)

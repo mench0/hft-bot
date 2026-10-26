@@ -64,6 +64,10 @@ pub struct Bot {
     pub screener_sources: crate::screener::Sources,
     /// Последнее учтённое время funding по (биржа, символ).
     funding_applied: Mutex<HashMap<(String, String), u64>>,
+    /// Сторож перпов: позиции без стратегии — с какого момента замечены (биржа, символ) → мс; закрыто по биржам.
+    /// (замечена, отправлен выход), мс.
+    pub orphans: Mutex<HashMap<(String, String), (u64, u64)>>,
+    pub orphans_closed: Mutex<HashMap<String, u64>>,
 }
 
 /// Комиссия биржи из каталога, % (makerFeePct / takerFeePct).
@@ -118,6 +122,8 @@ impl Bot {
             screener: Arc::default(),
             screener_sources: crate::screener::Sources::default(),
             funding_applied: Mutex::default(),
+            orphans: Mutex::default(),
+            orphans_closed: Mutex::default(),
         };
         bot.persist();
         bot
@@ -508,6 +514,125 @@ impl Bot {
         }
     }
 
+    /// Позиции перпов без стратегии (остались после перезапуска, открыты вручную, стратегия выключена) — под защиту
+    /// (guardOrphans, по умолчанию да): стоп-лосс orphanStopLossPercent (по умолчанию 2 %) от цены входа по середине стакана
+    /// и, если задан, таймаут orphanMaxHoldMinutes с момента, как бот их заметил. Закрытие — рыночным выходом (проходит и при
+    /// выключенной торговле).
+    fn guard_orphans(
+        &self,
+        ex: &str,
+        acc: &mut Account,
+        params: &serde_json::Map<String, Value>,
+        owned: &std::collections::HashSet<String>,
+        books: &HashMap<String, Book>,
+    ) {
+        let on = params
+            .get("guardOrphans")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let sl = params
+            .get("orphanStopLossPercent")
+            .and_then(Value::as_f64)
+            .unwrap_or(2.0);
+        let hold = params
+            .get("orphanMaxHoldMinutes")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let now = crate::util::now_ms();
+        let mut orphans = self.orphans.lock().unwrap();
+        let positions: Vec<(String, f64, f64)> = acc
+            .positions()
+            .into_iter()
+            .filter(|(_, q, _)| q.abs() > 1e-12)
+            .collect();
+        // закрытые и снова занятые стратегиями — не сироты
+        orphans.retain(|(e, s), _| {
+            e != ex || positions.iter().any(|(p, _, _)| p == s) && !owned.contains(s)
+        });
+        if !on {
+            return;
+        }
+        for (sym, qty, entry) in positions {
+            if owned.contains(&sym) {
+                continue;
+            }
+            let key = (ex.to_owned(), sym.clone());
+            let (since, closing) = *orphans.entry(key.clone()).or_insert_with(|| {
+                tracing::warn!(
+                    "[{ex}] позиция {sym} {qty} @ {entry} без стратегии — беру под защиту: стоп-лосс {sl}%{}",
+                    if hold > 0.0 { format!(", закрытие через {hold} мин") } else { String::new() }
+                );
+                (now, 0)
+            });
+            // выход уже отправлен (живой счёт исполняет его в фоне) — ждём 10 с, прежде чем повторить
+            if closing > 0 && now.saturating_sub(closing) < 10_000 {
+                continue;
+            }
+            let book = books
+                .get(&sym)
+                .cloned()
+                .or_else(|| self.market.book(ex, &sym));
+            let Some(mid) = book.as_ref().filter(|b| b.is_ready()).and_then(Book::mid) else {
+                continue; // нет свежей цены — ждём
+            };
+            if entry <= 0.0 {
+                continue;
+            }
+            let pnl = qty.signum() * (mid - entry) / entry * 100.0;
+            let why = if pnl <= -sl {
+                format!("стоп-лосс {pnl:.2}%")
+            } else if hold > 0.0 && now.saturating_sub(since) as f64 >= hold * 60_000.0 {
+                "таймаут".to_owned()
+            } else {
+                continue;
+            };
+            tracing::warn!("[{ex}] закрываю позицию {sym} без стратегии ({why})");
+            let side = if qty > 0.0 {
+                crate::paper::Side::Sell
+            } else {
+                crate::paper::Side::Buy
+            };
+            match acc.exit_market(&sym, side, qty.abs(), book.as_ref()) {
+                Ok(f) if f.executed > 0.0 => {
+                    orphans.remove(&key);
+                    *self
+                        .orphans_closed
+                        .lock()
+                        .unwrap()
+                        .entry(ex.to_owned())
+                        .or_default() += 1;
+                }
+                // живой счёт: ордер ушёл, позиция исчезнет после исполнения
+                Ok(_) if acc.is_live() => {
+                    if closing == 0 {
+                        *self
+                            .orphans_closed
+                            .lock()
+                            .unwrap()
+                            .entry(ex.to_owned())
+                            .or_default() += 1;
+                    }
+                    orphans.insert(key, (since, now));
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("[{ex}] позиция {sym} без стратегии не закрыта: {e}"),
+            }
+        }
+    }
+
+    /// Сироты биржи для /status.
+    pub fn orphans_json(&self, ex: &str) -> Value {
+        let o: Vec<String> = self
+            .orphans
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(e, _)| e == ex)
+            .map(|(_, s)| s.clone())
+            .collect();
+        json!({"позиции": o, "закрыто": self.orphans_closed.lock().unwrap().get(ex).copied().unwrap_or(0)})
+    }
+
     /// Счёт биржи: создать (бумажный со стартовым балансом или живой) или добавить валюту новой монеты.
     fn ensure_account(&self, ex: &str, symbols: &[String]) {
         let p = self.params(ex);
@@ -800,6 +925,12 @@ impl Bot {
                 &busy,
                 now,
             );
+            // сторож перпов: позиции, которыми не управляет ни одна стратегия
+            if paper.is_perp() {
+                let owned: std::collections::HashSet<String> =
+                    busy.into_iter().chain(sa.held()).collect();
+                self.guard_orphans(&ex, paper, &params, &owned, &books);
+            }
         }
         // межбиржевой арбитраж на споте: все счета сразу
         let sp = crate::spotarb::Params::from(&self.settings());

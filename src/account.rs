@@ -90,6 +90,15 @@ impl Account {
         }
     }
 
+    /// Позиции перпов: (символ, объём со знаком, цена входа).
+    pub fn positions(&mut self) -> Vec<(String, f64, f64)> {
+        self.ledger_mut()
+            .positions
+            .iter()
+            .map(|(s, p)| (s.clone(), p.qty, p.entry))
+            .collect()
+    }
+
     /// Символы, по которым есть позиция или стоп.
     pub fn stop_symbols(&mut self) -> Vec<String> {
         let led = self.ledger_mut();
