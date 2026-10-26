@@ -21,7 +21,7 @@
   - **Gate** — спот: `spot.order_book` (снимки 20 уровней) + `spot.book_ticker`; перпы: `futures.order_book` +
     `futures.book_ticker`.
   - **Aster** — спот и перпы: потоки как у Binance (`depth20@100ms` + `bookTicker`);
-  - **Hyperliquid** — перпы: `l2Book` по монете (снимки);
+  - **Hyperliquid** — перпы и спот: `l2Book` по монете (снимки; спот — по имени пары из `spotMeta`);
   - **BingX** — спот и перпы: `depth20` (кадры gzip, ответ на пинг сервера);
   - **KuCoin** — спот и перпы: токен `bullet-public`, `level2Depth50` (перпы — объём лота × multiplier);
   - **MEXC** — спот: `spot@public.limit.depth.v3.api.pb` (protobuf, свой разбор, до 30 подписок); перпы: `sub.depth.full`

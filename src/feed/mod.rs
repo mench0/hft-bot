@@ -224,7 +224,21 @@ pub fn start(
             ws_url.unwrap_or_else(|| upbit::URL.into()),
             &symbols,
         )),
-        "hyperliquid" | "lbank" | "upbit" => {
+        "hyperliquid" => Arc::new(hyperliquid::Hyperliquid::new_spot(
+            ws_url.unwrap_or_else(|| hyperliquid::default_url(testnet).into()),
+            params
+                .get("restUrl")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(if testnet {
+                    "https://api.hyperliquid-testnet.xyz"
+                } else {
+                    "https://api.hyperliquid.xyz"
+                })
+                .to_owned(),
+            &symbols,
+        )),
+        "lbank" | "upbit" => {
             return Plan::Unsupported(format!(
                 "{ex}: {} в Rust-бэкенде ещё нет",
                 if perp { "перпов" } else { "спота" }
