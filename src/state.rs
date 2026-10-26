@@ -55,6 +55,8 @@ pub struct Bot {
     statarbs: Mutex<HashMap<String, crate::statarb::StatArb>>,
     /// Межбиржевой арбитраж на споте (один на процесс).
     spotarb: Mutex<crate::spotarb::SpotArb>,
+    /// Lead-lag (один на процесс).
+    leadlag: Mutex<crate::leadlag::LeadLag>,
     /// Скринер (подбор тикеров).
     pub screener: Arc<Mutex<crate::screener::Screener>>,
     pub screener_sources: crate::screener::Sources,
@@ -109,6 +111,7 @@ impl Bot {
             spreads: Mutex::default(),
             statarbs: Mutex::default(),
             spotarb: Mutex::default(),
+            leadlag: Mutex::default(),
             screener: Arc::default(),
             screener_sources: crate::screener::Sources::default(),
             funding_applied: Mutex::default(),
@@ -533,6 +536,8 @@ impl Bot {
         let now = std::time::Instant::now();
         let exchanges: Vec<String> = self.accounts.lock().unwrap().keys().cloned().collect();
         let mut cross: HashMap<String, (HashMap<String, Book>, Limits)> = HashMap::new();
+        // «биржа:символ», занятые стратегиями одной биржи (lead-lag их не трогает)
+        let mut busy_cross: std::collections::HashSet<String> = std::collections::HashSet::new();
         for ex in exchanges {
             let params = self.params(&ex);
             let lim = Limits::from_params(&params);
@@ -579,6 +584,15 @@ impl Bot {
             let mut sas = self.statarbs.lock().unwrap();
             let sa = sas.entry(ex.clone()).or_default();
             let sa_held = sa.held();
+            // монеты этой биржи, занятые позициями lead-lag
+            let ll_held: std::collections::HashSet<String> = self
+                .leadlag
+                .lock()
+                .unwrap()
+                .held()
+                .into_iter()
+                .filter_map(|k| k.strip_prefix(&format!("{ex}:")).map(str::to_owned))
+                .collect();
             let mut all = self.spreads.lock().unwrap();
             let sc = all
                 .entry(ex.clone())
@@ -586,7 +600,8 @@ impl Bot {
             for sym in &selected {
                 let bound = saved.symbol_strategies.get(&ex).and_then(|m| m.get(sym));
                 let mine = bound.is_none_or(|ids| ids.is_empty() || ids.contains(spread::ID))
-                    && !sa_held.contains(sym);
+                    && !sa_held.contains(sym)
+                    && !ll_held.contains(sym);
                 let book = books.get(sym);
                 if sp.enabled && lim.trading_enabled && mine {
                     let minutes =
@@ -613,7 +628,16 @@ impl Bot {
                 })
                 .cloned()
                 .collect();
-            let busy: std::collections::HashSet<String> = sc.symbols().into_iter().collect();
+            let busy: std::collections::HashSet<String> = sc
+                .symbols()
+                .into_iter()
+                .chain(ll_held.iter().cloned())
+                .collect();
+            busy_cross.extend(
+                busy.iter()
+                    .chain(sa_held.iter())
+                    .map(|s| format!("{ex}:{s}")),
+            );
             sa.step(
                 &books,
                 paper,
@@ -643,6 +667,16 @@ impl Bot {
             })
             .collect();
         self.spotarb.lock().unwrap().step(&mut venues, &sp, now);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.leadlag.lock().unwrap().step(
+            &mut venues,
+            &crate::leadlag::Params::from(&self.settings()),
+            &busy_cross,
+            now_ms,
+        );
     }
 
     /// Биржи подбора (discoveryExchanges) и период автопересчёта.
@@ -747,7 +781,19 @@ impl Bot {
         } else {
             off.clone()
         };
-        json!({"perpPrice": off, "spotPrice": spot, "leadLag": off})
+        let ll = if self.running() {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            self.leadlag
+                .lock()
+                .unwrap()
+                .stats(&crate::leadlag::Params::from(&self.settings()), now_ms)
+        } else {
+            off.clone()
+        };
+        json!({"perpPrice": off, "spotPrice": spot, "leadLag": ll})
     }
 
     /// Состояние стратегий биржи для админки (/strategies).

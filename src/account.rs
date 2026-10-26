@@ -98,6 +98,11 @@ impl Account {
         }
     }
 
+    /// Позиция перпа по символу (спот — 0).
+    pub fn position_qty(&self, symbol: &str) -> f64 {
+        self.ledger().position(symbol).qty
+    }
+
     /// Счёт перпов.
     pub fn is_perp(&self) -> bool {
         self.ledger().leverage().is_some()

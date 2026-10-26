@@ -10,6 +10,7 @@ mod book;
 mod bybit_api;
 mod data;
 mod feed;
+mod leadlag;
 mod live;
 mod market;
 mod paper;
