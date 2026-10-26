@@ -160,9 +160,104 @@ mod tests {
         let d = Arc::new(Binance {
             url: stream_url(&format!("{addr}/stream"), &["BTCUSDT".into()], true),
         });
-        let task = tokio::spawn(run(m.clone(), "binance".into(), d));
+        let task = tokio::spawn(run(m.clone(), "binance".into(), d, Default::default()));
         let b = testkit::wait_ready(&m, "binance", "BTCUSDT").await;
         assert_eq!(b.mid(), Some(100.5));
+        task.abort();
+    }
+
+    /// Ошибки биржи в потоке ниже порога wsMaxParseErrors соединение не рвут.
+    #[tokio::test]
+    async fn parse_errors_below_limit_keep_connection() {
+        let err = r#"{"channel":"error","data":"x"}"#.to_owned();
+        let snap = r#"{"channel":"l2Book","data":{"coin":"BTC","time":5,"levels":[[{"px":"100","sz":"1","n":1}],[{"px":"101","sz":"1","n":1}]]}}"#.to_owned();
+        let (addr, _) = testkit::server(vec![err.clone(), err.clone(), err, snap]).await;
+        let m = Arc::new(Market::default());
+        let d = Arc::new(crate::feed::hyperliquid::Hyperliquid::new(
+            addr,
+            &["BTCUSDC".into()],
+        ));
+        let task = tokio::spawn(run(m.clone(), "hyperliquid".into(), d, Default::default()));
+        testkit::wait_ready(&m, "hyperliquid", "BTCUSDC").await;
+        let f = m.feed("hyperliquid").unwrap();
+        assert_eq!((f.parse_errors, f.reconnects), (3, 0), "{f:?}");
+        task.abort();
+    }
+
+    /// Устойчивость: тишина — переподключение; сервер исчез —
+    /// после feedMaxFailures неудач подряд источник сдаётся.
+    #[tokio::test]
+    async fn silence_parse_errors_and_give_up() {
+        let snap = r#"{"stream":"btcusdt@depth20@100ms","data":{"lastUpdateId":10,"bids":[["100","1"]],"asks":[["101","1"]]}}"#.to_owned();
+        let (addr, _) =
+            testkit::server(vec![snap, "мусор".into(), "{не json".into(), "ещё".into()]).await;
+        let m = Arc::new(Market::default());
+        let d = Arc::new(Binance {
+            url: stream_url(&format!("{addr}/stream"), &["BTCUSDT".into()], true),
+        });
+        let tune = super::super::Tune {
+            stale: std::time::Duration::from_millis(400),
+            reconnect_base: std::time::Duration::from_millis(50),
+            max_failures: 2,
+            ..Default::default()
+        };
+        let task = tokio::spawn(run(m.clone(), "binance".into(), d, tune));
+        testkit::wait_ready(&m, "binance", "BTCUSDT").await;
+        let until = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let f = m.feed("binance").unwrap();
+            if f.gave_up {
+                assert_eq!(f.silence_reconnects, 1, "соединение рвёт тишина: {f:?}");
+                assert!(f.failures >= 2 && f.down_since.is_some(), "{f:?}");
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "источник не сдался: {f:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        task.abort();
+    }
+
+    /// WebSocket недоступен дольше grace — стакан приходит REST-опросом; «слишком часто» не роняет опрос.
+    #[tokio::test]
+    async fn rest_fallback_while_ws_down() {
+        use axum::{Json, Router, routing::get};
+        let app = Router::new().route(
+            "/fapi/v1/depth",
+            get(|| async { Json(serde_json::json!({"lastUpdateId": 1, "bids": [["99", "2"]], "asks": [["99.5", "3"]]})) }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let m = Arc::new(Market::default());
+        m.with_feed("binance", |f| {
+            f.down_since = Some(std::time::Instant::now())
+        });
+        let tune = super::super::Tune {
+            grace: std::time::Duration::from_millis(0),
+            ..Default::default()
+        };
+        let task = tokio::spawn(super::super::rest_fallback(
+            m.clone(),
+            "binance".into(),
+            base,
+            true,
+            vec!["BTCUSDT".into()],
+            tune,
+        ));
+        let b = testkit::wait_ready(&m, "binance", "BTCUSDT").await;
+        assert_eq!(
+            (b.best_bid(), b.best_ask()),
+            (Some((99.0, 2.0)), Some((99.5, 3.0)))
+        );
+        let f = m.feed("binance").unwrap();
+        assert!(f.rest_polling && f.rest_polls >= 1, "{f:?}");
+        // WebSocket вернулся — опрос выключается
+        m.with_feed("binance", |f| f.down_since = None);
+        tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+        assert!(!m.feed("binance").unwrap().rest_polling);
         task.abort();
     }
 }

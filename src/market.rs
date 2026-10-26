@@ -22,6 +22,17 @@ pub struct FeedState {
     pub stale: u64,
     /// Ошибка REST (правила пар, свечи); пусто — в порядке.
     pub rest_error: String,
+    /// Переподключений из-за тишины, ошибок разбора (сколько всего), перекрещённых стаканов.
+    pub silence_reconnects: u64,
+    pub parse_errors: u64,
+    pub crossed_resets: u64,
+    /// Неудачных подключений подряд; источник сдался (feedMaxFailures) — торговля на бирже на паузе, пока он не вернётся.
+    pub failures: u32,
+    pub gave_up: bool,
+    /// С какого момента нет WebSocket (None — подключён); REST-опрос стакана включён, сколько снимков получено.
+    pub down_since: Option<std::time::Instant>,
+    pub rest_polling: bool,
+    pub rest_polls: u64,
 }
 
 /// Оборот последних закрытых минут и когда получен.

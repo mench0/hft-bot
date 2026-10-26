@@ -803,7 +803,17 @@ impl Bot {
         let mut busy_cross: std::collections::HashSet<String> = std::collections::HashSet::new();
         for ex in exchanges {
             let params = self.params(&ex);
-            let lim = Limits::from_params(&params);
+            let mut lim = Limits::from_params(&params);
+            // источник данных сдался (feedMaxFailures) — торговля на бирже на паузе, заявки сняты
+            if self.market.feed(&ex).is_some_and(|f| f.gave_up) {
+                lim.trading_enabled = false;
+                if let Some(a) = self.accounts.lock().unwrap().get_mut(&ex) {
+                    let n = a.cancel_all(None);
+                    if n > 0 {
+                        tracing::warn!("[{ex}] источник данных сдался — снято заявок: {n}");
+                    }
+                }
+            }
             let sp = spread::Params::from(&params);
             let selected = saved.selection.get(&ex).cloned().unwrap_or_default();
             let books: HashMap<String, Book> = selected

@@ -290,7 +290,16 @@ fn status_json(bot: &Bot) -> Value {
                 "получено_сообщений": f.messages,
                 "переподключений": f.reconnects,
                 "символы": f.symbols,
+                "переподключений_по_тишине": f.silence_reconnects,
+                "ошибок_разбора": f.parse_errors,
+                "сбросов_перекрещённых": f.crossed_resets,
+                "неудач_подряд": f.failures,
+                "rest_опрос": f.rest_polling,
+                "rest_снимков": f.rest_polls,
             });
+            if f.gave_up {
+                e["источник_сдался"] = Value::Bool(true);
+            }
             let acc_stats = bot
                 .accounts
                 .lock()

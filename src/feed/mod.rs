@@ -111,6 +111,163 @@ pub fn levels(v: Option<&Value>) -> Vec<(f64, f64)> {
         .unwrap_or_default()
 }
 
+/// Настройки устойчивости фида (параметры биржи, как в Java).
+#[derive(Clone, Debug)]
+pub struct Tune {
+    /// Тишина в WebSocket до переподключения (wsStaleMs; 0 — по умолчанию 30 с, у Uniswap — 120 с: пулы бывают тихими).
+    pub stale: Duration,
+    /// Начальная пауза переподключения (wsReconnectBaseMs, 500 мс), дальше — вдвое до 30 с.
+    pub reconnect_base: Duration,
+    /// Сколько ждать WebSocket, прежде чем опрашивать стакан по REST (restFallbackGraceMs, 2 с).
+    pub grace: Duration,
+    /// Пауза REST-опроса после «слишком часто» (pollBackoffMs, 60 с; повторы — вдвое дольше).
+    pub poll_backoff: Duration,
+    /// Неудач подряд, после которых источник сдаётся (feedMaxFailures, 15).
+    pub max_failures: u32,
+    /// Ошибок разбора подряд до сброса соединения (wsMaxParseErrors, 5).
+    pub max_parse_errors: u32,
+    /// Перекрещённых стаканов подряд (bid ≥ ask) по символу до переподключения (wsMaxCrossedBooks, 200).
+    pub max_crossed: u32,
+}
+
+impl Default for Tune {
+    fn default() -> Self {
+        Tune::from("", &Map::new())
+    }
+}
+
+impl Tune {
+    pub fn from(ex: &str, p: &Map<String, Value>) -> Tune {
+        let n = |k: &str, d: f64| {
+            p.get(k)
+                .and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse().ok()))
+                .unwrap_or(d)
+        };
+        let ms = |x: f64| Duration::from_millis(x.max(0.0) as u64);
+        let stale = n("wsStaleMs", 0.0);
+        Tune {
+            stale: if stale > 0.0 {
+                ms(stale)
+            } else if ex == "uniswapv2" {
+                Duration::from_secs(120)
+            } else {
+                Duration::from_secs(30)
+            },
+            reconnect_base: ms(n("wsReconnectBaseMs", 500.0).max(50.0)),
+            grace: ms(n("restFallbackGraceMs", 2000.0)),
+            poll_backoff: ms(n("pollBackoffMs", 60_000.0).max(1000.0)),
+            max_failures: n("feedMaxFailures", 15.0).max(1.0) as u32,
+            max_parse_errors: n("wsMaxParseErrors", 5.0).max(1.0) as u32,
+            max_crossed: n("wsMaxCrossedBooks", 200.0).max(1.0) as u32,
+        }
+    }
+}
+
+/// Адрес REST-стакана символа для опроса, пока нет WebSocket; None — у биржи (рынка) опроса нет.
+pub fn rest_book_url(ex: &str, base: &str, symbol: &str, perp: bool) -> Option<String> {
+    let (b, q) = crate::paper::split(symbol)?;
+    let s = symbol.to_uppercase();
+    Some(match (ex, perp) {
+        ("binance", true) => format!("{base}/fapi/v1/depth?symbol={s}&limit=50"),
+        ("bybit", true) => {
+            format!("{base}/v5/market/orderbook?category=linear&symbol={s}&limit=50")
+        }
+        ("binance" | "mexc", false) => format!("{base}/api/v3/depth?symbol={s}&limit=50"),
+        ("bybit", false) => format!("{base}/v5/market/orderbook?category=spot&symbol={s}&limit=50"),
+        ("okx", false) => format!("{base}/api/v5/market/books?instId={b}-{q}&sz=50"),
+        ("gate", false) => format!("{base}/api/v4/spot/order_book?currency_pair={b}_{q}&limit=50"),
+        ("upbit", false) => format!("{base}/v1/orderbook?markets={q}-{b}"),
+        ("lbank", false) => format!(
+            "{base}/v2/depth.do?symbol={}_{}&size=50",
+            b.to_lowercase(),
+            q.to_lowercase()
+        ),
+        _ => return None,
+    })
+}
+
+/// REST-опрос стаканов, пока WebSocket лежит дольше grace: снимок раз в секунду по каждому символу; «слишком часто»
+/// (HTTP 429/418) — пауза pollBackoffMs, повторы вдвое дольше. WebSocket вернулся — опрос выключается.
+async fn rest_fallback(
+    market: Arc<Market>,
+    ex: String,
+    base: String,
+    perp: bool,
+    symbols: Vec<String>,
+    tune: Tune,
+) {
+    let urls: Vec<(String, String)> = symbols
+        .iter()
+        .filter_map(|s| Some((s.clone(), rest_book_url(&ex, &base, s, perp)?)))
+        .collect();
+    if urls.is_empty() {
+        return;
+    }
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("HTTP-клиент");
+    let mut backoff = tune.poll_backoff;
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let down = market
+            .feed(&ex)
+            .and_then(|f| f.down_since)
+            .is_some_and(|t| t.elapsed() >= tune.grace);
+        let was = market.with_feed(&ex, |f| std::mem::replace(&mut f.rest_polling, down));
+        if down != was {
+            tracing::warn!(
+                "[{ex}] REST-опрос стакана {}",
+                if down {
+                    "включён: WebSocket не отвечает"
+                } else {
+                    "выключен: WebSocket вернулся"
+                }
+            );
+        }
+        if !down {
+            continue;
+        }
+        for (sym, url) in &urls {
+            let r = match http.get(url).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    market.with_feed(&ex, |f| f.rest_error = format!("стакан {sym}: {e}"));
+                    continue;
+                }
+            };
+            let st = r.status().as_u16();
+            if st == 429 || st == 418 {
+                tracing::warn!(
+                    "[{ex}] REST-опрос: «слишком часто» — пауза {} с",
+                    backoff.as_secs()
+                );
+                market.with_feed(&ex, |f| {
+                    f.rest_error = format!("стакан: HTTP {st}, пауза {} с", backoff.as_secs())
+                });
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(3600));
+                break;
+            }
+            match r
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|v| crate::screener::parse_book(&ex, &v))
+            {
+                Some((bids, asks)) => {
+                    backoff = tune.poll_backoff;
+                    market.with_book(&ex, sym, |b| b.apply_snapshot(bids, asks, 0));
+                    market.with_feed(&ex, |f| f.rest_polls += 1);
+                }
+                None => market.with_feed(&ex, |f| {
+                    f.rest_error = format!("стакан {sym}: HTTP {st}, ответ не разобран")
+                }),
+            }
+        }
+    }
+}
+
 /// Запустить фид биржи по её параметрам (`market`, `testnet`, `wsUrl`, `restUrl`, `wsBookTicker`).
 pub fn start(
     market: Arc<Market>,
@@ -303,6 +460,30 @@ pub fn start(
             }
             .to_owned()
         });
+    let tune = Tune::from(&ex, params);
+    // REST-опрос стакана, пока нет WebSocket: restUrl или публичный адрес биржи (спот — как у скринера)
+    let book_base = params
+        .get("restUrl")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            if perp {
+                Some(rest_url.clone())
+            } else {
+                crate::screener::base_url(&ex).map(str::to_owned)
+            }
+        });
+    let fallback = book_base.map(|b| {
+        rest_fallback(
+            m.clone(),
+            ex.clone(),
+            b,
+            perp,
+            symbols.clone(),
+            tune.clone(),
+        )
+    });
     let rest = (ex == "binance").then(|| {
         rest_loop(
             market.clone(),
@@ -317,7 +498,12 @@ pub fn start(
     let funding = perp.then(|| funding_loop(market, ex.clone(), rest_url, symbols));
     Plan::Run(tokio::spawn(async move {
         tokio::join!(
-            run(m, ex, dialect),
+            run(m, ex, dialect, tune),
+            async {
+                if let Some(f) = fallback {
+                    f.await
+                }
+            },
             async {
                 if let Some(c) = contracts {
                     c.await
@@ -338,7 +524,7 @@ pub fn start(
 }
 
 /// Применить обновление к стакану.
-pub fn apply(market: &Market, ex: &str, u: Update) {
+pub fn apply(market: &Market, ex: &str, u: Update) -> String {
     match u {
         Update::Snapshot {
             sym,
@@ -347,6 +533,7 @@ pub fn apply(market: &Market, ex: &str, u: Update) {
             id,
         } => {
             market.with_book(ex, &sym, |b| b.apply_snapshot(bids, asks, id));
+            sym
         }
         Update::Delta {
             sym,
@@ -355,6 +542,7 @@ pub fn apply(market: &Market, ex: &str, u: Update) {
             id,
         } => {
             market.with_book(ex, &sym, |b| b.apply_delta(&bids, &asks, id));
+            sym
         }
         Update::Best { sym, bid, ask, id } => {
             let fresh =
@@ -366,19 +554,25 @@ pub fn apply(market: &Market, ex: &str, u: Update) {
                     f.stale += 1
                 }
             });
+            sym
         }
     }
 }
 
 /// Держать соединение: подписаться, читать сообщения, слать пинги; при обрыве или ошибке биржи — переподключиться.
-/// Задача снимается abort() при остановке.
-pub async fn run(market: Arc<Market>, ex: String, d: Arc<dyn Dialect>) {
-    let mut backoff = Backoff::default();
+/// Тишина дольше tune.stale, tune.max_parse_errors ошибок разбора подряд или tune.max_crossed перекрещённых стаканов
+/// подряд по символу — переподключение; tune.max_failures неудач подряд — источник сдаётся (gave_up: торговля на бирже
+/// на паузе), но попытки продолжаются и при успехе флаг снимается. Задача снимается abort() при остановке.
+pub async fn run(market: Arc<Market>, ex: String, d: Arc<dyn Dialect>, tune: Tune) {
+    let mut backoff = Backoff::with_base(tune.reconnect_base);
+    market.with_feed(&ex, |f| {
+        f.down_since.get_or_insert_with(std::time::Instant::now);
+    });
     loop {
         let url = match d.connect_url().await {
             Ok(u) => u,
             Err(e) => {
-                market.with_feed(&ex, |f| f.last_error = e.clone());
+                fail(&market, &ex, &e, &tune);
                 tokio::time::sleep(backoff.next()).await;
                 continue;
             }
@@ -395,6 +589,8 @@ pub async fn run(market: Arc<Market>, ex: String, d: Arc<dyn Dialect>) {
                 std::io::Error::other("подключение не ответило за 10 с"),
             )),
         };
+        // соединение считается удачным, когда пришло первое сообщение
+        let mut got = false;
         let err = match conn {
             Ok((mut ws, _)) => {
                 tracing::info!("[{ex}] WebSocket подключён");
@@ -402,7 +598,6 @@ pub async fn run(market: Arc<Market>, ex: String, d: Arc<dyn Dialect>) {
                     f.connected = true;
                     f.last_error.clear();
                 });
-                backoff.reset();
                 let mut err = String::new();
                 for m in d.subscribe() {
                     if let Err(e) = ws.send(Message::text(m)).await {
@@ -413,20 +608,36 @@ pub async fn run(market: Arc<Market>, ex: String, d: Arc<dyn Dialect>) {
                     .ping()
                     .unwrap_or((String::new(), Duration::from_secs(3600)));
                 let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+                let mut watch = tokio::time::interval(Duration::from_millis(500));
+                let mut last = std::time::Instant::now();
+                let (mut parse_errors, mut crossed) =
+                    (0u32, std::collections::HashMap::<String, u32>::new());
                 while err.is_empty() {
+                    let mut ups: Vec<Update> = Vec::new();
+                    let mut parsed: Option<Result<(), String>> = None;
                     tokio::select! {
                         msg = ws.next() => match msg {
                             Some(Ok(m @ (Message::Text(_) | Message::Binary(_)))) => {
+                                last = std::time::Instant::now();
+                                if !got {
+                                    got = true;
+                                    backoff.reset();
+                                    market.with_feed(&ex, |f| {
+                                        f.failures = 0;
+                                        f.down_since = None;
+                                        if f.gave_up {
+                                            tracing::warn!("[{ex}] источник данных вернулся — торговля снова разрешена");
+                                        }
+                                        f.gave_up = false;
+                                    });
+                                }
                                 let t = match m {
                                     Message::Text(t) => Some(t.to_string()),
                                     // protobuf (MEXC) — сразу в обновления
                                     Message::Binary(b) => match d.parse_binary(&b) {
                                         Some(r) => {
                                             market.with_feed(&ex, |f| f.messages += 1);
-                                            match r {
-                                                Ok(ups) => for u in ups { apply(&market, &ex, u); },
-                                                Err(e) => err = e,
-                                            }
+                                            parsed = Some(r.map(|u| ups = u));
                                             None
                                         }
                                         None => d.binary(&b),
@@ -438,21 +649,50 @@ pub async fn run(market: Arc<Market>, ex: String, d: Arc<dyn Dialect>) {
                                     if let Some(r) = d.reply(&t) {
                                         if let Err(e) = ws.send(Message::text(r)).await { err = e.to_string(); }
                                     } else {
-                                        match d.parse(&t) {
-                                            Ok(ups) => for u in ups { apply(&market, &ex, u); },
-                                            Err(e) => err = e,
-                                        }
+                                        parsed = Some(d.parse(&t).map(|u| ups = u));
                                     }
                                 }
                             }
-                            Some(Ok(Message::Ping(p))) => { let _ = ws.send(Message::Pong(p)).await; }
+                            Some(Ok(Message::Ping(p))) => { last = std::time::Instant::now(); let _ = ws.send(Message::Pong(p)).await; }
                             Some(Ok(Message::Close(c))) => err = format!("закрыто биржей: {c:?}"),
-                            Some(Ok(_)) => {}
+                            Some(Ok(_)) => last = std::time::Instant::now(),
                             Some(Err(e)) => err = e.to_string(),
                             None => err = "соединение закрыто".into(),
                         },
                         _ = ping.tick(), if !ping_msg.is_empty() => {
                             if let Err(e) = ws.send(Message::text(ping_msg.clone())).await { err = e.to_string(); }
+                        }
+                        _ = watch.tick() => {
+                            if last.elapsed() >= tune.stale {
+                                market.with_feed(&ex, |f| f.silence_reconnects += 1);
+                                err = format!("тишина {} с", last.elapsed().as_secs());
+                            }
+                        }
+                    }
+                    match parsed {
+                        Some(Err(e)) => {
+                            parse_errors += 1;
+                            market.with_feed(&ex, |f| f.parse_errors += 1);
+                            if parse_errors >= tune.max_parse_errors {
+                                err = format!("{parse_errors} ошибок разбора подряд: {e}");
+                            } else {
+                                tracing::warn!(
+                                    "[{ex}] ошибка в потоке ({parse_errors} подряд): {e}"
+                                );
+                                market.with_feed(&ex, |f| f.last_error = e);
+                            }
+                        }
+                        Some(Ok(())) => parse_errors = 0,
+                        None => {}
+                    }
+                    for u in ups {
+                        let sym = apply(&market, &ex, u);
+                        let bad = market.with_book(&ex, &sym, |b| matches!((b.best_bid(), b.best_ask()), (Some(x), Some(y)) if x.0 >= y.0));
+                        let n = crossed.entry(sym.clone()).or_default();
+                        *n = if bad { *n + 1 } else { 0 };
+                        if *n >= tune.max_crossed {
+                            market.with_feed(&ex, |f| f.crossed_resets += 1);
+                            err = format!("стакан {sym} перекрещён {} обновлений подряд", *n);
                         }
                     }
                 }
@@ -460,11 +700,15 @@ pub async fn run(market: Arc<Market>, ex: String, d: Arc<dyn Dialect>) {
             }
             Err(e) => e.to_string(),
         };
+        if !got {
+            fail(&market, &ex, &err, &tune);
+        }
         let pause = backoff.next();
         market.with_feed(&ex, |f| {
             f.connected = false;
             f.reconnects += 1;
             f.last_error = err.clone();
+            f.down_since.get_or_insert_with(std::time::Instant::now);
         });
         tracing::warn!(
             "[{ex}] WebSocket: {err} — переподключение через {} мс",
@@ -472,6 +716,21 @@ pub async fn run(market: Arc<Market>, ex: String, d: Arc<dyn Dialect>) {
         );
         tokio::time::sleep(pause).await;
     }
+}
+
+/// Неудачное подключение: счёт подряд; на tune.max_failures — источник сдаётся.
+fn fail(market: &Market, ex: &str, e: &str, tune: &Tune) {
+    market.with_feed(ex, |f| {
+        f.last_error = e.to_owned();
+        f.failures += 1;
+        if f.failures >= tune.max_failures && !f.gave_up {
+            f.gave_up = true;
+            tracing::error!(
+                "[{ex}] источник данных сдался после {} неудач подряд ({e}) — заявки сняты, торговля на паузе до его возвращения",
+                f.failures
+            );
+        }
+    });
 }
 
 /// Правила пар — при подключении (повтор раз в 10 с, пока не получены); оборот минутных свечей — раз в минуту.
@@ -545,22 +804,25 @@ async fn funding_loop(market: Arc<Market>, ex: String, base: String, symbols: Ve
 }
 
 /// Пауза перед переподключением: 0.5 с, удваивается до 30 с; после успешного подключения — снова с начала.
-pub struct Backoff(Duration);
+pub struct Backoff(Duration, Duration);
 
 impl Default for Backoff {
     fn default() -> Self {
-        Backoff(Duration::from_millis(500))
+        Backoff::with_base(Duration::from_millis(500))
     }
 }
 
 impl Backoff {
+    pub fn with_base(base: Duration) -> Backoff {
+        Backoff(base, base)
+    }
     pub fn next(&mut self) -> Duration {
         let d = self.0;
-        self.0 = (self.0 * 2).min(Duration::from_secs(30));
+        self.0 = (self.0 * 2).min(Duration::from_secs(30)).max(self.1);
         d
     }
     pub fn reset(&mut self) {
-        *self = Backoff::default();
+        self.0 = self.1;
     }
 }
 

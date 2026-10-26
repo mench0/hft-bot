@@ -143,6 +143,7 @@ mod tests {
             m.clone(),
             "bybit".into(),
             Arc::new(Bybit::new(addr, &["BTCUSDT".into()], false)),
+            Default::default(),
         ));
         testkit::wait_ready(&m, "bybit", "BTCUSDT").await;
         tokio::time::sleep(Duration::from_millis(100)).await;
