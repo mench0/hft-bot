@@ -1,0 +1,427 @@
+{
+ "exchanges": [
+  {
+   "id": "binance",
+   "title": "Binance",
+   "kind": "CEX_TIER1",
+   "adapter": "NATIVE_LIVE",
+   "makerFeePct": 0.1,
+   "takerFeePct": 0.1,
+   "maxRequestsPerSec": 20.0,
+   "defaultQuote": "USDT",
+   "symbolHint": "BTCUSDT",
+   "notes": "Полный адаптер: стакан, ордера (WebSocket API) и события аккаунта по WebSocket, REST — запасной. Фьючерсы (market=perp): USDⓈ-M.",
+   "region": "CEX · Токио (AWS ap-northeast-1)",
+   "recommendation": {
+    "server": "Токио",
+    "near": [
+     "Перп – перп на разных биржах",
+     "Статистический арбитраж",
+     "Возврат к среднему",
+     "Спот – спот на разных биржах (сканер)",
+     "Lead-lag: ведущая биржа – ведомая",
+     "Сбор спреда (сканер)"
+    ],
+    "neighbor": [
+     "Статистический арбитраж",
+     "Возврат к среднему"
+    ],
+    "far": []
+   },
+   "selectable": true,
+   "markets": [
+    "perp",
+    "spot"
+   ],
+   "perpMakerFeePct": 0.02,
+   "perpTakerFeePct": 0.05
+  },
+  {
+   "id": "bybit",
+   "title": "Bybit",
+   "kind": "CEX_TIER1",
+   "adapter": "NATIVE_LIVE",
+   "makerFeePct": 0.1,
+   "takerFeePct": 0.1,
+   "maxRequestsPerSec": 8.0,
+   "defaultQuote": "USDT",
+   "symbolHint": "BTCUSDT",
+   "notes": "Полный адаптер: стакан, ордера (/v5/trade), исполнения и баланс (/v5/private) по WebSocket, REST — запасной. Блокирует IP многих дата-центров (403). Фьючерсы (market=perp): linear.",
+   "region": "CEX · Сингапур (AWS ap-southeast-1)",
+   "recommendation": {
+    "server": "Сингапур",
+    "near": [
+     "Перп – перп на разных биржах",
+     "Статистический арбитраж",
+     "Возврат к среднему",
+     "Спот – спот на разных биржах (сканер)",
+     "Lead-lag: ведущая биржа – ведомая",
+     "Сбор спреда (сканер)"
+    ],
+    "neighbor": [
+     "Статистический арбитраж",
+     "Возврат к среднему"
+    ],
+    "far": []
+   },
+   "selectable": true,
+   "markets": [
+    "perp",
+    "spot"
+   ],
+   "perpMakerFeePct": 0.02,
+   "perpTakerFeePct": 0.055
+  },
+  {
+   "id": "okx",
+   "title": "OKX",
+   "kind": "CEX_TIER1",
+   "adapter": "LIVE_UNVERIFIED",
+   "makerFeePct": 0.08,
+   "takerFeePct": 0.1,
+   "maxRequestsPerSec": 8.0,
+   "defaultQuote": "USDT",
+   "symbolHint": "BTCUSDT",
+   "notes": "Спот: стакан, ордера, отмены, исполнения и балансы по WebSocket (публичный + приватный канал), REST — запасной. Нужен OKX_PASSPHRASE. Фьючерсы (market=perp): SWAP.",
+   "region": "CEX · Гонконг (Alibaba Cloud)",
+   "recommendation": {
+    "server": "Гонконг",
+    "near": [
+     "Перп – перп на разных биржах",
+     "Статистический арбитраж",
+     "Возврат к среднему",
+     "Спот – спот на разных биржах (сканер)",
+     "Lead-lag: ведущая биржа – ведомая",
+     "Сбор спреда (сканер)"
+    ],
+    "neighbor": [
+     "Статистический арбитраж",
+     "Возврат к среднему"
+    ],
+    "far": []
+   },
+   "selectable": true,
+   "markets": [
+    "perp",
+    "spot"
+   ],
+   "perpMakerFeePct": 0.02,
+   "perpTakerFeePct": 0.05
+  },
+  {
+   "id": "mexc",
+   "title": "MEXC",
+   "kind": "CEX_TIER3",
+   "adapter": "LIVE_UNVERIFIED",
+   "makerFeePct": 0.0,
+   "takerFeePct": 0.05,
+   "maxRequestsPerSec": 5.0,
+   "defaultQuote": "USDT",
+   "symbolHint": "BTCUSDT",
+   "notes": "Спот, 0% maker. Стакан, исполнения и баланс по WebSocket (protobuf; стакан — до 30 символов на соединение) + REST-запас; ордера только REST (WS-ордеров у MEXC нет). Не держите большую часть капитала. Фьючерсы (market=perp): MEXC Contract — стакан, исполнения, позиции и баланс по WS; ордера REST (WS-ордеров нет), доступ к ним через API MEXC выдаёт отдельно.",
+   "region": "CEX · Токио (AWS ap-northeast-1)",
+   "recommendation": {
+    "server": "Токио",
+    "near": [
+     "Перп – перп на разных биржах",
+     "Статистический арбитраж",
+     "Возврат к среднему",
+     "Спот – спот на разных биржах (сканер)",
+     "Lead-lag: ведущая биржа – ведомая",
+     "Сбор спреда (сканер)"
+    ],
+    "neighbor": [
+     "Статистический арбитраж",
+     "Возврат к среднему"
+    ],
+    "far": []
+   },
+   "selectable": true,
+   "markets": [
+    "perp",
+    "spot"
+   ],
+   "perpMakerFeePct": 0.0,
+   "perpTakerFeePct": 0.02
+  },
+  {
+   "id": "gate",
+   "title": "Gate",
+   "kind": "CEX_TIER3",
+   "adapter": "LIVE_UNVERIFIED",
+   "makerFeePct": 0.2,
+   "takerFeePct": 0.2,
+   "maxRequestsPerSec": 5.0,
+   "defaultQuote": "USDT",
+   "symbolHint": "BTCUSDT",
+   "notes": "Спот: стакан, ордера (WS API), исполнения и балансы по WebSocket, REST — запасной. Комиссия указана по умолчанию, проверьте тариф. Фьючерсы (market=perp): USDT-фьючерсы — стакан, ордера (WS API), исполнения, позиции и баланс по WS.",
+   "region": "CEX · Токио (AWS ap-northeast-1)",
+   "recommendation": {
+    "server": "Токио",
+    "near": [
+     "Перп – перп на разных биржах",
+     "Статистический арбитраж",
+     "Возврат к среднему",
+     "Спот – спот на разных биржах (сканер)",
+     "Lead-lag: ведущая биржа – ведомая",
+     "Сбор спреда (сканер)"
+    ],
+    "neighbor": [
+     "Статистический арбитраж",
+     "Возврат к среднему"
+    ],
+    "far": []
+   },
+   "selectable": true,
+   "markets": [
+    "perp",
+    "spot"
+   ],
+   "perpMakerFeePct": 0.02,
+   "perpTakerFeePct": 0.05
+  },
+  {
+   "id": "hyperliquid",
+   "title": "Hyperliquid",
+   "kind": "PERP_DEX",
+   "adapter": "LIVE_UNVERIFIED",
+   "makerFeePct": 0.04,
+   "takerFeePct": 0.07,
+   "maxRequestsPerSec": 5.0,
+   "defaultQuote": "USDC",
+   "symbolHint": "HYPEUSDC (спот), BTCUSDC (перп)",
+   "notes": "Перпы (по умолчанию) и спот (market=spot): стакан, ордера, info-запросы (WS post) и исполнения по WebSocket, REST — запасной. Спот: пары из spotMeta, символ — имена токенов подряд (HYPEUSDC, UBTCUSDC — обёрнутый BTC), баланс — spotClearinghouseState; комиссия спота 0.04/0.07%, перпов 0.015/0.045%. Ордера подписываются agent-ключом (EIP-712) через web3j. HYPERLIQUID_API_KEY = адрес аккаунта, _SECRET = ключ agent-кошелька без права вывода. Лимит адреса: 1 действие на $1 оборота.",
+   "region": "DEX (перпы, свой блокчейн) · Токио (AWS ap-northeast-1): ноды и API",
+   "recommendation": {
+    "server": "Токио",
+    "near": [
+     "Перп – перп на разных биржах",
+     "Статистический арбитраж",
+     "Возврат к среднему",
+     "Спот – спот на разных биржах (сканер)",
+     "Lead-lag: ведущая биржа – ведомая",
+     "Сбор спреда (сканер)"
+    ],
+    "neighbor": [
+     "Статистический арбитраж",
+     "Возврат к среднему"
+    ],
+    "far": []
+   },
+   "selectable": true,
+   "markets": [
+    "perp",
+    "spot"
+   ],
+   "perpMakerFeePct": 0.015,
+   "perpTakerFeePct": 0.045
+  },
+  {
+   "id": "kucoin",
+   "title": "KuCoin",
+   "kind": "CEX_TIER1",
+   "adapter": "LIVE_UNVERIFIED",
+   "makerFeePct": 0.1,
+   "takerFeePct": 0.1,
+   "maxRequestsPerSec": 10.0,
+   "defaultQuote": "USDT",
+   "symbolHint": "BTCUSDT",
+   "notes": "Спот: стакан по WebSocket (level2Depth50, адрес и токен через bullet-public) + REST-запас; ордера и отмены по WS API (wsapi.kucoin.com), исполнения и балансы — приватный поток (bullet-private). Нужен KUCOIN_PASSPHRASE; для UTA-счёта — KUCOIN_UTA=true (uta.order/uta.cancel). Лимиты — пулы весов (публичный 2000/30 с, спот 4000/30 с). Фьючерсы (market=perp): KuCoin Futures (XBTUSDTM) — стакан, ордера (Pro WS API), исполнения, позиции и баланс по WS.",
+   "region": "CEX · Токио (AWS ap-northeast-1, зона ap-northeast-1a)",
+   "recommendation": {
+    "server": "Токио",
+    "near": [
+     "Перп – перп на разных биржах",
+     "Статистический арбитраж",
+     "Возврат к среднему",
+     "Спот – спот на разных биржах (сканер)",
+     "Lead-lag: ведущая биржа – ведомая",
+     "Сбор спреда (сканер)"
+    ],
+    "neighbor": [
+     "Статистический арбитраж",
+     "Возврат к среднему"
+    ],
+    "far": []
+   },
+   "selectable": true,
+   "markets": [
+    "perp",
+    "spot"
+   ],
+   "perpMakerFeePct": 0.02,
+   "perpTakerFeePct": 0.06
+  },
+  {
+   "id": "aster",
+   "title": "Aster",
+   "kind": "ORDERBOOK_DEX",
+   "adapter": "LIVE_UNVERIFIED",
+   "makerFeePct": 0.1,
+   "takerFeePct": 0.1,
+   "maxRequestsPerSec": 5.0,
+   "defaultQuote": "USDT",
+   "symbolHint": "BTCUSDT",
+   "notes": "Спот, API v3 в формате Binance: стакан (depth20@100ms), исполнения и баланс (listenKey) по WebSocket + REST-запас; ордера через REST (WS-ордеров нет) с подписью EIP-712 кошельком-агентом. ASTER_API_KEY = адрес основного кошелька, ASTER_API_SECRET = ключ API-кошелька (signer) без права вывода. Комиссии указаны по умолчанию, проверьте тариф. Фьючерсы (market=perp): Aster Futures (/fapi/v3, формат Binance USDⓈ-M), исполнения и позиции по listenKey.",
+   "region": "DEX (стакан ордеров, BNB Chain) · децентрализованная: единого места серверов нет, задержка — до API-шлюза Aster",
+   "recommendation": {
+    "server": "Азия (Токио или Сингапур)",
+    "near": [
+     "Перп – перп на разных биржах",
+     "Статистический арбитраж",
+     "Возврат к среднему",
+     "Спот – спот на разных биржах (сканер)",
+     "Lead-lag: ведущая биржа – ведомая",
+     "Сбор спреда (сканер)"
+    ],
+    "neighbor": [
+     "Статистический арбитраж",
+     "Возврат к среднему"
+    ],
+    "far": []
+   },
+   "selectable": true,
+   "markets": [
+    "perp",
+    "spot"
+   ],
+   "perpMakerFeePct": 0.01,
+   "perpTakerFeePct": 0.035
+  },
+  {
+   "id": "lbank",
+   "title": "LBank",
+   "kind": "CEX_TIER3",
+   "adapter": "LIVE_UNVERIFIED",
+   "makerFeePct": 0.1,
+   "takerFeePct": 0.1,
+   "maxRequestsPerSec": 5.0,
+   "defaultQuote": "USDT",
+   "symbolHint": "BTCUSDT",
+   "notes": "Спот, API v2: стакан по WebSocket (depth, снимки) + REST-запас; ордера только REST (WS-ордеров у LBank нет), исполнения и балансы — приватный WS по ключу подписки (бот продлевает его сам). Подпись HmacSHA256 (LBANK_API_KEY, LBANK_API_SECRET; при создании ключа выберите HmacSHA256, не RSA). Рыночная покупка объёма монеты — на сумму «объём × аск + 0.3%». Тестовой сети нет. Комиссии указаны по умолчанию, проверьте тариф. Фьючерсы LBank бот пока не торгует.",
+   "region": "CEX · Гонконг",
+   "recommendation": {
+    "server": "Гонконг",
+    "near": [
+     "Перп – перп на разных биржах",
+     "Статистический арбитраж",
+     "Возврат к среднему",
+     "Спот – спот на разных биржах (сканер)",
+     "Lead-lag: ведущая биржа – ведомая",
+     "Сбор спреда (сканер)"
+    ],
+    "neighbor": [
+     "Статистический арбитраж",
+     "Возврат к среднему"
+    ],
+    "far": []
+   },
+   "selectable": true,
+   "markets": [
+    "spot"
+   ]
+  },
+  {
+   "id": "bingx",
+   "title": "BingX",
+   "kind": "CEX_TIER3",
+   "adapter": "LIVE_UNVERIFIED",
+   "makerFeePct": 0.1,
+   "takerFeePct": 0.1,
+   "maxRequestsPerSec": 5.0,
+   "defaultQuote": "USDT",
+   "symbolHint": "BTCUSDT",
+   "notes": "Спот: стакан (depth20, gzip) по WebSocket + REST-запас; ордера только REST (WS-ордеров у BingX нет), исполнения — приватный поток по listenKey (продлевается ботом), баланс — REST. Подпись HmacSHA256 (BINGX_API_KEY, BINGX_API_SECRET). Тестовой сети у спота нет. Фьючерсы (market=perp): USDT-M перпы (/openApi/swap/v2) — стакан, исполнения, позиции и баланс по WS, ордера REST; тестнет — демо-счёт VST. Комиссии указаны по умолчанию, проверьте тариф.",
+   "region": "CEX · Азия: точное место серверов BingX не публикует",
+   "recommendation": {
+    "server": "Азия (Токио или Сингапур)",
+    "near": [
+     "Перп – перп на разных биржах",
+     "Статистический арбитраж",
+     "Возврат к среднему",
+     "Спот – спот на разных биржах (сканер)",
+     "Lead-lag: ведущая биржа – ведомая",
+     "Сбор спреда (сканер)"
+    ],
+    "neighbor": [
+     "Статистический арбитраж",
+     "Возврат к среднему"
+    ],
+    "far": []
+   },
+   "selectable": true,
+   "markets": [
+    "perp",
+    "spot"
+   ],
+   "perpMakerFeePct": 0.02,
+   "perpTakerFeePct": 0.05
+  },
+  {
+   "id": "upbit",
+   "title": "Upbit",
+   "kind": "CEX_TIER1",
+   "adapter": "LIVE_UNVERIFIED",
+   "makerFeePct": 0.05,
+   "takerFeePct": 0.05,
+   "maxRequestsPerSec": 8.0,
+   "defaultQuote": "KRW",
+   "symbolHint": "BTCKRW (рынок KRW-BTC), BTCUSDT",
+   "notes": "Спот: рынки KRW-, BTC- и USDT-; символ в боте — база+котировка (BTCKRW). Стакан по WebSocket (снимки orderbook) + REST-запас; ордера и их статусы — REST (приватный WS Upbit требует заголовок авторизации), баланс — REST. Подпись JWT (UPBIT_API_KEY = access key, UPBIT_API_SECRET = secret key), доступ к API — по IP из белого списка ключа. Рыночная покупка — на сумму («объём × аск + 0.3%»). Тестовой сети нет. Комиссия KRW-рынка 0.05%, у BTC/USDT-рынков 0.25% — проверьте тариф.",
+   "region": "CEX · Сеул (AWS ap-northeast-2), Южная Корея",
+   "recommendation": {
+    "server": "Азия (Токио или Сингапур)",
+    "near": [
+     "Перп – перп на разных биржах",
+     "Статистический арбитраж",
+     "Возврат к среднему",
+     "Спот – спот на разных биржах (сканер)",
+     "Lead-lag: ведущая биржа – ведомая",
+     "Сбор спреда (сканер)"
+    ],
+    "neighbor": [
+     "Статистический арбитраж",
+     "Возврат к среднему"
+    ],
+    "far": []
+   },
+   "selectable": true,
+   "markets": [
+    "spot"
+   ]
+  },
+  {
+   "id": "uniswapv2",
+   "title": "Uniswap V2-совместимые пулы",
+   "kind": "AMM_DEX",
+   "adapter": "LIVE_UNVERIFIED",
+   "makerFeePct": 0.3,
+   "takerFeePct": 0.3,
+   "maxRequestsPerSec": 4.0,
+   "defaultQuote": "USDC",
+   "symbolHint": "WETHUSDC",
+   "notes": "Стакан из событий Sync через eth_subscribe и все JSON-RPC вызовы по WebSocket ноды (HTTP — запасной). Свопы через Router02 (web3j). Роутер, токены и пулы — параметры биржи uniRouter, uniTokens, uniPools; GTC-лимиток и отмены нет. Горячий кошелёк с малой суммой, приватный RPC против сэндвичей.",
+   "region": "DEX (AMM-пулы) · блокчейн: зависит от RPC-ноды (restUrl)",
+   "recommendation": {
+    "server": "рядом с RPC-нодой",
+    "near": [
+     "Статистический арбитраж",
+     "Возврат к среднему"
+    ],
+    "neighbor": [
+     "Статистический арбитраж",
+     "Возврат к среднему"
+    ],
+    "far": [
+     "Статистический арбитраж",
+     "Возврат к среднему"
+    ],
+    "note": "Скорость ограничена временем блока; быстрые арбитражи на AMM не подходят"
+   },
+   "selectable": true,
+   "markets": [
+    "spot"
+   ]
+  }
+ ]
+}

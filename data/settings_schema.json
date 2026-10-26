@@ -1,0 +1,627 @@
+{
+ "описание": {
+  "statusLogSec": {
+   "default": "60",
+   "min": 5.0,
+   "max": 86400.0,
+   "restart": false,
+   "help": "Как часто писать в лог сводку по биржам, с"
+  },
+  "tradeRecheckSec": {
+   "default": "3600",
+   "min": 0.0,
+   "max": 86400.0,
+   "restart": false,
+   "help": "Не используется: перепроверка монет во время торговли идёт после каждого автопересчёта подбора (discoveryRefreshSec) и после «Пересчитать сейчас». Оставлен для совместимости сохранённых настроек"
+  },
+  "tradeRecheckRetire": {
+   "default": "true",
+   "restart": false,
+   "help": "Всегда включено: монета не прошла перепроверку — сразу закрыть по ней позиции и ордера рыночными ордерами, перестать получать её стакан и убрать из выбранных"
+  },
+  "debugRequests": {
+   "default": "false",
+   "restart": false,
+   "help": "Режим отладки: каждый запрос к биржам (REST и исходящие WS) — в logs/requests.log; все действия в админке и в торговле (ордера, отмены, отказы, решения стратегий, остановки) — в logs/actions.log; секреты скрыты. Включается и выключается на лету"
+  },
+  "timeSyncMin": {
+   "default": "30",
+   "min": 1.0,
+   "max": 1440.0,
+   "restart": false,
+   "help": "Как часто сверять часы с биржей (Binance), мин"
+  },
+  "rateLimitSafety": {
+   "default": "0.8",
+   "min": 0.1,
+   "max": 1.0,
+   "restart": true,
+   "help": "Какую долю официального лимита запросов бирж разрешено тратить"
+  },
+  "serverRegion": {
+   "default": "",
+   "format": "(|tokyo|singapore|hongkong|europe|us|other)",
+   "restart": false,
+   "help": "Где стоит сервер бота: tokyo, singapore, hongkong, europe, us, other. По расстоянию до бирж подбор тикеров отсеивает стратегии, которым биржа слишком далеко, а каталог показывает, что подходит. Пусто — местоположение не учитывается"
+  },
+  "discoveryExchanges": {
+   "default": "",
+   "format": "(|[a-z0-9]+(,[a-z0-9]+)*)",
+   "restart": false,
+   "help": "Биржи для подбора через запятую — выбираются до подбора, монеты не нужны; пусто — подбор не запускается"
+  },
+  "discoveryQuotes": {
+   "default": "USDT,USDC,USD",
+   "format": "[A-Z0-9]+(,[A-Z0-9]+)*",
+   "restart": false,
+   "help": "Котируемые валюты, которые берутся в подбор"
+  },
+  "discoveryRefreshSec": {
+   "default": "0",
+   "min": 0.0,
+   "max": 86400.0,
+   "restart": false,
+   "help": "Автопересчёт подбора раз в N секунд; после каждого пересчёта, пока идёт торговля, выбранные монеты перепроверяются по его итогу. 0 — только по кнопке «Пересчитать сейчас»"
+  },
+  "discoveryMinVolume": {
+   "default": "1000000",
+   "min": 0.0,
+   "max": 1000000000000000.0,
+   "restart": false,
+   "help": "Минимальный оборот за 24 ч для возврата к среднему"
+  },
+  "discoveryMinTrades24h": {
+   "default": "1000",
+   "min": 0.0,
+   "max": 1000000000.0,
+   "restart": false,
+   "help": "Все стратегии: сделок за 24 ч не меньше (монеты, где ничего не происходит, отсеиваются); 0 — не проверять. Биржи, которые число сделок не сообщают, не отсеиваются"
+  },
+  "discoveryMinVolume1h": {
+   "default": "50000",
+   "min": 0.0,
+   "max": 1000000000000000.0,
+   "restart": false,
+   "help": "Оборот за последний час не меньше (по минутным свечам): монета живая сейчас, а не вчера; 0 — не проверять"
+  },
+  "discoveryMinHourlyVolume": {
+   "default": "10000",
+   "min": 0.0,
+   "max": 1000000000000000.0,
+   "restart": false,
+   "help": "Оборот в самый тихий час из последних (по минутным свечам) не меньше: торгуется равномерно, без «мёртвых» часов; 0 — не проверять"
+  },
+  "discoveryMinDepthMultiple": {
+   "default": "10",
+   "min": 0.0,
+   "max": 10000.0,
+   "restart": false,
+   "help": "Глубина стакана в пределах discoveryDepthBandPercent от лучших цен — не меньше стольких размеров сделки (orderQuote): вход и выход без проскальзывания; 0 — не проверять"
+  },
+  "discoveryDepthBandPercent": {
+   "default": "0.5",
+   "min": 0.01,
+   "max": 10.0,
+   "restart": false,
+   "help": "Полоса для глубины стакана: столько % от лучшей цены каждой стороны (биды — вниз от лучшего бида, аски — вверх от лучшего аска)"
+  },
+  "discoveryMaxFlatMinutesPercent": {
+   "default": "60",
+   "min": 0.0,
+   "max": 100.0,
+   "restart": false,
+   "help": "Возврат к среднему: доля минут без движения цены (по минутным свечам) не больше, %; 100 — не проверять"
+  },
+  "discoveryBacktestPerExchange": {
+   "default": "8",
+   "min": 0.0,
+   "max": 200.0,
+   "restart": false,
+   "help": "Сколько кандидатов на бирже прогонять бэктестом"
+  },
+  "discoveryKlineBudget": {
+   "default": "12",
+   "min": 0.0,
+   "max": 500.0,
+   "restart": false,
+   "help": "Сколько запросов свечей на биржу за один пересчёт"
+  },
+  "discoveryBacktestWindow": {
+   "default": "30",
+   "min": 5.0,
+   "max": 1000.0,
+   "restart": false,
+   "help": "Бэктест возврата к среднему: окно среднего, минутных свечей"
+  },
+  "discoveryBacktestMaxHoldBars": {
+   "default": "60",
+   "min": 1.0,
+   "max": 10000.0,
+   "restart": false,
+   "help": "Бэктест возврата к среднему: закрыть позицию через столько свечей"
+  },
+  "discoveryMrMaxSpreadPercent": {
+   "default": "0.1",
+   "min": 0.0,
+   "max": 100.0,
+   "restart": false,
+   "help": "Возврат к среднему: спред не шире, %"
+  },
+  "discoveryMrMinRangePercent": {
+   "default": "1",
+   "min": 0.0,
+   "max": 1000.0,
+   "restart": false,
+   "help": "Возврат к среднему: дневной диапазон не меньше, %"
+  },
+  "discoveryMrMaxRangePercent": {
+   "default": "25",
+   "min": 0.0,
+   "max": 1000.0,
+   "restart": false,
+   "help": "Возврат к среднему: дневной диапазон не больше, %"
+  },
+  "discoveryMrMaxTrend": {
+   "default": "0.7",
+   "min": 0.0,
+   "max": 1.0,
+   "restart": false,
+   "help": "Возврат к среднему: |изменение за 24 ч| / диапазон не больше (не тренд)"
+  },
+  "discoveryArbMinVolume": {
+   "default": "50000",
+   "min": 0.0,
+   "max": 1000000000000000.0,
+   "restart": false,
+   "help": "Спот – спот на разных биржах: оборот за 24 ч не меньше"
+  },
+  "discoveryArbMaxGrossPercent": {
+   "default": "5",
+   "min": 0.0,
+   "max": 1000.0,
+   "restart": false,
+   "help": "Спот – спот на разных биржах: расхождение больше — считаем ошибкой данных, %"
+  },
+  "discoverySpreadMinVolume": {
+   "default": "50000",
+   "min": 0.0,
+   "max": 1000000000000000.0,
+   "restart": false,
+   "help": "Сбор спреда: оборот за 24 ч не меньше"
+  },
+  "discoverySpreadMaxVolume": {
+   "default": "5000000",
+   "min": 0.0,
+   "max": 1000000000000000.0,
+   "restart": false,
+   "help": "Сбор спреда: оборот за 24 ч не больше (ликвидные пары заняты маркет-мейкерами)"
+  },
+  "discoverySpreadMinEdgePercent": {
+   "default": "0.1",
+   "min": 0.0,
+   "max": 100.0,
+   "restart": false,
+   "help": "Сбор спреда: спред минус две maker-комиссии не меньше, %"
+  },
+  "discoverySpreadMaxPercent": {
+   "default": "3",
+   "min": 0.0,
+   "max": 100.0,
+   "restart": false,
+   "help": "Сбор спреда: спред не шире, %"
+  },
+  "discoverySpreadMaxRangePercent": {
+   "default": "2",
+   "min": 0.0,
+   "max": 100.0,
+   "restart": false,
+   "help": "Сбор спреда: размах цены за последние 15 минут (по минутным свечам) не больше, %: цена скачет — купленное уходит в минус быстрее, чем продаётся; 0 — не проверять"
+  },
+  "discoverySpreadMaxTrendPercent": {
+   "default": "5",
+   "min": 0.0,
+   "max": 100.0,
+   "restart": false,
+   "help": "Сбор спреда: изменение цены за 2 часа (по минутным свечам) не больше, % в любую сторону: при падении бот только покупает и застревает с монетой; 0 — не проверять"
+  },
+  "discoveryMaxImpactPercent": {
+   "default": "1",
+   "min": 0.0,
+   "max": 100.0,
+   "restart": false,
+   "help": "Проскальзывание рыночного ордера на размер сделки (orderQuote) по стакану — худшее из покупки и продажи — не больше, %; 0 — не проверять"
+  },
+  "discoveryMaxWallPercent": {
+   "default": "90",
+   "min": 0.0,
+   "max": 100.0,
+   "restart": false,
+   "help": "Стена: доля самого крупного уровня в глубине стороны (в полосе стакана) не больше, %; 0 — не проверять"
+  },
+  "discoveryMinBookLevels": {
+   "default": "3",
+   "min": 0.0,
+   "max": 1000.0,
+   "restart": false,
+   "help": "Уровней стакана в полосе с каждой стороны не меньше (без дыр в стакане); 0 — не проверять"
+  },
+  "discoveryMaxTickPercent": {
+   "default": "0.5",
+   "min": 0.0,
+   "max": 100.0,
+   "restart": false,
+   "help": "Шаг цены к цене не больше, % (крупный шаг — каждое движение цены слишком большое); 0 — не проверять"
+  },
+  "discoveryMinBookBalance": {
+   "default": "0.1",
+   "min": 0.0,
+   "max": 1.0,
+   "restart": false,
+   "help": "Перекос стакана: меньшая сторона / большая (в полосе) не меньше; 0 — не проверять"
+  },
+  "discoveryMaxZeroVolumeMinutesPercent": {
+   "default": "50",
+   "min": 0.0,
+   "max": 100.0,
+   "restart": false,
+   "help": "Минут без оборота (по минутным свечам) не больше, %: торговля рваная или её нет; 100 — не проверять"
+  },
+  "discoveryExclude": {
+   "default": "LEVERAGED,STABLE",
+   "format": "[A-Za-z0-9,]*",
+   "restart": false,
+   "help": "Исключить из подбора: LEVERAGED — токены с плечом (3L, 3S, UP, DOWN, BULL, BEAR), STABLE — стейблкоин к стейблкоину, и свои монеты через запятую (например PEPE,SHIB); пусто — ничего не исключать"
+  },
+  "listingEnabled": {
+   "default": "true",
+   "restart": false,
+   "help": "Листинги: следить за новыми парами на всех биржах и слать алерт в Discord (только алерт, без торговли)"
+  },
+  "listingPollSec": {
+   "default": "60",
+   "min": 15.0,
+   "max": 3600.0,
+   "restart": false,
+   "help": "Листинги: как часто сверять список пар бирж, с"
+  },
+  "announcePollSec": {
+   "default": "60",
+   "min": 30.0,
+   "max": 3600.0,
+   "restart": false,
+   "help": "Листинги: как часто проверять официальные анонсы бирж (Bybit, OKX, KuCoin), с"
+  },
+  "listingDiscordUrl": {
+   "default": "",
+   "format": "(|https://[A-Za-z0-9./_:%?=&-]+)",
+   "restart": false,
+   "help": "Листинги: адрес вебхука Discord; пусто — алерты не отправляются"
+  },
+  "listingQuotes": {
+   "default": "KRW,USDT",
+   "format": "[A-Za-z0-9]+(,[A-Za-z0-9]+)*",
+   "restart": false,
+   "help": "Листинги: котируемые валюты новых пар (KRW — корейские Upbit, USDT и т.д.) через запятую"
+  },
+  "listingExchanges": {
+   "default": "*",
+   "format": "(|\\*|[a-z0-9]+(,[a-z0-9]+)*)",
+   "restart": false,
+   "help": "Листинги: биржи через запятую; * — все биржи, пусто — ни одной. Задаются на вкладке «Алерты»"
+  },
+  "discoveryFilters": {
+   "default": "{}",
+   "format": "(?s)\\{.*\\}",
+   "restart": false,
+   "help": "Фильтры подбора отдельно для каждой биржи и стратегии: JSON {биржа: {стратегия: {параметр: значение}}}; не заданное — значение по умолчанию. Задаются на вкладке «Стратегии»"
+  },
+  "fundingPollSec": {
+   "default": "30",
+   "min": 5.0,
+   "max": 3600.0,
+   "restart": true,
+   "help": "Как часто обновлять ставки funding по REST (учёт выплат по позициям перпов), с"
+  },
+  "perpArbEnabled": {
+   "default": "true",
+   "restart": false,
+   "help": "Включена ли стратегия (вкладка «Стратегии»; выключение закрывает её позиции или доводит их до выхода, новых входов нет; ордера — только при tradingEnabled). Перп – перп на разных биржах: продать там, где перп дороже, купить там, где дешевле, закрыть при схождении цен"
+  },
+  "perpArbCheckMs": {
+   "default": "200",
+   "min": 50.0,
+   "max": 60000.0,
+   "restart": true,
+   "help": "Как часто сравнивать стаканы, мс"
+  },
+  "perpArbMinProfitPercent": {
+   "default": "0.05",
+   "min": 0.0,
+   "max": 10.0,
+   "restart": false,
+   "help": "Вход: ожидаемая прибыль после 4 комиссий тейкера обеих бирж не меньше, %"
+  },
+  "perpArbExitSpreadPercent": {
+   "default": "0",
+   "min": -10.0,
+   "max": 10.0,
+   "restart": false,
+   "help": "Выход: стоимость закрытия пары (аск дорогой − бид дешёвой) упала до этого, %"
+  },
+  "perpArbStopLossPercent": {
+   "default": "0.5",
+   "min": 0.01,
+   "max": 50.0,
+   "restart": false,
+   "help": "Стоп: расхождение цен выросло, и убыток пары по ценам больше этого, %"
+  },
+  "perpArbOrderQuote": {
+   "default": "50",
+   "min": 0.0,
+   "max": 1000000000.0,
+   "restart": false,
+   "help": "Размер каждой ноги в котируемой валюте"
+  },
+  "perpArbMaxPositions": {
+   "default": "3",
+   "min": 1.0,
+   "max": 100.0,
+   "restart": false,
+   "help": "Сколько пар держать одновременно"
+  },
+  "perpArbMaxHoldMinutes": {
+   "default": "60",
+   "min": 1.0,
+   "max": 10080.0,
+   "restart": false,
+   "help": "Закрыть пару по таймауту, мин"
+  },
+  "perpArbMaxBookAgeMs": {
+   "default": "1000",
+   "min": 10.0,
+   "max": 60000.0,
+   "restart": false,
+   "help": "Оба стакана не старше, мс"
+  },
+  "perpArbDepthUsage": {
+   "default": "0.5",
+   "min": 0.01,
+   "max": 1.0,
+   "restart": false,
+   "help": "Какую долю объёма лучших уровней можно взять"
+  },
+  "perpArbSymbols": {
+   "default": "",
+   "format": "([A-Z0-9]+(,[A-Z0-9]+)*)?",
+   "restart": false,
+   "help": "Монеты или символы через запятую; пусто — все общие"
+  },
+  "spotArbEnabled": {
+   "default": "true",
+   "restart": false,
+   "help": "Включена ли стратегия (вкладка «Стратегии»; выключение закрывает её позиции или доводит их до выхода, новых входов нет; ордера — только при tradingEnabled). Спот – спот на разных биржах: продать монету там, где дороже, и одновременно купить там, где дешевле. Нужен запас заранее: монета на бирже продажи и котируемая валюта на бирже покупки (переводов между биржами бот не делает)"
+  },
+  "spotArbCheckMs": {
+   "default": "200",
+   "min": 50.0,
+   "max": 60000.0,
+   "restart": true,
+   "help": "Как часто сравнивать стаканы, мс"
+  },
+  "spotArbMinProfitPercent": {
+   "default": "0.05",
+   "min": 0.0,
+   "max": 10.0,
+   "restart": false,
+   "help": "Вход: разница цен после двух комиссий тейкера не меньше, %"
+  },
+  "spotArbOrderQuote": {
+   "default": "50",
+   "min": 0.0,
+   "max": 1000000000.0,
+   "restart": false,
+   "help": "Размер сделки в котируемой валюте"
+  },
+  "spotArbMaxBookAgeMs": {
+   "default": "1000",
+   "min": 10.0,
+   "max": 60000.0,
+   "restart": false,
+   "help": "Оба стакана не старше, мс"
+  },
+  "spotArbDepthUsage": {
+   "default": "0.5",
+   "min": 0.01,
+   "max": 1.0,
+   "restart": false,
+   "help": "Какую долю объёма лучших уровней можно взять"
+  },
+  "spotArbCooldownMs": {
+   "default": "1000",
+   "min": 0.0,
+   "max": 600000.0,
+   "restart": false,
+   "help": "Пауза по монете после сделки, мс"
+  },
+  "spotArbSymbols": {
+   "default": "",
+   "format": "([A-Z0-9]+(,[A-Z0-9]+)*)?",
+   "restart": false,
+   "help": "Монеты или символы через запятую; пусто — все общие для бирж с market=spot"
+  },
+  "leadLagEnabled": {
+   "default": "true",
+   "restart": false,
+   "help": "Включена ли стратегия (вкладка «Стратегии»; выключение закрывает её позиции или доводит их до выхода, новых входов нет; ордера — только при tradingEnabled). Lead-lag: цена монеты на ведущей бирже резко сдвинулась, а на ведомой ещё нет — бот входит на ведомой по старой цене и выходит, когда она догнала. Торговля только на ведомой бирже"
+  },
+  "leadLagLeader": {
+   "default": "binance",
+   "format": "[a-z0-9]*",
+   "restart": false,
+   "help": "Ведущая биржа (за ней следим, на ней не торгуем): binance, bybit, okx… Должна быть запущена"
+  },
+  "leadLagCheckMs": {
+   "default": "50",
+   "min": 10.0,
+   "max": 60000.0,
+   "restart": true,
+   "help": "Как часто сравнивать цены, мс"
+  },
+  "leadLagWindowMs": {
+   "default": "500",
+   "min": 50.0,
+   "max": 60000.0,
+   "restart": false,
+   "help": "Окно движения ведущей цены, мс: движение считается за это время"
+  },
+  "leadLagMinMovePercent": {
+   "default": "0.15",
+   "min": 0.0,
+   "max": 50.0,
+   "restart": false,
+   "help": "Вход: ведущая цена сдвинулась за окно не меньше, %"
+  },
+  "leadLagMinProfitPercent": {
+   "default": "0.05",
+   "min": 0.0,
+   "max": 10.0,
+   "restart": false,
+   "help": "Вход: отставание ведомой цены после двух комиссий тейкера ведомой биржи не меньше, %"
+  },
+  "leadLagExitGapPercent": {
+   "default": "0.02",
+   "min": -10.0,
+   "max": 10.0,
+   "restart": false,
+   "help": "Выход: отставание сократилось до этого, % (ведомая догнала)"
+  },
+  "leadLagStopLossPercent": {
+   "default": "0.3",
+   "min": 0.01,
+   "max": 50.0,
+   "restart": false,
+   "help": "Стоп: убыток позиции по цене больше этого, %"
+  },
+  "leadLagMaxHoldMs": {
+   "default": "5000",
+   "min": 100.0,
+   "max": 3600000.0,
+   "restart": false,
+   "help": "Закрыть позицию по таймауту, мс: ведомая не догнала"
+  },
+  "leadLagOrderQuote": {
+   "default": "50",
+   "min": 0.0,
+   "max": 1000000000.0,
+   "restart": false,
+   "help": "Размер сделки в котируемой валюте"
+  },
+  "leadLagMaxPositions": {
+   "default": "3",
+   "min": 1.0,
+   "max": 100.0,
+   "restart": false,
+   "help": "Сколько позиций держать одновременно"
+  },
+  "leadLagBasisSec": {
+   "default": "60",
+   "min": 1.0,
+   "max": 86400.0,
+   "restart": false,
+   "help": "Обычная разница цен ведущей и ведомой биржи считается как среднее за столько секунд"
+  },
+  "leadLagMaxBookAgeMs": {
+   "default": "500",
+   "min": 10.0,
+   "max": 60000.0,
+   "restart": false,
+   "help": "Оба стакана не старше, мс"
+  },
+  "leadLagCooldownMs": {
+   "default": "2000",
+   "min": 0.0,
+   "max": 600000.0,
+   "restart": false,
+   "help": "Пауза по монете после сделки, мс"
+  },
+  "leadLagSymbols": {
+   "default": "",
+   "format": "([A-Z0-9]+(,[A-Z0-9]+)*)?",
+   "restart": false,
+   "help": "Монеты или символы через запятую; пусто — все общие для ведущей и ведомых бирж"
+  }
+ },
+ "фильтры_стратегий": {
+  "mean-reversion": [
+   "discoveryMinVolume",
+   "discoveryMrMaxSpreadPercent",
+   "discoveryMrMinRangePercent",
+   "discoveryMrMaxRangePercent",
+   "discoveryMrMaxTrend",
+   "discoveryMinTrades24h",
+   "discoveryMaxFlatMinutesPercent",
+   "discoveryMinVolume1h",
+   "discoveryMinHourlyVolume",
+   "discoveryMinDepthMultiple",
+   "discoveryDepthBandPercent",
+   "discoveryMaxImpactPercent",
+   "discoveryMaxWallPercent",
+   "discoveryMinBookLevels",
+   "discoveryMaxTickPercent",
+   "discoveryMinBookBalance",
+   "discoveryMaxZeroVolumeMinutesPercent",
+   "discoveryExclude",
+   "discoveryBacktestPerExchange",
+   "discoveryBacktestWindow",
+   "discoveryBacktestMaxHoldBars"
+  ],
+  "stat-arb": [
+   "discoveryMinVolume",
+   "discoveryMinTrades24h",
+   "discoveryExclude"
+  ],
+  "lead-lag": [
+   "discoveryArbMinVolume",
+   "discoveryExclude"
+  ],
+  "spread-capture": [
+   "discoverySpreadMinVolume",
+   "discoverySpreadMaxVolume",
+   "discoverySpreadMinEdgePercent",
+   "discoverySpreadMaxPercent",
+   "discoverySpreadMaxRangePercent",
+   "discoverySpreadMaxTrendPercent",
+   "discoveryMinTrades24h",
+   "discoveryMinVolume1h",
+   "discoveryMinHourlyVolume",
+   "discoveryMaxZeroVolumeMinutesPercent",
+   "discoveryMinDepthMultiple",
+   "discoveryDepthBandPercent",
+   "discoveryMaxImpactPercent",
+   "discoveryMaxWallPercent",
+   "discoveryMinBookLevels",
+   "discoveryMaxTickPercent",
+   "discoveryMinBookBalance",
+   "discoveryExclude"
+  ],
+  "cross-exchange-arb": [
+   "discoveryArbMinVolume",
+   "discoveryArbMaxGrossPercent",
+   "discoveryMinTrades24h",
+   "discoveryMinDepthMultiple",
+   "discoveryDepthBandPercent",
+   "discoveryMaxImpactPercent",
+   "discoveryMaxWallPercent",
+   "discoveryMinBookLevels",
+   "discoveryMaxTickPercent",
+   "discoveryMinBookBalance",
+   "discoveryExclude"
+  ],
+  "perp-arb": [
+   "discoveryArbMinVolume",
+   "discoveryArbMaxGrossPercent",
+   "discoveryMinTrades24h",
+   "discoveryExclude"
+  ]
+ }
+}
