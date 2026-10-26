@@ -2992,6 +2992,9 @@ mod tests {
             pos: f64,
             orders: Vec<(u64, String)>,
             bad_sig: u32,
+            /// стопы: запросы (POST) и снятые algoId (DELETE)
+            stops: Vec<String>,
+            stops_cancelled: Vec<String>,
         }
         let ex = Arc::new(Mutex::new(Ex::default()));
         fn param(q: &str, k: &str) -> Option<String> {
@@ -3013,6 +3016,7 @@ mod tests {
             )
         };
         let (e1, e2, e3, e4) = (ex.clone(), ex.clone(), ex.clone(), ex.clone());
+        let (e5, e6) = (ex.clone(), ex.clone());
         let rest = Router::new()
             .route("/fapi/v1/time", get(|| async { Json(json!({"serverTime": now_ms()})) }))
             .route("/fapi/v1/exchangeInfo", get(|| async { Json(json!({"symbols": [{"symbol": "BTCUSDT", "filters": [
@@ -3043,6 +3047,19 @@ mod tests {
                 let mut x = e3.lock().unwrap();
                 if !check(&q, &h) { x.bad_sig += 1; return bad(); }
                 (StatusCode::OK, Json(json!([{"symbol": "BTCUSDT", "positionAmt": format!("{}", x.pos), "entryPrice": "100"}])))
+            }))
+            .route("/fapi/v1/algoOrder", axum::routing::post(move |RawQuery(q): RawQuery, h: HeaderMap| async move {
+                let q = q.unwrap_or_default();
+                let mut x = e5.lock().unwrap();
+                if !check(&q, &h) { x.bad_sig += 1; }
+                x.stops.push(q);
+                Json(json!({"algoId": 777}))
+            }).delete(move |RawQuery(q): RawQuery, h: HeaderMap| async move {
+                let q = q.unwrap_or_default();
+                let mut x = e6.lock().unwrap();
+                if !check(&q, &h) { x.bad_sig += 1; }
+                x.stops_cancelled.push(param(&q, "algoId").unwrap());
+                Json(json!({"code": "200"}))
             }))
             .route("/fapi/v1/order", axum::routing::post(move |RawQuery(q): RawQuery, h: HeaderMap| async move {
                 let q = q.unwrap_or_default();
@@ -3107,7 +3124,7 @@ mod tests {
         crate::util::set_env("BINANCE_TESTNET_API_SECRET", SECRET);
         let (_d, r) = app("");
         let sel = format!(
-            "/control/select?exchange=binance&symbols=BTCUSDT&market=perp&leverage=5&testnet=true&wsUrl=ws://{waddr}/stream&restUrl=http://{raddr}&spreadCaptureEnabled=false&maxPositionQuote=1000"
+            "/control/select?exchange=binance&symbols=BTCUSDT&market=perp&leverage=5&testnet=true&wsUrl=ws://{waddr}/stream&restUrl=http://{raddr}&spreadCaptureEnabled=false&maxPositionQuote=1000&exchangeStopLossPercent=2.04"
         );
         assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
         call(&r, "POST", "/control/start", "").await;
@@ -3152,6 +3169,34 @@ mod tests {
             assert!(tokio::time::Instant::now() < until, "шорт не учтён: {a}");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        // стоп на бирже: шорт от 100 — BUY на 2.04 % выше, вверх до шага 0.1 → 102.1, closePosition по маркировке
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let (_, a) = call(&r, "GET", "/status", "").await;
+            if a["binance"]["тестовый_счёт"]["positions"][0]["stop"] == json!(102.1) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "стоп не поставлен: {a}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        {
+            let x = ex.lock().unwrap();
+            assert_eq!(x.stops.len(), 1, "стоп ставится один раз: {:?}", x.stops);
+            let q = &x.stops[0];
+            for (k, v) in [
+                ("algoType", "CONDITIONAL"),
+                ("side", "BUY"),
+                ("type", "STOP_MARKET"),
+                ("triggerPrice", "102.1"),
+                ("closePosition", "true"),
+                ("workingType", "MARK_PRICE"),
+            ] {
+                assert_eq!(param(q, k).as_deref(), Some(v), "{k} в {q}");
+            }
+        }
         // позиция закрыта на бирже (например, вручную) — событие ACCOUNT_UPDATE убирает её из учёта
         ev_tx.send(json!({"e": "ACCOUNT_UPDATE", "a": {"B": [], "P": [{"s": "BTCUSDT", "pa": "0", "ep": "0"}]}}).to_string()).unwrap();
         let until = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -3166,6 +3211,13 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        // позиции нет — стоп снят
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        while ex.lock().unwrap().stops_cancelled.is_empty() {
+            assert!(tokio::time::Instant::now() < until, "стоп не снят");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(ex.lock().unwrap().stops_cancelled, ["777"]);
         assert_eq!(ex.lock().unwrap().bad_sig, 0, "все подписи верны");
         call(&r, "POST", "/control/stop", "").await;
     }

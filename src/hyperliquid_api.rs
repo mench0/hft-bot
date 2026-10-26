@@ -587,6 +587,43 @@ fn apply(ups: Vec<(u64, OrderState)>) -> StreamMsg {
     }))
 }
 
+/// Стоп на бирже (перпы): reduceOnly-стоп по цене маркировки на всю позицию; None — биржа или рынок не поддерживает.
+impl Client {
+    /// Триггер-ордер tpsl «sl» (рыночный, reduceOnly) на объём позиции; предел проскальзывания — стоп ±5 %.
+    pub async fn place_stop(
+        &self,
+        symbol: &str,
+        side: Side,
+        qty: f64,
+        price: f64,
+    ) -> Result<Option<String>, String> {
+        if !self.perp {
+            return Ok(None);
+        }
+        let a = self.asset(symbol)?;
+        let buy = side == Side::Buy;
+        let px = |x: f64| format_price(x, a.sz_dec, 6);
+        let order = json!({"a": a.index, "b": buy, "p": px(price * if buy { 1.0 + MARKET_BAND } else { 1.0 - MARKET_BAND }),
+            "s": size(qty, a.sz_dec), "r": true, "t": {"trigger": {"isMarket": true, "triggerPx": px(price), "tpsl": "sl"}}});
+        let v = self
+            .exchange(json!({"type": "order", "orders": [order], "grouping": "na"}))
+            .await?;
+        let st = &v["response"]["data"]["statuses"][0];
+        st["resting"]["oid"]
+            .as_u64()
+            .map(|o| Some(o.to_string()))
+            .ok_or_else(|| format!("Hyperliquid: стоп не принят: {st}"))
+    }
+
+    pub async fn cancel_stop(&self, symbol: &str, id: &str) -> Result<(), String> {
+        let a = self.asset(symbol)?;
+        let oid: u64 = id.parse().map_err(|_| format!("номер стопа {id}"))?;
+        self.exchange(json!({"type": "cancel", "cancels": [{"a": a.index, "o": oid}]}))
+            .await
+            .map(|_| ())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

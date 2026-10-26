@@ -491,6 +491,44 @@ impl Client {
     }
 }
 
+/// Стоп на бирже (перпы): reduceOnly-стоп по цене маркировки на всю позицию; None — биржа или рынок не поддерживает.
+impl Client {
+    /// Стоп-ордер closeOrder по маркировке (stopPriceType MP): лонг — stop=down, шорт — stop=up.
+    pub async fn place_stop(
+        &self,
+        symbol: &str,
+        side: crate::paper::Side,
+        price: f64,
+    ) -> Result<Option<String>, String> {
+        if !self.perp {
+            return Ok(None);
+        }
+        let sell = side == crate::paper::Side::Sell;
+        let b = json!({"clientOid": format!("sl{}", now_ms()), "side": if sell { "sell" } else { "buy" }, "symbol": self.instrument(symbol),
+            "type": "market", "stop": if sell { "down" } else { "up" }, "stopPriceType": "MP", "stopPrice": dec(price),
+            "closeOrder": true, "marginMode": "CROSS"});
+        let v = self
+            .call(reqwest::Method::POST, "/api/v1/orders", Some(b))
+            .await?;
+        let id = v["orderId"]
+            .as_str()
+            .or(v["data"]["orderId"].as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("KuCoin: нет orderId у стопа: {v}"))?;
+        Ok(Some(id.to_owned()))
+    }
+
+    pub async fn cancel_stop(&self, _symbol: &str, id: &str) -> Result<(), String> {
+        self.call(
+            reqwest::Method::DELETE,
+            &format!("/api/v1/orders/{id}"),
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

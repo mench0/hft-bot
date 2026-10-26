@@ -349,6 +349,43 @@ pub fn parse_balances(d: &Value, perp: bool) -> BTreeMap<String, f64> {
         .collect()
 }
 
+/// Стоп на бирже (перпы): reduceOnly-стоп по цене маркировки на всю позицию; None — биржа или рынок не поддерживает.
+impl Client {
+    /// Алгоритмический стоп conditional: вся позиция (closeFraction 1), по маркировке, рыночный (slOrdPx −1).
+    pub async fn place_stop(
+        &self,
+        symbol: &str,
+        side: crate::paper::Side,
+        price: f64,
+    ) -> Result<Option<String>, String> {
+        if !self.perp {
+            return Ok(None);
+        }
+        let b = json!({"instId": self.inst_id(symbol), "tdMode": "cross", "side": if side == crate::paper::Side::Buy { "buy" } else { "sell" },
+            "ordType": "conditional", "closeFraction": "1", "reduceOnly": true, "slTriggerPx": crate::signed::dec(price),
+            "slTriggerPxType": "mark", "slOrdPx": "-1"});
+        let d = self
+            .call(reqwest::Method::POST, "/api/v5/trade/order-algo", Some(b))
+            .await?;
+        let id = d[0]["algoId"]
+            .as_str()
+            .or(d["data"][0]["algoId"].as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("OKX: нет algoId у стопа: {d}"))?;
+        Ok(Some(id.to_owned()))
+    }
+
+    pub async fn cancel_stop(&self, symbol: &str, id: &str) -> Result<(), String> {
+        self.call(
+            reqwest::Method::POST,
+            "/api/v5/trade/cancel-algos",
+            Some(json!([{"instId": self.inst_id(symbol), "algoId": id}])),
+        )
+        .await
+        .map(|_| ())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

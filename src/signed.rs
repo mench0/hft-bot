@@ -432,6 +432,77 @@ pub fn dec(x: f64) -> String {
     s.trim_end_matches('.').to_owned()
 }
 
+/// Стоп на бирже (перпы): reduceOnly-стоп по цене маркировки на всю позицию; None — биржа или рынок не поддерживает.
+impl Client {
+    /// STOP_MARKET closePosition через Algo Order API (id «a:…»), при ошибке — классический /fapi/v1/order («o:…»).
+    pub async fn place_stop(
+        &self,
+        symbol: &str,
+        side: crate::paper::Side,
+        price: f64,
+    ) -> Result<Option<String>, String> {
+        if !self.perp {
+            return Ok(None);
+        }
+        let s = if side == crate::paper::Side::Buy {
+            "BUY"
+        } else {
+            "SELL"
+        };
+        let px = dec(price);
+        let a = [
+            ("algoType", "CONDITIONAL".to_owned()),
+            ("symbol", symbol.to_uppercase()),
+            ("side", s.to_owned()),
+            ("type", "STOP_MARKET".to_owned()),
+            ("triggerPrice", px.clone()),
+            ("closePosition", "true".to_owned()),
+            ("workingType", "MARK_PRICE".to_owned()),
+        ];
+        match self
+            .signed(reqwest::Method::POST, "/fapi/v1/algoOrder", &a)
+            .await
+        {
+            Ok(v) if !v["algoId"].is_null() => Ok(Some(format!(
+                "a:{}",
+                v["algoId"]
+                    .as_str()
+                    .map_or_else(|| v["algoId"].to_string(), str::to_owned)
+            ))),
+            r => {
+                tracing::warn!("[binance] Algo Order API: {r:?} — стоп через /fapi/v1/order");
+                let p = [
+                    ("symbol", symbol.to_uppercase()),
+                    ("side", s.to_owned()),
+                    ("type", "STOP_MARKET".to_owned()),
+                    ("stopPrice", px),
+                    ("closePosition", "true".to_owned()),
+                    ("workingType", "MARK_PRICE".to_owned()),
+                ];
+                let v = self
+                    .signed(reqwest::Method::POST, "/fapi/v1/order", &p)
+                    .await?;
+                Ok(Some(format!("o:{}", v["orderId"])))
+            }
+        }
+    }
+
+    pub async fn cancel_stop(&self, symbol: &str, id: &str) -> Result<(), String> {
+        let (path, k, v) = match id.split_once(':') {
+            Some(("a", x)) => ("/fapi/v1/algoOrder", "algoId", x),
+            Some((_, x)) => ("/fapi/v1/order", "orderId", x),
+            None => ("/fapi/v1/order", "orderId", id),
+        };
+        self.signed(
+            reqwest::Method::DELETE,
+            path,
+            &[("symbol", symbol.to_uppercase()), (k, v.to_owned())],
+        )
+        .await
+        .map(|_| ())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

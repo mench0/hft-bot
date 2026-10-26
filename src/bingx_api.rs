@@ -471,6 +471,62 @@ impl Client {
     }
 }
 
+/// Стоп на бирже (перпы): reduceOnly-стоп по цене маркировки на всю позицию; None — биржа или рынок не поддерживает.
+impl Client {
+    /// STOP_MARKET closePosition по маркировке.
+    pub async fn place_stop(
+        &self,
+        symbol: &str,
+        side: Side,
+        price: f64,
+    ) -> Result<Option<String>, String> {
+        if !self.perp {
+            return Ok(None);
+        }
+        let p = [
+            ("symbol", sym(symbol)),
+            (
+                "side",
+                if side == Side::Buy { "BUY" } else { "SELL" }.to_owned(),
+            ),
+            ("positionSide", "BOTH".to_owned()),
+            ("type", "STOP_MARKET".to_owned()),
+            ("stopPrice", dec(price)),
+            ("closePosition", "true".to_owned()),
+            ("workingType", "MARK_PRICE".to_owned()),
+        ];
+        let v = self
+            .signed(
+                reqwest::Method::POST,
+                &format!("{}/trade/order", self.api()),
+                &p,
+            )
+            .await?;
+        let d = if v["data"].get("order").is_some() {
+            &v["data"]["order"]
+        } else {
+            &v["data"]
+        };
+        let id = d["orderId"]
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| d["orderId"].as_i64().map(|x| x.to_string()))
+            .or_else(|| v["order"]["orderId"].as_i64().map(|x| x.to_string()))
+            .ok_or_else(|| format!("BingX: нет orderId у стопа: {v}"))?;
+        Ok(Some(id))
+    }
+
+    pub async fn cancel_stop(&self, symbol: &str, id: &str) -> Result<(), String> {
+        self.signed(
+            reqwest::Method::DELETE,
+            &format!("{}/trade/order", self.api()),
+            &[("symbol", sym(symbol)), ("orderId", id.to_owned())],
+        )
+        .await
+        .map(|_| ())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

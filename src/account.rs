@@ -29,6 +29,84 @@ impl Account {
         }
     }
 
+    /// Защитный стоп перпа (exchangeStopLossPercent): позиция есть — стоп на pct % от цены входа против неё на весь
+    /// объём, нет — стопа нет. Бумага: цена дошла до стопа — рыночный выход; живой счёт — стоп ставится на бирже.
+    pub fn protect(&mut self, symbol: &str, pct: f64, book: Option<&Book>) {
+        let tick = self.filter(symbol).map(|f| f.tick).unwrap_or(0.0);
+        let led = self.ledger_mut();
+        let p = led.positions.get(symbol).cloned();
+        let want = p
+            .filter(|p| pct > 0.0 && p.qty.abs() > 1e-12 && p.entry > 0.0)
+            .map(|p| {
+                let long = p.qty > 0.0;
+                let raw = p.entry
+                    * if long {
+                        1.0 - pct / 100.0
+                    } else {
+                        1.0 + pct / 100.0
+                    };
+                // по шагу цены, без него — 6 значащих цифр
+                let px = if tick > 0.0 {
+                    let r = if long {
+                        (raw / tick).floor()
+                    } else {
+                        (raw / tick).ceil()
+                    } * tick;
+                    let d = (-tick.log10()).ceil().max(0.0) as usize;
+                    format!("{r:.d$}").parse().unwrap_or(r)
+                } else {
+                    let d = (5 - raw.abs().log10().floor() as i32).max(0) as usize;
+                    format!("{raw:.d$}").parse().unwrap_or(raw)
+                };
+                (if long { Side::Sell } else { Side::Buy }, p.qty.abs(), px)
+            });
+        match self {
+            Account::Paper(pp) => {
+                let Some((side, qty, px)) = want else {
+                    pp.stops.remove(symbol);
+                    return;
+                };
+                pp.stops.insert(symbol.to_owned(), (side, px));
+                let hit = book.is_some_and(|b| match side {
+                    Side::Sell => b.best_bid().is_some_and(|x| x.0 <= px),
+                    Side::Buy => b.best_ask().is_some_and(|x| x.0 >= px),
+                });
+                if hit {
+                    pp.stops.remove(symbol);
+                    pp.stops_triggered += 1;
+                    match pp.exit_market(symbol, side, qty, book) {
+                        Ok(f) => tracing::warn!(
+                            "[стоп] {symbol}: сработал стоп {px} — закрыто {} по {}",
+                            f.executed,
+                            f.avg_price
+                        ),
+                        Err(e) => tracing::warn!(
+                            "[стоп] {symbol}: стоп {px} сработал, выход не удался: {e}"
+                        ),
+                    }
+                }
+            }
+            Account::Live(l) => l.want_stop(symbol, want),
+        }
+    }
+
+    /// Символы, по которым есть позиция или стоп.
+    pub fn stop_symbols(&mut self) -> Vec<String> {
+        let led = self.ledger_mut();
+        let mut v: Vec<String> = led
+            .positions
+            .keys()
+            .chain(led.stops.keys())
+            .cloned()
+            .collect();
+        if let Account::Live(l) = self {
+            v.extend(l.stop_keys());
+        }
+        v.sort();
+        v.dedup();
+        v
+    }
+
     /// "PAPER", "TESTNET" или "LIVE".
     pub fn mode(&self) -> &'static str {
         match self {
@@ -221,5 +299,60 @@ impl Account {
             Account::Paper(_) => "",
             Account::Live(l) => &l.error,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::paper::Amount;
+
+    fn book(bid: f64, ask: f64) -> Book {
+        let mut b = Book::default();
+        b.apply_snapshot(vec![(bid, 100.0)], vec![(ask, 100.0)], 0);
+        b
+    }
+
+    #[test]
+    fn paper_stop_follows_position_and_fires() {
+        let mut a = Account::Paper(Paper::new(&["XUSDT".into()], 1000.0, 0.0, 0.0));
+        a.set_perp(2.0);
+        let mut lim = Limits::from_params(&serde_json::Map::new());
+        lim.trading_enabled = true;
+        a.order(
+            "XUSDT",
+            Side::Buy,
+            Amount::Qty(1.0),
+            None,
+            Some(&book(99.9, 100.0)),
+            &lim,
+        )
+        .unwrap();
+        // лонг от 100: стоп на 2 % ниже
+        a.protect("XUSDT", 2.0, Some(&book(99.0, 99.1)));
+        assert_eq!(
+            a.paper().unwrap().stops.get("XUSDT"),
+            Some(&(Side::Sell, 98.0))
+        );
+        assert!(a.position_qty("XUSDT") > 0.99);
+        // бид дошёл до стопа — позиция закрыта рыночным
+        a.protect("XUSDT", 2.0, Some(&book(97.9, 98.0)));
+        assert!(a.position_qty("XUSDT").abs() < 1e-9);
+        let p = a.paper().unwrap();
+        assert_eq!((p.stops_triggered, p.stops.len()), (1, 0));
+        // выключено — стопа нет
+        let mut b = Account::Paper(Paper::new(&["XUSDT".into()], 1000.0, 0.0, 0.0));
+        b.set_perp(2.0);
+        b.order(
+            "XUSDT",
+            Side::Sell,
+            Amount::Qty(1.0),
+            None,
+            Some(&book(100.0, 100.1)),
+            &lim,
+        )
+        .unwrap();
+        b.protect("XUSDT", 0.0, Some(&book(150.0, 150.1)));
+        assert!(b.position_qty("XUSDT") < -0.99);
     }
 }

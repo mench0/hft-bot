@@ -34,6 +34,19 @@ pub enum Cmd {
         coin: String,
         network: String,
     },
+    /// Поставить защитный стоп (перпы); old — прежний стоп, снимается после установки нового.
+    PlaceStop {
+        symbol: String,
+        side: Side,
+        qty: f64,
+        price: f64,
+        old: Option<String>,
+    },
+    /// Снять защитный стоп.
+    CancelStop {
+        symbol: String,
+        id: String,
+    },
     /// Вывести монету (номер перевода — свой).
     Withdraw {
         tid: u64,
@@ -83,6 +96,27 @@ pub struct Live {
     pub addresses: HashMap<(String, String), Result<(String, String), String>>,
     /// Итог выводов по своему номеру: номер на бирже или ошибка.
     pub withdrawals: HashMap<u64, Result<String, String>>,
+    /// Защитные стопы на бирже по символам.
+    stops: HashMap<String, Stop>,
+    /// Последняя неудача стопа по символу (повтор не раньше чем через STOP_RETRY).
+    stop_failed: HashMap<String, std::time::Instant>,
+    /// Биржа (рынок) не поддерживает стопы в боте — защищает только стоп-лосс бота.
+    pub stops_unsupported: bool,
+}
+
+#[derive(Debug, Clone)]
+struct Stop {
+    /// Номер на бирже; None — запрос ещё идёт.
+    id: Option<String>,
+    side: Side,
+    qty: f64,
+    price: f64,
+}
+
+const STOP_RETRY: Duration = Duration::from_secs(30);
+
+fn near(a: f64, b: f64) -> bool {
+    (a - b).abs() <= (b.abs() * 1e-9).max(1e-12)
 }
 
 impl Live {
@@ -107,6 +141,9 @@ impl Live {
             networks: HashMap::new(),
             addresses: HashMap::new(),
             withdrawals: HashMap::new(),
+            stops: HashMap::new(),
+            stop_failed: HashMap::new(),
+            stops_unsupported: false,
         }
     }
 
@@ -252,6 +289,108 @@ impl Live {
             .map(|(id, _)| *id)
             .collect();
         ids.iter().filter(|id| self.cancel(**id)).count()
+    }
+
+    /// Привести стоп символа на бирже к желаемому (None — снять). Новый ставится до снятия старого.
+    pub fn want_stop(&mut self, symbol: &str, want: Option<(Side, f64, f64)>) {
+        if self.stops_unsupported {
+            return;
+        }
+        let cur = self.stops.get(symbol).cloned();
+        match (want, cur) {
+            (None, None) => {}
+            (None, Some(c)) => {
+                if let Some(id) = c.id {
+                    self.stops.remove(symbol);
+                    self.ledger.stops.remove(symbol);
+                    let _ = self.tx.send(Cmd::CancelStop {
+                        symbol: symbol.to_owned(),
+                        id,
+                    });
+                }
+            }
+            (Some(_), Some(c)) if c.id.is_none() => {} // запрос идёт
+            (Some((side, qty, price)), cur) => {
+                if cur
+                    .as_ref()
+                    .is_some_and(|c| c.side == side && near(c.qty, qty) && near(c.price, price))
+                {
+                    return;
+                }
+                if self
+                    .stop_failed
+                    .get(symbol)
+                    .is_some_and(|t| t.elapsed() < STOP_RETRY)
+                {
+                    return;
+                }
+                let old = cur.and_then(|c| c.id);
+                self.stops.insert(
+                    symbol.to_owned(),
+                    Stop {
+                        id: None,
+                        side,
+                        qty,
+                        price,
+                    },
+                );
+                let _ = self.tx.send(Cmd::PlaceStop {
+                    symbol: symbol.to_owned(),
+                    side,
+                    qty,
+                    price,
+                    old,
+                });
+            }
+        }
+    }
+
+    pub fn stop_keys(&self) -> Vec<String> {
+        self.stops.keys().cloned().collect()
+    }
+
+    /// Итог установки стопа (из фоновой задачи).
+    fn stop_placed(
+        &mut self,
+        symbol: &str,
+        r: &Result<Option<String>, String>,
+        old: Option<String>,
+    ) {
+        match r {
+            Ok(Some(id)) => {
+                if let Some(s) = self.stops.get_mut(symbol) {
+                    s.id = Some(id.clone());
+                    self.ledger
+                        .stops
+                        .insert(symbol.to_owned(), (s.side, s.price));
+                }
+                self.stop_failed.remove(symbol);
+            }
+            Ok(None) => {
+                self.stops_unsupported = true;
+                self.stops.clear();
+                tracing::warn!(
+                    "биржа не поддерживает стоп-ордера в боте — защищает только стоп-лосс бота"
+                );
+            }
+            Err(e) => {
+                self.stop_failed
+                    .insert(symbol.to_owned(), std::time::Instant::now());
+                self.error = format!("стоп {symbol}: {e}");
+                // прежний стоп остаётся на бирже
+                match old {
+                    Some(id) => {
+                        if let Some(s) = self.stops.get_mut(symbol) {
+                            s.id = Some(id);
+                            s.price = f64::NAN; // не совпадёт с желаемым — повтор после паузы
+                        }
+                    }
+                    None => {
+                        self.stops.remove(symbol);
+                    }
+                }
+            }
+        }
     }
 
     /// Ответ биржи по ордеру: номер, новое исполнение (в учёт), конец жизни ордера.
@@ -600,6 +739,41 @@ impl Venue {
             Venue::Lbank(_) | Venue::Upbit(_) | Venue::Uniswap(_) => Ok(Vec::new()),
         }
     }
+    /// Защитный стоп (перпы): None — не поддерживается.
+    async fn place_stop(
+        &self,
+        symbol: &str,
+        side: Side,
+        qty: f64,
+        price: f64,
+    ) -> Result<Option<String>, String> {
+        match self {
+            Venue::Binance(c) => c.place_stop(symbol, side, price).await,
+            Venue::Bybit(c) => c.place_stop(symbol, side, price).await,
+            Venue::Aster(c) => c.place_stop(symbol, side, price).await,
+            Venue::Okx(c) => c.place_stop(symbol, side, price).await,
+            Venue::Gate(c) => c.place_stop(symbol, side, price).await,
+            Venue::Kucoin(c) => c.place_stop(symbol, side, price).await,
+            Venue::Bingx(c) => c.place_stop(symbol, side, price).await,
+            Venue::Hyperliquid(c) => c.place_stop(symbol, side, qty, price).await,
+            _ => Ok(None),
+        }
+    }
+
+    async fn cancel_stop(&self, symbol: &str, id: &str) -> Result<(), String> {
+        match self {
+            Venue::Binance(c) => c.cancel_stop(symbol, id).await,
+            Venue::Bybit(c) => c.cancel_stop(symbol, id).await,
+            Venue::Aster(c) => c.cancel_stop(symbol, id).await,
+            Venue::Okx(c) => c.cancel_stop(symbol, id).await,
+            Venue::Gate(c) => c.cancel_stop(symbol, id).await,
+            Venue::Kucoin(c) => c.cancel_stop(symbol, id).await,
+            Venue::Bingx(c) => c.cancel_stop(symbol, id).await,
+            Venue::Hyperliquid(c) => c.cancel_stop(symbol, id).await,
+            _ => Ok(()),
+        }
+    }
+
     async fn set_leverage(&self, symbol: &str, lev: f64) -> Result<(), String> {
         match self {
             Venue::Binance(c) => c.set_leverage(symbol, lev).await,
@@ -709,6 +883,26 @@ pub async fn worker(
                         }
                     }
                     Cmd::Cancel { local } => cancel(&acc, &ex, &client, local).await,
+                    Cmd::PlaceStop { symbol, side, qty, price, old } => {
+                        let r = client.place_stop(&symbol, side, qty, price).await;
+                        match &r {
+                            Ok(Some(id)) => tracing::warn!("[{ex}] стоп на бирже {symbol} {side:?} {qty} @ {price} (id {id})"),
+                            Ok(None) => {}
+                            Err(e) => tracing::error!("[{ex}] стоп по {symbol} не поставлен: {e} — повтор через 30 с"),
+                        }
+                        // старый снимается только после нового (у Bybit стоп позиции один — id тот же)
+                        if let (Ok(Some(id)), Some(o)) = (&r, &old)
+                            && id != o
+                            && let Err(e) = client.cancel_stop(&symbol, o).await
+                        {
+                            tracing::warn!("[{ex}] стоп {o} по {symbol} не снят: {e}");
+                        }
+                        with_live(&acc, &ex, |l| l.stop_placed(&symbol, &r, old));
+                    }
+                    Cmd::CancelStop { symbol, id } => match client.cancel_stop(&symbol, &id).await {
+                        Ok(()) => tracing::info!("[{ex}] стоп {id} по {symbol} снят"),
+                        Err(e) => tracing::warn!("[{ex}] стоп {id} по {symbol} не снят (возможно, сработал): {e}"),
+                    },
                     Cmd::Networks { coin } => {
                         let r = client.networks(&coin).await;
                         with_live(&acc, &ex, |l| { l.networks.insert(coin, r); });

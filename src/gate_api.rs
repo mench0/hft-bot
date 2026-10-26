@@ -507,6 +507,48 @@ impl Client {
     }
 }
 
+/// Стоп на бирже (перпы): reduceOnly-стоп по цене маркировки на всю позицию; None — биржа или рынок не поддерживает.
+impl Client {
+    /// Ценовой триггер /price_orders по маркировке: рыночное закрытие всей позиции; лонг — при цене ≤ стопа (rule 2).
+    pub async fn place_stop(
+        &self,
+        symbol: &str,
+        side: crate::paper::Side,
+        price: f64,
+    ) -> Result<Option<String>, String> {
+        if !self.perp {
+            return Ok(None);
+        }
+        let b = json!({"initial": {"contract": pair(symbol), "size": 0, "price": "0", "tif": "ioc", "close": true, "reduce_only": true},
+            "trigger": {"strategy_type": 0, "price_type": 1, "price": dec(price), "rule": if side == crate::paper::Side::Sell { 2 } else { 1 }}});
+        let v = self
+            .call(
+                reqwest::Method::POST,
+                "/futures/usdt/price_orders",
+                "",
+                Some(b),
+            )
+            .await?;
+        let id = v["id"]
+            .as_i64()
+            .map(|x| x.to_string())
+            .or_else(|| v["id"].as_str().map(str::to_owned))
+            .ok_or_else(|| format!("Gate: нет id у стопа: {v}"))?;
+        Ok(Some(id))
+    }
+
+    pub async fn cancel_stop(&self, _symbol: &str, id: &str) -> Result<(), String> {
+        self.call(
+            reqwest::Method::DELETE,
+            &format!("/futures/usdt/price_orders/{id}"),
+            "",
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

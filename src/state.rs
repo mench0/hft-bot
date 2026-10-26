@@ -696,6 +696,20 @@ impl Bot {
                     paper.match_resting(sym, b, &lim);
                 }
             }
+            // перпы: защитный стоп по каждой позиции (и снятие стопов закрытых)
+            if paper.is_perp() {
+                let pct = params
+                    .get("exchangeStopLossPercent")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                for sym in paper.stop_symbols() {
+                    let book = books
+                        .get(&sym)
+                        .cloned()
+                        .or_else(|| self.market.book(&ex, &sym));
+                    paper.protect(&sym, pct, book.as_ref().filter(|b| b.is_ready()));
+                }
+            }
             // funding перпов: когда наступило время списания — один раз по последней известной ставке
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

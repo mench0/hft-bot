@@ -161,6 +161,10 @@ pub struct Paper {
     /// Funding: уплачено (минус — получено).
     pub funding_paid: f64,
     pub liquidations: u64,
+    /// Защитные стопы перпов по символам: (сторона закрытия, цена срабатывания) — у бумаги срабатывают в учёте,
+    /// у живого счёта стоят на бирже.
+    pub stops: HashMap<String, (Side, f64)>,
+    pub stops_triggered: u64,
 }
 
 /// Исполнение заявки.
@@ -223,6 +227,8 @@ impl Paper {
             positions: HashMap::new(),
             funding_paid: 0.0,
             liquidations: 0,
+            stops: HashMap::new(),
+            stops_triggered: 0,
         };
         for s in symbols {
             if let Some((_, q)) = split(s) {
@@ -1156,10 +1162,10 @@ impl Paper {
             "openOrders": self.open_orders(),
             "openPositions": if self.leverage.is_some() { self.positions.len() } else { self.lots.values().filter(|l| l.qty > 1e-12).count() },
             "market": if self.leverage.is_some() { "perp" } else { "spot" }, "leverage": self.leverage,
-            "fundingPaid": self.funding_paid, "liquidations": self.liquidations,
+            "fundingPaid": self.funding_paid, "liquidations": self.liquidations, "stopsTriggered": self.stops_triggered,
             "positions": self.positions.iter().map(|(s, p)| {
                 let mark = mids.get(s).copied();
-                json!({"symbol": s, "qty": p.qty, "entry": p.entry, "margin": p.margin, "mark": mark,
+                json!({"symbol": s, "qty": p.qty, "entry": p.entry, "margin": p.margin, "mark": mark, "stop": self.stops.get(s).map(|x| x.1),
                     "unrealizedPnl": mark.map(|m| p.qty * (m - p.entry))})
             }).collect::<Vec<_>>(),
         })

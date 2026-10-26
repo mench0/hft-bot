@@ -263,6 +263,52 @@ impl Client {
     }
 }
 
+/// Стоп на бирже (перпы): reduceOnly-стоп по цене маркировки на всю позицию; None — биржа или рынок не поддерживает.
+impl Client {
+    /// STOP_MARKET closePosition по маркировке, формат Binance.
+    pub async fn place_stop(
+        &self,
+        symbol: &str,
+        side: Side,
+        price: f64,
+    ) -> Result<Option<String>, String> {
+        if !self.perp {
+            return Ok(None);
+        }
+        let p = [
+            ("symbol", symbol.to_uppercase()),
+            (
+                "side",
+                if side == Side::Buy { "BUY" } else { "SELL" }.to_owned(),
+            ),
+            ("type", "STOP_MARKET".to_owned()),
+            ("stopPrice", dec(price)),
+            ("closePosition", "true".to_owned()),
+            ("workingType", "MARK_PRICE".to_owned()),
+        ];
+        let v = self.signed(reqwest::Method::POST, "/order", &p).await?;
+        Ok(Some(
+            v["orderId"]
+                .as_i64()
+                .map(|x| x.to_string())
+                .unwrap_or_else(|| v["orderId"].to_string()),
+        ))
+    }
+
+    pub async fn cancel_stop(&self, symbol: &str, id: &str) -> Result<(), String> {
+        self.signed(
+            reqwest::Method::DELETE,
+            "/order",
+            &[
+                ("symbol", symbol.to_uppercase()),
+                ("orderId", id.to_owned()),
+            ],
+        )
+        .await
+        .map(|_| ())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -134,6 +134,12 @@
   ордер — своп с защитой по цене (minOut / maxIn, uniSlippagePercent, по умолчанию 0.5 %), approve ровно на сумму,
   legacy-транзакции EIP-155 (подпись сверена с примером из EIP), итог — по квитанции и разнице балансов. Параметры:
   restUrl — RPC-узел, uniRouter, uniTokens="WETH=0x…:18;USDC=0x…:6"; ключ — UNISWAPV2_API_SECRET (горячий кошелёк!). Газ — в ETH.
+- **Стоп на бирже** (`exchangeStopLossPercent`, перпы; 0 — выключено): по каждой позиции — один reduceOnly-стоп на столько %
+  от цены входа против неё, на весь объём, по цене маркировки (страховка, если бот упадёт или пропадёт связь). Новый стоп
+  ставится до снятия старого; позиция закрылась — стоп снимается; неудача — повтор через 30 с. Binance (Algo Order API,
+  запасной путь /fapi/v1/order), Bybit (trading-stop позиции), OKX (order-algo), Gate (price_orders), KuCoin, BingX, Aster,
+  Hyperliquid (триггер tpsl sl); на остальных — только стоп-лосс бота. На бумаге стоп срабатывает в учёте по лучшей цене.
+  Цена стопа видна в /status (positions[].stop), сработавшие — stopsTriggered.
 - **Перпы (USDT)** — параметр `market=perp`, плечо — `leverage`. Бумага: лонг и шорт, изолированная маржа, комиссии
   перпов из каталога, funding по ставке биржи в момент списания (ставки — Binance `/fapi/v1/premiumIndex`, Bybit
   `/v5/market/tickers`, раз в 30 с; видны в `/market` как `funding_проц`), ликвидация при марже ниже 0.5% объёма.

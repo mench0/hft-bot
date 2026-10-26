@@ -345,6 +345,48 @@ impl Client {
     }
 }
 
+/// Стоп на бирже (перпы): reduceOnly-стоп по цене маркировки на всю позицию; None — биржа или рынок не поддерживает.
+impl Client {
+    /// Стоп-лосс самой позиции (/v5/position/trading-stop, tpslMode Full, по маркировке, рыночный); id — «position».
+    pub async fn place_stop(
+        &self,
+        symbol: &str,
+        _side: crate::paper::Side,
+        price: f64,
+    ) -> Result<Option<String>, String> {
+        if self.category != "linear" {
+            return Ok(None);
+        }
+        self.call(
+            true,
+            "/v5/position/trading-stop",
+            Self::trading_stop(symbol, &dec(price)),
+        )
+        .await?;
+        Ok(Some("position".into()))
+    }
+
+    /// Снять стоп позиции: stopLoss=0; позиции уже нет — не ошибка.
+    pub async fn cancel_stop(&self, symbol: &str, _id: &str) -> Result<(), String> {
+        match self
+            .call(
+                true,
+                "/v5/position/trading-stop",
+                Self::trading_stop(symbol, "0"),
+            )
+            .await
+        {
+            Err(e) if e.contains("10001") => Ok(()),
+            r => r.map(|_| ()),
+        }
+    }
+
+    fn trading_stop(symbol: &str, sl: &str) -> String {
+        json!({"category": "linear", "symbol": symbol.to_uppercase(), "tpslMode": "Full", "positionIdx": 0, "stopLoss": sl,
+            "slTriggerBy": "MarkPrice", "slOrderType": "Market"}).to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
