@@ -14,6 +14,7 @@ mod leadlag;
 mod live;
 mod market;
 mod paper;
+mod perparb;
 mod rest;
 mod screener;
 mod signed;

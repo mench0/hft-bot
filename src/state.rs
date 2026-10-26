@@ -57,6 +57,8 @@ pub struct Bot {
     spotarb: Mutex<crate::spotarb::SpotArb>,
     /// Lead-lag (один на процесс).
     leadlag: Mutex<crate::leadlag::LeadLag>,
+    /// Арбитраж цен перпов между биржами (один на процесс).
+    perparb: Mutex<crate::perparb::PerpArb>,
     /// Скринер (подбор тикеров).
     pub screener: Arc<Mutex<crate::screener::Screener>>,
     pub screener_sources: crate::screener::Sources,
@@ -112,6 +114,7 @@ impl Bot {
             statarbs: Mutex::default(),
             spotarb: Mutex::default(),
             leadlag: Mutex::default(),
+            perparb: Mutex::default(),
             screener: Arc::default(),
             screener_sources: crate::screener::Sources::default(),
             funding_applied: Mutex::default(),
@@ -591,6 +594,7 @@ impl Bot {
                 .unwrap()
                 .held()
                 .into_iter()
+                .chain(self.perparb.lock().unwrap().held())
                 .filter_map(|k| k.strip_prefix(&format!("{ex}:")).map(str::to_owned))
                 .collect();
             let mut all = self.spreads.lock().unwrap();
@@ -671,10 +675,24 @@ impl Bot {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+        // монеты пар perp-arb lead-lag не трогает, и наоборот
+        let pa_held = self.perparb.lock().unwrap().held();
+        let ll_busy: std::collections::HashSet<String> =
+            busy_cross.union(&pa_held).cloned().collect();
         self.leadlag.lock().unwrap().step(
             &mut venues,
             &crate::leadlag::Params::from(&self.settings()),
-            &busy_cross,
+            &ll_busy,
+            now_ms,
+        );
+        let pa_busy: std::collections::HashSet<String> = busy_cross
+            .union(&self.leadlag.lock().unwrap().held())
+            .cloned()
+            .collect();
+        self.perparb.lock().unwrap().step(
+            &mut venues,
+            &crate::perparb::Params::from(&self.settings()),
+            &pa_busy,
             now_ms,
         );
     }
@@ -793,7 +811,15 @@ impl Bot {
         } else {
             off.clone()
         };
-        json!({"perpPrice": off, "spotPrice": spot, "leadLag": ll})
+        let pa = if self.running() {
+            self.perparb
+                .lock()
+                .unwrap()
+                .stats(&crate::perparb::Params::from(&self.settings()), None)
+        } else {
+            off.clone()
+        };
+        json!({"perpPrice": pa, "spotPrice": spot, "leadLag": ll})
     }
 
     /// Состояние стратегий биржи для админки (/strategies).
