@@ -1,4 +1,4 @@
-//! REST Binance (спот `/api/v3`, перпы `/fapi/v1`): правила торговли пар и минутные свечи.
+//! REST Binance (спот `/api/v3`, перпы `/fapi/v1`): правила торговли пар и минутные свечи; ставки funding Binance и Bybit.
 
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -162,6 +162,49 @@ pub async fn minute_volumes(
                 .unwrap_or(0.0)
         })
         .collect())
+}
+
+/// Ставка funding перпа: Binance — /fapi/v1/premiumIndex, Bybit — /v5/market/tickers (linear).
+pub async fn funding(ex: &str, base: &str, symbol: &str) -> Result<crate::market::Funding, String> {
+    let base = base.trim_end_matches('/');
+    let url = if ex == "bybit" {
+        format!("{base}/v5/market/tickers?category=linear&symbol={symbol}")
+    } else {
+        format!("{base}/fapi/v1/premiumIndex?symbol={symbol}")
+    };
+    let v: serde_json::Value = client()
+        .get(&url)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    let n = |x: &serde_json::Value| {
+        x.as_str()
+            .and_then(|s| s.parse::<f64>().ok())
+            .or_else(|| x.as_f64())
+            .unwrap_or(0.0)
+    };
+    let (rate, next, mark) = if ex == "bybit" {
+        let t = &v["result"]["list"][0];
+        (&t["fundingRate"], &t["nextFundingTime"], &t["markPrice"])
+    } else {
+        (
+            &v["lastFundingRate"],
+            &v["nextFundingTime"],
+            &v["markPrice"],
+        )
+    };
+    if rate.is_null() {
+        return Err(format!("нет ставки funding: {v}"));
+    }
+    Ok(crate::market::Funding {
+        rate: n(rate),
+        next_ms: n(next) as u64,
+        mark: n(mark),
+    })
 }
 
 #[cfg(test)]

@@ -56,6 +56,8 @@ pub struct Client {
     http: reqwest::Client,
     offset_ms: AtomicI64,
     pub recv_window: u64,
+    /// USDⓈ-M перпы (/fapi) вместо спота (/api/v3).
+    pub perp: bool,
 }
 
 impl Client {
@@ -69,6 +71,23 @@ impl Client {
                 .expect("HTTP-клиент"),
             offset_ms: AtomicI64::new(0),
             recv_window: 5000,
+            perp: false,
+        }
+    }
+
+    /// Клиент USDⓈ-M перпов.
+    pub fn new_perp(base: &str, keys: Keys) -> Client {
+        Client {
+            perp: true,
+            ..Client::new(base, keys)
+        }
+    }
+
+    fn order_path(&self) -> &'static str {
+        if self.perp {
+            "/fapi/v1/order"
+        } else {
+            "/api/v3/order"
         }
     }
 
@@ -76,7 +95,15 @@ impl Client {
     pub async fn sync_time(&self) -> Result<(), String> {
         let v: Value = self
             .http
-            .get(format!("{}/api/v3/time", self.base))
+            .get(format!(
+                "{}{}",
+                self.base,
+                if self.perp {
+                    "/fapi/v1/time"
+                } else {
+                    "/api/v3/time"
+                }
+            ))
             .send()
             .await
             .map_err(|e| e.to_string())?
@@ -134,8 +161,22 @@ impl Client {
             "apiKey": self.keys.key, "timestamp": ts, "signature": sign(&self.keys.secret, &query)}}).to_string()
     }
 
-    /// Свободные балансы больше нуля.
+    /// Свободные балансы больше нуля (перпы — доступная маржа).
     pub async fn balances(&self) -> Result<std::collections::BTreeMap<String, f64>, String> {
+        if self.perp {
+            let v = self
+                .signed(reqwest::Method::GET, "/fapi/v2/balance", &[])
+                .await?;
+            return Ok(v
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|b| {
+                    let free: f64 = b["availableBalance"].as_str()?.parse().ok()?;
+                    (free > 0.0).then_some((b["asset"].as_str()?.to_owned(), free))
+                })
+                .collect());
+        }
         let v = self
             .signed(
                 reqwest::Method::GET,
@@ -191,7 +232,7 @@ impl Client {
         }
         OrderState::from(
             &self
-                .signed(reqwest::Method::POST, "/api/v3/order", &p)
+                .signed(reqwest::Method::POST, self.order_path(), &p)
                 .await?,
         )
     }
@@ -201,7 +242,7 @@ impl Client {
         let p = [("symbol", symbol.to_owned()), ("orderId", id.to_owned())];
         OrderState::from(
             &self
-                .signed(reqwest::Method::GET, "/api/v3/order", &p)
+                .signed(reqwest::Method::GET, self.order_path(), &p)
                 .await?,
         )
     }
@@ -210,13 +251,75 @@ impl Client {
     pub async fn cancel(&self, symbol: &str, id: &str) -> Result<OrderState, String> {
         let p = [("symbol", symbol.to_owned()), ("orderId", id.to_owned())];
         match self
-            .signed(reqwest::Method::DELETE, "/api/v3/order", &p)
+            .signed(reqwest::Method::DELETE, self.order_path(), &p)
             .await
         {
             Ok(v) => OrderState::from(&v),
             Err(_) => self.query(symbol, id).await,
         }
     }
+}
+
+impl Client {
+    /// Позиции перпов: символ, количество со знаком, цена входа.
+    pub async fn positions(&self) -> Result<Vec<(String, f64, f64)>, String> {
+        let v = self
+            .signed(reqwest::Method::GET, "/fapi/v2/positionRisk", &[])
+            .await?;
+        Ok(v.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| {
+                let n = |k: &str| p[k].as_str().and_then(|s| s.parse::<f64>().ok());
+                Some((
+                    p["symbol"].as_str()?.to_owned(),
+                    n("positionAmt")?,
+                    n("entryPrice").unwrap_or(0.0),
+                ))
+            })
+            .collect())
+    }
+
+    /// Плечо символа на бирже.
+    pub async fn set_leverage(&self, symbol: &str, leverage: f64) -> Result<(), String> {
+        let p = [
+            ("symbol", symbol.to_owned()),
+            ("leverage", format!("{}", leverage.round() as u64)),
+        ];
+        self.signed(reqwest::Method::POST, "/fapi/v1/leverage", &p)
+            .await
+            .map(|_| ())
+    }
+
+    /// Ключ потока событий счёта перпов (только X-MBX-APIKEY, без подписи); PUT — продлить.
+    pub async fn listen_key(&self, method: reqwest::Method) -> Result<String, String> {
+        let r = self
+            .http
+            .request(method, format!("{}/fapi/v1/listenKey", self.base))
+            .header("X-MBX-APIKEY", &self.keys.key)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let v: Value = r.json().await.map_err(|e| e.to_string())?;
+        v["listenKey"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| format!("нет listenKey: {v}"))
+    }
+}
+
+/// Адрес потока событий счёта перпов (к нему добавляется /listenKey); BINANCE_FSTREAM_URL — свой адрес.
+pub fn fstream_url(testnet: bool) -> String {
+    std::env::var("BINANCE_FSTREAM_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| {
+            if testnet {
+                "wss://stream.binancefuture.com/ws".into()
+            } else {
+                "wss://fstream.binance.com/ws".into()
+            }
+        })
 }
 
 /// Адрес WebSocket API Binance (события счёта); переменная BINANCE_WS_API_URL — свой адрес (проверки, прокси).
@@ -257,7 +360,8 @@ impl OrderState {
                 .to_string(),
             status: v["status"].as_str().unwrap_or("").to_owned(),
             executed: n("executedQty"),
-            quote: n("cummulativeQuoteQty"),
+            // спот — cummulativeQuoteQty, перпы — cumQuote
+            quote: n("cummulativeQuoteQty").max(n("cumQuote")),
         })
     }
 

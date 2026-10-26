@@ -51,6 +51,8 @@ pub struct Bot {
     matcher: Mutex<Option<JoinHandle<()>>>,
     /// «Сбор спреда» по биржам.
     spreads: Mutex<HashMap<String, SpreadCapture>>,
+    /// Последнее учтённое время funding по (биржа, символ).
+    funding_applied: Mutex<HashMap<(String, String), u64>>,
 }
 
 /// Комиссия биржи из каталога, % (makerFeePct / takerFeePct).
@@ -60,6 +62,17 @@ fn fee(ex: &str, key: &str) -> f64 {
         .and_then(|a| a.iter().find(|e| e["id"] == ex))
         .and_then(|e| e[key].as_f64())
         .unwrap_or(0.1)
+}
+
+/// Плечо перпов из параметров (число или строка), 1…125.
+fn leverage(p: &Map<String, Value>) -> f64 {
+    p.get("leverage")
+        .and_then(|v| {
+            v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+        .unwrap_or(2.0)
+        .clamp(1.0, 125.0)
 }
 
 impl Bot {
@@ -87,6 +100,7 @@ impl Bot {
             accounts: Arc::default(),
             matcher: Mutex::default(),
             spreads: Mutex::default(),
+            funding_applied: Mutex::default(),
         };
         bot.persist();
         bot
@@ -377,7 +391,7 @@ impl Bot {
     }
 
     /// Режим счёта биржи по параметрам и ключам, как в Java: paper — бумага; live или testnet с ключами — реальные
-    /// ордера (в Rust пока Binance и Bybit спот); иначе — бумага. Возвращает ключи и testnet для живого счёта.
+    /// ордера (в Rust — Binance и Bybit, спот и USDT-перпы); иначе — бумага. Возвращает ключи и testnet для живого счёта.
     fn live_mode(&self, ex: &str) -> Option<(crate::signed::Keys, bool)> {
         let p = self.params(ex);
         let flag = |k: &str| p.get(k).and_then(Value::as_bool).unwrap_or(false);
@@ -385,11 +399,9 @@ impl Bot {
         if flag("paper") || !(flag("live") || testnet) {
             return None;
         }
-        if !matches!(ex, "binance" | "bybit")
-            || p.get("market").and_then(Value::as_str) == Some("perp")
-        {
+        if !matches!(ex, "binance" | "bybit") {
             tracing::warn!(
-                "[{ex}] реальные ордера в Rust-бэкенде пока только для Binance и Bybit спот — бумажный режим"
+                "[{ex}] реальные ордера в Rust-бэкенде пока только для Binance и Bybit (спот и USDT-перпы) — бумажный режим"
             );
             return None;
         }
@@ -416,7 +428,15 @@ impl Bot {
             .get("paperStartBalance")
             .and_then(Value::as_f64)
             .unwrap_or(1000.0);
-        let fee = |k: &str| fee(ex, k);
+        let perp = p.get("market").and_then(Value::as_str) == Some("perp");
+        // у перпов свои комиссии (perpMakerFeePct / perpTakerFeePct в каталоге)
+        let fee = |k: &str| {
+            if perp {
+                fee(ex, &format!("perp{}{}", k[..1].to_uppercase(), &k[1..]))
+            } else {
+                fee(ex, k)
+            }
+        };
         if !self.accounts.lock().unwrap().contains_key(ex) {
             let account = match self.live_mode(ex) {
                 Some((keys, testnet)) => {
@@ -429,7 +449,7 @@ impl Bot {
                             if ex == "bybit" {
                                 crate::bybit_api::rest_url(testnet)
                             } else {
-                                crate::rest::default_url(false, testnet)
+                                crate::rest::default_url(perp, testnet)
                             }
                             .to_owned()
                         });
@@ -437,7 +457,13 @@ impl Bot {
                     let mode = if testnet { "TESTNET" } else { "LIVE" };
                     tracing::warn!("[{ex}] режим {mode}: ордера пойдут на биржу ({base})");
                     let client = Arc::new(if ex == "bybit" {
-                        crate::live::Venue::Bybit(crate::bybit_api::Client::new(&base, keys))
+                        let mut c = crate::bybit_api::Client::new(&base, keys);
+                        if perp {
+                            c.category = "linear";
+                        }
+                        crate::live::Venue::Bybit(c)
+                    } else if perp {
+                        crate::live::Venue::Binance(crate::signed::Client::new_perp(&base, keys))
                     } else {
                         crate::live::Venue::Binance(crate::signed::Client::new(&base, keys))
                     });
@@ -446,6 +472,8 @@ impl Bot {
                         ex.to_owned(),
                         client,
                         rx,
+                        symbols.to_vec(),
+                        perp.then(|| leverage(&p)),
                     ));
                     Account::Live(crate::live::Live::new(
                         symbols,
@@ -462,6 +490,10 @@ impl Bot {
                     fee("takerFeePct"),
                 )),
             };
+            let mut account = account;
+            if p.get("market").and_then(Value::as_str) == Some("perp") {
+                account.set_perp(leverage(&p));
+            }
             self.accounts.lock().unwrap().insert(ex.to_owned(), account);
         }
         if let Some(a) = self.accounts.lock().unwrap().get_mut(ex) {
@@ -508,6 +540,29 @@ impl Bot {
                     paper.match_resting(sym, b, &lim);
                 }
             }
+            // funding перпов: когда наступило время списания — один раз по последней известной ставке
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let mut applied = self.funding_applied.lock().unwrap();
+            for sym in &selected {
+                let Some(f) = self.market.funding(&ex, sym) else {
+                    continue;
+                };
+                let key = (ex.clone(), sym.clone());
+                let last = applied.get(&key).copied();
+                if f.next_ms == 0 || now_ms < f.next_ms || last == Some(f.next_ms) {
+                    continue;
+                }
+                applied.insert(key, f.next_ms);
+                let mark = books.get(sym).and_then(Book::mid).unwrap_or(f.mark);
+                let pay = paper.apply_funding(sym, f.rate, mark);
+                if pay != 0.0 {
+                    tracing::info!("[{ex}] funding {sym}: ставка {} — {pay:+.6}", f.rate);
+                }
+            }
+            drop(applied);
             let mut all = self.spreads.lock().unwrap();
             let sc = all
                 .entry(ex.clone())
@@ -569,12 +624,6 @@ impl Bot {
     ) -> ActionResult<Fill> {
         self.running_exchange(ex)?;
         let p = self.params(ex);
-        if p.get("market").and_then(Value::as_str) == Some("perp") {
-            return Err(
-                "бумажные перпы в Rust-бэкенде пока не поддерживаются — переключите рынок на spot"
-                    .into(),
-            );
-        }
         let sym = symbol.trim().to_uppercase();
         if !self
             .snapshot()

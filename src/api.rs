@@ -915,6 +915,193 @@ mod tests {
     /// Живой режим (testnet) против макета REST Binance: макет проверяет подпись каждого запроса, ведёт балансы и
     /// статусы ордеров. Рыночная покупка учитывается, лимитная продажа стоит, паника снимает её на «бирже».
     #[tokio::test(flavor = "multi_thread")]
+    async fn live_perp_flow_against_mock_binance_futures() {
+        use axum::extract::RawQuery;
+        use axum::http::HeaderMap;
+        use futures_util::SinkExt;
+        use std::sync::Mutex;
+        use tokio_tungstenite::tungstenite::Message;
+        const SECRET: &str = "test-secret";
+        #[derive(Default)]
+        struct Ex {
+            leverage: Vec<String>,
+            /// позиция BTCUSDT
+            pos: f64,
+            orders: Vec<(u64, String)>,
+            bad_sig: u32,
+        }
+        let ex = Arc::new(Mutex::new(Ex::default()));
+        fn param(q: &str, k: &str) -> Option<String> {
+            q.split('&').find_map(|kv| {
+                kv.split_once('=')
+                    .filter(|(a, _)| *a == k)
+                    .map(|(_, v)| v.to_owned())
+            })
+        }
+        fn check(q: &str, h: &HeaderMap) -> bool {
+            let (body, sig) = q.rsplit_once("&signature=").unwrap_or((q, ""));
+            h.get("x-mbx-apikey").is_some_and(|k| k == "test-key")
+                && crate::signed::sign(SECRET, body) == sig
+        }
+        let bad = || {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"code": -1022, "msg": "Signature"})),
+            )
+        };
+        let (e1, e2, e3, e4) = (ex.clone(), ex.clone(), ex.clone(), ex.clone());
+        let rest = Router::new()
+            .route("/fapi/v1/time", get(|| async { Json(json!({"serverTime": now_ms()})) }))
+            .route("/fapi/v1/exchangeInfo", get(|| async { Json(json!({"symbols": [{"symbol": "BTCUSDT", "filters": [
+                {"filterType": "PRICE_FILTER", "tickSize": "0.1"}, {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"}]}]})) }))
+            .route("/fapi/v1/klines", get(|| async { Json(json!([])) }))
+            .route("/fapi/v1/premiumIndex", get(|| async {
+                Json(json!({"symbol": "BTCUSDT", "markPrice": "100.5", "lastFundingRate": "0.00010000", "nextFundingTime": now_ms() + 3_600_000}))
+            }))
+            .route("/fapi/v1/listenKey", axum::routing::post(|h: HeaderMap| async move {
+                assert_eq!(h.get("x-mbx-apikey").unwrap(), "test-key");
+                Json(json!({"listenKey": "lk1"}))
+            }))
+            .route("/fapi/v1/leverage", axum::routing::post(move |RawQuery(q): RawQuery, h: HeaderMap| async move {
+                let q = q.unwrap_or_default();
+                let mut x = e1.lock().unwrap();
+                if !check(&q, &h) { x.bad_sig += 1; return bad(); }
+                x.leverage.push(format!("{}={}", param(&q, "symbol").unwrap(), param(&q, "leverage").unwrap()));
+                (StatusCode::OK, Json(json!({"leverage": 5})))
+            }))
+            .route("/fapi/v2/balance", get(move |RawQuery(q): RawQuery, h: HeaderMap| async move {
+                let q = q.unwrap_or_default();
+                let mut x = e2.lock().unwrap();
+                if !check(&q, &h) { x.bad_sig += 1; return bad(); }
+                (StatusCode::OK, Json(json!([{"asset": "USDT", "availableBalance": "1000", "balance": "1000"}])))
+            }))
+            .route("/fapi/v2/positionRisk", get(move |RawQuery(q): RawQuery, h: HeaderMap| async move {
+                let q = q.unwrap_or_default();
+                let mut x = e3.lock().unwrap();
+                if !check(&q, &h) { x.bad_sig += 1; return bad(); }
+                (StatusCode::OK, Json(json!([{"symbol": "BTCUSDT", "positionAmt": format!("{}", x.pos), "entryPrice": "100"}])))
+            }))
+            .route("/fapi/v1/order", axum::routing::post(move |RawQuery(q): RawQuery, h: HeaderMap| async move {
+                let q = q.unwrap_or_default();
+                let mut x = e4.lock().unwrap();
+                if !check(&q, &h) { x.bad_sig += 1; return bad(); }
+                let qty: f64 = param(&q, "quantity").unwrap().parse().unwrap();
+                let id = 500 + x.orders.len() as u64;
+                x.orders.push((id, param(&q, "newClientOrderId").unwrap()));
+                x.pos += if param(&q, "side").as_deref() == Some("SELL") { -qty } else { qty };
+                // как у фьючерсов: сумма — cumQuote
+                (StatusCode::OK, Json(json!({"orderId": id, "status": "FILLED", "executedQty": format!("{qty}"), "cumQuote": format!("{}", qty * 100.0)})))
+            }));
+        let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let raddr = rl.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(rl, rest).await.unwrap() });
+        let wl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let waddr = wl.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = wl.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            for i in 1..500u64 {
+                let m = format!(
+                    r#"{{"stream":"btcusdt@depth20@100ms","data":{{"lastUpdateId":{i},"bids":[["100","10"]],"asks":[["100.1","10"]]}}}}"#
+                );
+                if ws.send(Message::text(m)).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        // поток событий перпов по listenKey: путь /lk1, событие ACCOUNT_UPDATE по запросу теста
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let path = Arc::new(Mutex::new(String::new()));
+        let path2 = path.clone();
+        let fl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let faddr = fl.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = fl.accept().await.unwrap();
+            #[allow(clippy::result_large_err)]
+            let cb = |req: &tokio_tungstenite::tungstenite::handshake::server::Request, resp| {
+                *path2.lock().unwrap() = req.uri().path().to_owned();
+                Ok(resp)
+            };
+            let mut ws = tokio_tungstenite::accept_hdr_async(tcp, cb).await.unwrap();
+            while let Some(e) = ev_rx.recv().await {
+                if ws.send(Message::text(e)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        // SAFETY: ключи — те же, что в тесте спота Binance; адрес потока перпов задаёт только этот тест
+        unsafe {
+            std::env::set_var("BINANCE_FSTREAM_URL", format!("ws://{faddr}"));
+            std::env::set_var("BINANCE_TESTNET_API_KEY", "test-key");
+            std::env::set_var("BINANCE_TESTNET_API_SECRET", SECRET);
+        }
+        let (_d, r) = app("");
+        let sel = format!(
+            "/control/select?exchange=binance&symbols=BTCUSDT&market=perp&leverage=5&testnet=true&wsUrl=ws://{waddr}/stream&restUrl=http://{raddr}&spreadCaptureEnabled=false&maxPositionQuote=1000"
+        );
+        assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
+        call(&r, "POST", "/control/start", "").await;
+        call(&r, "POST", "/trading/start", "").await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (_, s) = call(&r, "GET", "/status", "").await;
+            let (_, m) = call(&r, "GET", "/market?exchange=binance", "").await;
+            let (_, b) = call(&r, "GET", "/balances?exchange=binance", "").await;
+            if b["свободно"]["USDT"] == json!(1000.0)
+                && s["binance"]["поток_событий_счёта"] == json!(true)
+                && m["BTCUSDT"]["funding_проц"] == json!(0.01)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "баланс, поток или funding: {s} {m} {b}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(*path.lock().unwrap(), "/lk1");
+        assert_eq!(ex.lock().unwrap().leverage, vec!["BTCUSDT=5".to_string()]);
+        // шорт без монет — на перпах можно
+        let (c, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=binance&symbol=BTCUSDT&side=SELL&type=MARKET&qty=2",
+            "",
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (_, a) = call(&r, "GET", "/status", "").await;
+            let ps = &a["binance"]["тестовый_счёт"]["positions"];
+            if ps[0]["qty"] == json!(-2.0) {
+                assert_eq!(a["binance"]["тестовый_счёт"]["market"], json!("perp"));
+                assert_eq!(ps[0]["margin"], json!(40.0), "100 × 2 / 5");
+                break;
+            }
+            assert!(tokio::time::Instant::now() < until, "шорт не учтён: {a}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // позиция закрыта на бирже (например, вручную) — событие ACCOUNT_UPDATE убирает её из учёта
+        ev_tx.send(json!({"e": "ACCOUNT_UPDATE", "a": {"B": [], "P": [{"s": "BTCUSDT", "pa": "0", "ep": "0"}]}}).to_string()).unwrap();
+        let until = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let (_, a) = call(&r, "GET", "/status", "").await;
+            if a["binance"]["тестовый_счёт"]["positions"] == json!([]) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "событие не учтено: {a}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(ex.lock().unwrap().bad_sig, 0, "все подписи верны");
+        call(&r, "POST", "/control/stop", "").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn live_testnet_flow_against_mock_bybit() {
         use axum::http::HeaderMap;
         use futures_util::{SinkExt, StreamExt};

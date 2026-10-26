@@ -124,14 +124,13 @@ impl Live {
             .ledger
             .prepare(symbol, side, amount, limit, book, lim)?;
         let (_, taker) = self.ledger.fees();
-        let (asset, need) = match side {
-            Side::Buy => (&pr.quote, pr.qty * pr.ref_px * (1.0 + taker)),
-            Side::Sell => (&pr.base, pr.qty),
-        };
-        if self.ledger.free(asset) + 1e-12 < need {
+        let (asset, need) = self
+            .ledger
+            .need(symbol, &pr.base, &pr.quote, side, pr.qty, pr.ref_px, taker);
+        if self.ledger.free(&asset) + 1e-12 < need {
             let e = format!(
                 "недостаточно {asset}: нужно {need:.8}, свободно {:.8}",
-                self.ledger.free(asset)
+                self.ledger.free(&asset)
             );
             self.ledger.note_rejected(&e);
             return Err(e);
@@ -151,7 +150,12 @@ impl Live {
         let base = crate::paper::split(symbol)
             .map(|x| x.0)
             .ok_or("не разобрать символ")?;
-        let qty = qty.min(self.ledger.free(&base));
+        let have = if self.ledger.leverage().is_some() {
+            self.ledger.position(symbol).qty.max(0.0)
+        } else {
+            self.ledger.free(&base)
+        };
+        let qty = qty.min(have);
         let qty = self
             .ledger
             .filter(&symbol.to_uppercase())
@@ -271,6 +275,44 @@ impl Live {
                     },
                 );
             }
+            // перпы: ORDER_TRADE_UPDATE — ордер (z — исполнено, ap — средняя цена), ACCOUNT_UPDATE — позиции
+            Some("ORDER_TRADE_UPDATE") => {
+                let o = &e["o"];
+                let Some(local) = o["c"]
+                    .as_str()
+                    .and_then(|c| c.strip_prefix("hft"))
+                    .and_then(|x| x.parse::<u64>().ok())
+                else {
+                    return;
+                };
+                let n = |k: &str| {
+                    o[k].as_str()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .unwrap_or(0.0)
+                };
+                let Some(id) = o["i"].as_u64() else { return };
+                self.on_state(
+                    local,
+                    &OrderState {
+                        id: id.to_string(),
+                        status: o["X"].as_str().unwrap_or("").to_owned(),
+                        executed: n("z"),
+                        quote: n("z") * n("ap"),
+                    },
+                );
+            }
+            Some("ACCOUNT_UPDATE") => {
+                for p in e["a"]["P"].as_array().into_iter().flatten() {
+                    let n = |k: &str| {
+                        p[k].as_str()
+                            .and_then(|s| s.parse::<f64>().ok())
+                            .unwrap_or(0.0)
+                    };
+                    if let Some(s) = p["s"].as_str() {
+                        self.ledger.set_position(s, n("pa"), n("ep"));
+                    }
+                }
+            }
             Some("outboundAccountPosition") => {
                 for b in e["B"].as_array().into_iter().flatten() {
                     let f = b["f"]
@@ -300,6 +342,11 @@ impl Live {
                         self.on_state(local, &st);
                     }
                 }
+                "position" => {
+                    if let Some((s, q, e)) = crate::bybit_api::position(d) {
+                        self.ledger.set_position(&s, q, e);
+                    }
+                }
                 "wallet" => {
                     for c in d["coin"].as_array().into_iter().flatten() {
                         if let Some(a) = c["coin"].as_str() {
@@ -309,6 +356,19 @@ impl Live {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Позиции с биржи: заменяют учётные (у кого на бирже позиции нет — закрыта).
+    pub fn sync_positions(&mut self, ps: &[(String, f64, f64)]) {
+        let known: Vec<String> = self.ledger.positions.keys().cloned().collect();
+        for k in known {
+            if !ps.iter().any(|p| p.0 == k) {
+                self.ledger.set_position(&k, 0.0, 0.0);
+            }
+        }
+        for (s, q, e) in ps {
+            self.ledger.set_position(s, *q, *e);
         }
     }
 
@@ -407,6 +467,24 @@ impl Venue {
             Venue::Bybit(c) => c.cancel(symbol, id).await,
         }
     }
+    fn perp(&self) -> bool {
+        match self {
+            Venue::Binance(c) => c.perp,
+            Venue::Bybit(c) => c.category == "linear",
+        }
+    }
+    async fn positions(&self) -> Result<Vec<(String, f64, f64)>, String> {
+        match self {
+            Venue::Binance(c) => c.positions().await,
+            Venue::Bybit(c) => c.positions().await,
+        }
+    }
+    async fn set_leverage(&self, symbol: &str, lev: f64) -> Result<(), String> {
+        match self {
+            Venue::Binance(c) => c.set_leverage(symbol, lev).await,
+            Venue::Bybit(c) => c.set_leverage(symbol, lev).await,
+        }
+    }
     async fn balances(&self) -> Result<std::collections::BTreeMap<String, f64>, String> {
         match self {
             Venue::Binance(c) => c.balances().await,
@@ -421,9 +499,20 @@ pub async fn worker(
     ex: String,
     client: Arc<Venue>,
     mut rx: mpsc::UnboundedReceiver<Cmd>,
+    symbols: Vec<String>,
+    leverage: Option<f64>,
 ) {
     if let Err(e) = client.sync_time().await {
         tracing::warn!("[{ex}] время сервера не получено: {e}");
+    }
+    // перпы: плечо на бирже — как в параметрах
+    if let Some(lev) = leverage {
+        for s in &symbols {
+            if let Err(e) = client.set_leverage(s, lev).await {
+                tracing::warn!("[{ex}] плечо {lev} для {s} не выставлено: {e}");
+                with_live(&acc, &ex, |l| l.error = format!("плечо {s}: {e}"));
+            }
+        }
     }
     let testnet = with_live(&acc, &ex, |l| l.mode == "TESTNET").unwrap_or(false);
     let _stream = AbortOnDrop(tokio::spawn(user_stream(
@@ -467,6 +556,12 @@ pub async fn worker(
                         Err(e) => { with_live(&acc, &ex, |l| l.error = e); }
                     }
                 }
+                if n % 10 == 1 && client.perp() {
+                    match client.positions().await {
+                        Ok(ps) => { with_live(&acc, &ex, |l| l.sync_positions(&ps)); }
+                        Err(e) => { tracing::warn!("[{ex}] позиции не получены: {e}"); with_live(&acc, &ex, |l| l.error = e); }
+                    }
+                }
                 if n % 10 == 1 {
                     match client.balances().await {
                         Ok(b) => { with_live(&acc, &ex, |l| { l.ledger.set_balances(b); l.error.clear(); }); }
@@ -494,32 +589,67 @@ async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) 
     use tokio_tungstenite::tungstenite::Message;
     let mut backoff = crate::feed::Backoff::default();
     let mut seq = 0u64;
-    let url = match venue.as_ref() {
-        Venue::Binance(_) => crate::signed::ws_api_url(testnet),
-        Venue::Bybit(_) => crate::bybit_api::private_url(testnet),
-    };
-    let mut ping = tokio::time::interval(Duration::from_secs(20));
+    let fstream = matches!(venue.as_ref(), Venue::Binance(c) if c.perp);
     loop {
+        // перпы Binance: поток по listenKey (без подписки), ключ продлевается каждые 30 мин
+        let url = match venue.as_ref() {
+            Venue::Binance(c) if c.perp => match c.listen_key(reqwest::Method::POST).await {
+                Ok(k) => format!("{}/{k}", crate::signed::fstream_url(testnet)),
+                Err(e) => {
+                    with_live(&acc, &ex, |l| l.error = format!("listenKey: {e}"));
+                    tokio::time::sleep(backoff.next()).await;
+                    continue;
+                }
+            },
+            Venue::Binance(_) => crate::signed::ws_api_url(testnet),
+            Venue::Bybit(_) => crate::bybit_api::private_url(testnet),
+        };
+        let mut pings = 0u32;
         let err = match tokio_tungstenite::connect_async(url.as_str()).await {
             Ok((mut ws, _)) => {
+                // первый пинг — через 20 с после подключения, не раньше входа и подписки
+                let mut ping = tokio::time::interval_at(
+                    tokio::time::Instant::now() + Duration::from_secs(20),
+                    Duration::from_secs(20),
+                );
                 seq += 1;
                 let sub = format!("sub{seq}");
                 let req = match venue.as_ref() {
-                    Venue::Binance(c) => c.ws_request(&sub, "userDataStream.subscribe.signature"),
-                    Venue::Bybit(c) => c.auth_message(),
+                    Venue::Binance(c) if c.perp => None,
+                    Venue::Binance(c) => {
+                        Some(c.ws_request(&sub, "userDataStream.subscribe.signature"))
+                    }
+                    Venue::Bybit(c) => Some(c.auth_message()),
                 };
-                let mut err = ws
-                    .send(Message::text(req))
-                    .await
-                    .err()
-                    .map(|e| e.to_string())
-                    .unwrap_or_default();
+                let mut err = match req {
+                    Some(r) => ws
+                        .send(Message::text(r))
+                        .await
+                        .err()
+                        .map(|e| e.to_string())
+                        .unwrap_or_default(),
+                    None => {
+                        tracing::info!("[{ex}] поток событий счёта перпов подключён");
+                        backoff.reset();
+                        with_live(&acc, &ex, |l| l.stream_ok = true);
+                        String::new()
+                    }
+                };
                 while err.is_empty() {
                     let msg = tokio::select! {
                         m = ws.next() => m,
                         _ = ping.tick() => {
-                            if matches!(venue.as_ref(), Venue::Bybit(_)) {
-                                err = ws.send(Message::text(r#"{"op":"ping"}"#)).await.err().map(|e| e.to_string()).unwrap_or_default();
+                            pings += 1;
+                            match venue.as_ref() {
+                                Venue::Bybit(_) => {
+                                    err = ws.send(Message::text(r#"{"op":"ping"}"#)).await.err().map(|e| e.to_string()).unwrap_or_default();
+                                }
+                                Venue::Binance(c) if c.perp && pings.is_multiple_of(90) => {
+                                    if let Err(e) = c.listen_key(reqwest::Method::PUT).await {
+                                        tracing::warn!("[{ex}] listenKey не продлён: {e}");
+                                    }
+                                }
+                                _ => {}
                             }
                             continue;
                         }
@@ -562,6 +692,12 @@ async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) 
                                             with_live(&acc, &ex, |l| l.on_bybit(topic, &v["data"]));
                                         }
                                     }
+                                }
+                            } else if fstream {
+                                if v["e"] == "listenKeyExpired" {
+                                    err = "listenKey истёк".into();
+                                } else {
+                                    with_live(&acc, &ex, |l| l.on_event(&v));
                                 }
                             } else if let Some(e) = v.get("event") {
                                 with_live(&acc, &ex, |l| l.on_event(e));

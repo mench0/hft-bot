@@ -103,7 +103,20 @@ struct Resting {
     side: Side,
     price: f64,
     qty: f64,
+    /// Занято под заявку (спот — валюта или монета по стороне, перп — маржа в котируемой валюте).
+    lock: f64,
 }
+
+/// Позиция перпа: количество со знаком (лонг > 0, шорт < 0), цена входа, маржа (изолированная).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Pos {
+    pub qty: f64,
+    pub entry: f64,
+    pub margin: f64,
+}
+
+/// Поддерживающая маржа перпа: позиция ликвидируется, когда маржа + нереализованный результат ниже этой доли объёма.
+const MAINT: f64 = 0.005;
 
 /// Купленная монета: количество и средняя цена с комиссией.
 #[derive(Clone, Copy, Debug, Default)]
@@ -141,6 +154,13 @@ pub struct Paper {
     exec_seq: u64,
     /// Правила торговли пар (шаг цены и объёма, минимумы); нет — ордер не округляется.
     filters: HashMap<String, Filter>,
+    /// Перпы: плечо (None — спот).
+    leverage: Option<f64>,
+    /// Позиции перпов по символам.
+    pub positions: HashMap<String, Pos>,
+    /// Funding: уплачено (минус — получено).
+    pub funding_paid: f64,
+    pub liquidations: u64,
 }
 
 /// Исполнение заявки.
@@ -199,6 +219,10 @@ impl Paper {
             execs: VecDeque::new(),
             exec_seq: 0,
             filters: HashMap::new(),
+            leverage: None,
+            positions: HashMap::new(),
+            funding_paid: 0.0,
+            liquidations: 0,
         };
         for s in symbols {
             if let Some((_, q)) = split(s) {
@@ -216,6 +240,192 @@ impl Paper {
         {
             self.free.insert(q, start_balance);
         }
+    }
+
+    /// Счёт перпов с плечом (лонг и шорт, маржа в котируемой валюте, funding).
+    pub fn set_perp(&mut self, leverage: f64) {
+        self.leverage = Some(leverage.max(1.0));
+    }
+
+    /// Плечо перпов; None — спот.
+    pub fn leverage(&self) -> Option<f64> {
+        self.leverage
+    }
+
+    /// Позиция символа (перпы).
+    pub fn position(&self, symbol: &str) -> Pos {
+        self.positions
+            .get(&symbol.to_uppercase())
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Позиция с биржи (живой счёт): заменяет учётную, маржа — по плечу.
+    pub fn set_position(&mut self, symbol: &str, qty: f64, entry: f64) {
+        let lev = self.leverage.unwrap_or(1.0);
+        let k = symbol.to_uppercase();
+        if qty.abs() < 1e-12 {
+            self.positions.remove(&k);
+        } else {
+            self.positions.insert(
+                k,
+                Pos {
+                    qty,
+                    entry,
+                    margin: qty.abs() * entry / lev,
+                },
+            );
+        }
+    }
+
+    /// Какая часть ордера открывает позицию (остальное закрывает встречную).
+    fn opening(&self, symbol: &str, side: Side, qty: f64) -> f64 {
+        let q = self.position(symbol).qty;
+        let against = (side == Side::Buy && q < 0.0) || (side == Side::Sell && q > 0.0);
+        if against {
+            (qty - q.abs()).max(0.0)
+        } else {
+            qty
+        }
+    }
+
+    /// Что нужно иметь свободным под ордер: спот — валюта (покупка) или монета (продажа); перп — маржа открываемой
+    /// части и комиссия в котируемой валюте.
+    #[allow(clippy::too_many_arguments)]
+    pub fn need(
+        &self,
+        symbol: &str,
+        base: &str,
+        quote: &str,
+        side: Side,
+        qty: f64,
+        px: f64,
+        fee: f64,
+    ) -> (String, f64) {
+        match self.leverage {
+            Some(lev) => (
+                quote.to_owned(),
+                self.opening(symbol, side, qty) * px / lev + qty * px * fee,
+            ),
+            None => match side {
+                Side::Buy => (quote.to_owned(), qty * px * (1.0 + fee)),
+                Side::Sell => (base.to_owned(), qty),
+            },
+        }
+    }
+
+    /// Исполнение перпа: сначала закрывается встречная позиция (результат и маржа — на счёт), остаток открывает или
+    /// наращивает позицию (маржа со счёта). check — проверять свободную маржу (живой счёт не проверяет: биржа главная).
+    #[allow(clippy::too_many_arguments)]
+    fn perp_settle(
+        &mut self,
+        symbol: &str,
+        quote: &str,
+        side: Side,
+        qty: f64,
+        px: f64,
+        fee: f64,
+        maker: bool,
+        check: bool,
+    ) -> Result<(), String> {
+        let lev = self.leverage.unwrap_or(1.0);
+        let key = symbol.to_uppercase();
+        if check {
+            let need = self.opening(&key, side, qty) * px / lev + fee;
+            if self.free(quote) + 1e-9 < need {
+                return Err(format!(
+                    "недостаточно маржи {quote}: нужно {need:.8}, свободно {:.8}",
+                    self.free(quote)
+                ));
+            }
+        }
+        let dir = if side == Side::Buy { 1.0 } else { -1.0 };
+        let mut p = self.positions.get(&key).copied().unwrap_or_default();
+        let (mut rest, mut gain, mut closed) = (qty, 0.0, false);
+        if p.qty * dir < 0.0 {
+            let c = qty.min(p.qty.abs());
+            let release = p.margin * c / p.qty.abs();
+            gain = c * (px - p.entry) * p.qty.signum();
+            self.add(quote, release + gain);
+            p.margin -= release;
+            p.qty -= c * p.qty.signum();
+            rest -= c;
+            closed = true;
+            if p.qty.abs() < 1e-12 {
+                p = Pos::default();
+            }
+        }
+        if rest > 1e-12 {
+            let m = rest * px / lev;
+            self.add(quote, -m);
+            p.entry = (p.qty.abs() * p.entry + rest * px) / (p.qty.abs() + rest);
+            p.qty += rest * dir;
+            p.margin += m;
+        }
+        self.add(quote, -fee);
+        if p.qty.abs() < 1e-12 {
+            self.positions.remove(&key);
+        } else {
+            self.positions.insert(key, p);
+        }
+        let pnl = gain - fee;
+        self.realized += pnl;
+        self.daily_pnl += pnl;
+        if closed {
+            self.closed += 1;
+            if pnl > 0.0 {
+                self.wins += 1;
+            }
+        }
+        if maker {
+            self.maker_fees += fee
+        } else {
+            self.taker_fees += fee
+        }
+        Ok(())
+    }
+
+    /// Funding по позиции символа: лонг платит при ставке > 0, шорт получает (и наоборот).
+    pub fn apply_funding(&mut self, symbol: &str, rate: f64, mark: f64) -> f64 {
+        let Some(p) = self.positions.get(&symbol.to_uppercase()).copied() else {
+            return 0.0;
+        };
+        let Some((_, quote)) = split(symbol) else {
+            return 0.0;
+        };
+        let pay = p.qty * mark * rate;
+        self.add(&quote, -pay);
+        self.funding_paid += pay;
+        self.realized -= pay;
+        self.daily_pnl -= pay;
+        pay
+    }
+
+    /// Ликвидация (бумага): маржа + нереализованный результат ниже поддерживающей — позиция закрывается,
+    /// маржа теряется (изолированная маржа, убыток не больше её).
+    fn check_liquidation(&mut self, symbol: &str, mark: f64) {
+        let key = symbol.to_uppercase();
+        let Some(p) = self.positions.get(&key).copied() else {
+            return;
+        };
+        let upnl = p.qty * (mark - p.entry);
+        if p.margin + upnl > MAINT * p.qty.abs() * mark {
+            return;
+        }
+        self.positions.remove(&key);
+        self.realized -= p.margin;
+        self.daily_pnl -= p.margin;
+        self.closed += 1;
+        self.liquidations += 1;
+        let id = self.next_id;
+        self.next_id += 1;
+        let side = if p.qty > 0.0 { Side::Sell } else { Side::Buy };
+        self.exec(id, &key, side, p.qty.abs(), mark, 0.0);
+        tracing::warn!(
+            "ликвидация {key}: позиция {} по {mark}, потеряна маржа {:.4}",
+            p.qty,
+            p.margin
+        );
     }
 
     /// Задать правила торговли пар.
@@ -341,12 +551,20 @@ impl Paper {
                 } else {
                     1.0
                 };
-                match side {
-                    Side::Buy => {
+                let q = self.position(symbol).qty;
+                match (self.leverage, side) {
+                    // перп: встречная позиция — закрыть её (долю), иначе — на свободную маржу с плечом
+                    (Some(_), Side::Buy) if q < 0.0 => -q * share,
+                    (Some(_), Side::Sell) if q > 0.0 => q * share,
+                    (Some(lev), _) => {
+                        (self.free(&quote) * lev).min(lim.max_order_quote) * share
+                            / (ref_px * (1.0 + self.taker * lev))
+                    }
+                    (None, Side::Buy) => {
                         self.free(&quote).min(lim.max_order_quote) * share
                             / (ref_px * (1.0 + self.taker))
                     }
-                    Side::Sell => self.free(&base) * share,
+                    (None, Side::Sell) => self.free(&base) * share,
                 }
             }
         };
@@ -451,7 +669,7 @@ impl Paper {
         if !crosses {
             return self.rest(symbol, &base, &quote, side, qty, ref_px);
         }
-        if let Err(e) = self.settle(&base, &quote, side, filled, avg, self.taker) {
+        if let Err(e) = self.fill(symbol, &base, &quote, side, filled, avg, false, true) {
             return self.reject(e);
         }
         self.note_accepted();
@@ -461,13 +679,14 @@ impl Paper {
         self.exec(id, symbol, side, filled, avg, filled * avg * self.taker);
         let rest = qty - filled;
         if rest > 1e-12 && limit.is_some() {
-            self.lock_for(&base, &quote, side, rest, ref_px)?;
+            let lock = self.lock_for(symbol, &base, &quote, side, rest, ref_px)?;
             self.orders.push(Resting {
                 id,
                 symbol: symbol.to_uppercase(),
                 side,
                 price: ref_px,
                 qty: rest,
+                lock,
             });
             return Ok(Fill {
                 order_id: id,
@@ -501,6 +720,12 @@ impl Paper {
         let Some((base, quote)) = split(symbol) else {
             return;
         };
+        if self.leverage.is_some() {
+            let _ = self.perp_settle(symbol, &quote, side, qty, px, fee, maker, false);
+            self.exec(order_id, symbol, side, qty, px, fee);
+            self.check_loss(lim);
+            return;
+        }
         let notional = qty * px;
         match side {
             Side::Buy => {
@@ -550,27 +775,47 @@ impl Paper {
         (self.maker, self.taker)
     }
 
+    /// Занять под заявку; сколько занято.
     fn lock_for(
         &mut self,
+        symbol: &str,
         base: &str,
         quote: &str,
         side: Side,
         qty: f64,
         px: f64,
-    ) -> Result<(), String> {
-        let (asset, need) = match side {
-            Side::Buy => (quote, qty * px * (1.0 + self.maker)),
-            Side::Sell => (base, qty),
-        };
-        if self.free(asset) + 1e-12 < need {
+    ) -> Result<f64, String> {
+        let (asset, need) = self.need(symbol, base, quote, side, qty, px, self.maker);
+        if self.free(&asset) + 1e-12 < need {
             return Err(format!(
                 "недостаточно {asset}: нужно {need:.8}, свободно {:.8}",
-                self.free(asset)
+                self.free(&asset)
             ));
         }
-        self.add(asset, -need);
-        *self.locked.entry(asset.to_owned()).or_default() += need;
-        Ok(())
+        self.add(&asset, -need);
+        *self.locked.entry(asset).or_default() += need;
+        Ok(need)
+    }
+
+    /// Исполнение: спот — балансы и средняя цена, перп — позиция и маржа.
+    #[allow(clippy::too_many_arguments)]
+    fn fill(
+        &mut self,
+        symbol: &str,
+        base: &str,
+        quote: &str,
+        side: Side,
+        qty: f64,
+        px: f64,
+        maker: bool,
+        check: bool,
+    ) -> Result<(), String> {
+        let rate = if maker { self.maker } else { self.taker };
+        if self.leverage.is_some() {
+            self.perp_settle(symbol, quote, side, qty, px, qty * px * rate, maker, check)
+        } else {
+            self.settle(base, quote, side, qty, px, rate)
+        }
     }
 
     fn rest(
@@ -582,9 +827,10 @@ impl Paper {
         qty: f64,
         px: f64,
     ) -> Result<Fill, String> {
-        if let Err(e) = self.lock_for(base, quote, side, qty, px) {
-            return self.reject(e);
-        }
+        let lock = match self.lock_for(symbol, base, quote, side, qty, px) {
+            Ok(l) => l,
+            Err(e) => return self.reject(e),
+        };
         self.recent.push_back(Instant::now());
         self.accepted += 1;
         let id = self.next_id;
@@ -595,6 +841,7 @@ impl Paper {
             side,
             price: px,
             qty,
+            lock,
         });
         Ok(Fill {
             order_id: id,
@@ -696,7 +943,7 @@ impl Paper {
             }
             let o = self.orders.remove(i);
             self.unlock(&base, &quote, &o);
-            match self.settle(&base, &quote, o.side, o.qty, o.price, self.maker) {
+            match self.fill(&o.symbol, &base, &quote, o.side, o.qty, o.price, true, true) {
                 Ok(()) => self.exec(
                     o.id,
                     &o.symbol,
@@ -708,16 +955,20 @@ impl Paper {
                 Err(e) => tracing::warn!("бумажная заявка {} не исполнена: {e}", o.id),
             }
         }
+        if self.leverage.is_some() {
+            self.check_liquidation(symbol, (bid + ask) / 2.0);
+        }
         self.check_loss(lim);
     }
 
     fn unlock(&mut self, base: &str, quote: &str, o: &Resting) {
-        let (asset, amt) = match o.side {
-            Side::Buy => (quote, o.qty * o.price * (1.0 + self.maker)),
-            Side::Sell => (base, o.qty),
+        let asset = if self.leverage.is_none() && o.side == Side::Sell {
+            base
+        } else {
+            quote
         };
-        *self.locked.entry(asset.to_owned()).or_default() -= amt;
-        self.add(asset, amt);
+        *self.locked.entry(asset.to_owned()).or_default() -= o.lock;
+        self.add(asset, o.lock);
     }
 
     fn exec(&mut self, order_id: u64, symbol: &str, side: Side, qty: f64, price: f64, fee: f64) {
@@ -750,7 +1001,12 @@ impl Paper {
     ) -> Result<Fill, String> {
         let b = book.filter(|b| b.is_ready()).ok_or("стакан не готов")?;
         let (base, quote) = split(symbol).ok_or_else(|| format!("не разобрать символ {symbol}"))?;
-        let qty = qty.min(self.free(&base));
+        let have = if self.leverage.is_some() {
+            self.position(symbol).qty.max(0.0)
+        } else {
+            self.free(&base)
+        };
+        let qty = qty.min(have);
         let qty = self
             .filters
             .get(&symbol.to_uppercase())
@@ -759,7 +1015,7 @@ impl Paper {
             return Err(format!("нет {base} для продажи"));
         }
         let (filled, avg) = walk(b, Side::Sell, qty, None);
-        self.settle(&base, &quote, Side::Sell, filled, avg, self.taker)?;
+        self.fill(symbol, &base, &quote, Side::Sell, filled, avg, false, false)?;
         let id = self.next_id;
         self.next_id += 1;
         self.exec(
@@ -824,7 +1080,15 @@ impl Paper {
                 self.free(&q) + self.locked.get(&q).copied().unwrap_or(0.0),
             );
         }
+        for (sym, p) in &self.positions {
+            let (_, q) = split(sym)?;
+            let mark = mids.get(sym).copied()?;
+            *out.entry(q).or_default() += p.margin + p.qty * (mark - p.entry);
+        }
         for (sym, mid) in mids {
+            if self.leverage.is_some() {
+                break;
+            }
             let (b, q) = split(sym)?;
             if out.contains_key(&b) {
                 continue;
@@ -856,7 +1120,15 @@ impl Paper {
             "fees": self.maker_fees + self.taker_fees, "takerFees": self.taker_fees, "makerFees": self.maker_fees,
             "closedTrades": self.closed, "winningTrades": self.wins,
             "winRatePercent": if self.closed > 0 { self.wins as f64 * 100.0 / self.closed as f64 } else { 0.0 },
-            "openOrders": self.open_orders(), "openPositions": self.lots.values().filter(|l| l.qty > 1e-12).count(),
+            "openOrders": self.open_orders(),
+            "openPositions": if self.leverage.is_some() { self.positions.len() } else { self.lots.values().filter(|l| l.qty > 1e-12).count() },
+            "market": if self.leverage.is_some() { "perp" } else { "spot" }, "leverage": self.leverage,
+            "fundingPaid": self.funding_paid, "liquidations": self.liquidations,
+            "positions": self.positions.iter().map(|(s, p)| {
+                let mark = mids.get(s).copied();
+                json!({"symbol": s, "qty": p.qty, "entry": p.entry, "margin": p.margin, "mark": mark,
+                    "unrealizedPnl": mark.map(|m| p.qty * (m - p.entry))})
+            }).collect::<Vec<_>>(),
         })
     }
 }
@@ -1120,5 +1392,141 @@ mod tests {
             .unwrap_err()
             .contains("сумма ордера")
         );
+    }
+
+    fn book_at(bid: f64, ask: f64) -> Book {
+        let mut b = Book::default();
+        b.apply_snapshot(vec![(bid, 100.0)], vec![(ask, 100.0)], 1);
+        b
+    }
+
+    #[test]
+    fn perp_long_short_flip_and_margin() {
+        let mut p = Paper::new(&["BTCUSDT".into()], 1000.0, 0.0, 0.0);
+        p.set_perp(10.0);
+        let l = Limits {
+            max_order_quote: 100_000.0,
+            ..lim()
+        };
+        // шорт 5 по 100 без монет: маржа 50
+        p.order(
+            "BTCUSDT",
+            Side::Sell,
+            Amount::Qty(5.0),
+            None,
+            Some(&book_at(100.0, 101.0)),
+            &l,
+        )
+        .unwrap();
+        assert_eq!(
+            p.position("BTCUSDT"),
+            Pos {
+                qty: -5.0,
+                entry: 100.0,
+                margin: 50.0
+            }
+        );
+        assert!((p.free("USDT") - 950.0).abs() < 1e-9);
+        // цена упала: откуп 8 по 91 — закрыть 5 (+45) и открыть лонг 3 (маржа 27.3)
+        p.order(
+            "BTCUSDT",
+            Side::Buy,
+            Amount::Qty(8.0),
+            None,
+            Some(&book_at(90.0, 91.0)),
+            &l,
+        )
+        .unwrap();
+        let pos = p.position("BTCUSDT");
+        assert!(
+            (pos.qty - 3.0).abs() < 1e-9 && (pos.entry - 91.0).abs() < 1e-9,
+            "{pos:?}"
+        );
+        assert!((p.realized - 45.0).abs() < 1e-9);
+        assert!((p.free("USDT") - (1000.0 + 45.0 - 27.3)).abs() < 1e-9);
+        // «весь» на продажу закрывает лонг
+        p.order(
+            "BTCUSDT",
+            Side::Sell,
+            Amount::All,
+            None,
+            Some(&book_at(92.0, 93.0)),
+            &l,
+        )
+        .unwrap();
+        assert!(p.positions.is_empty());
+        assert!((p.free("USDT") - 1048.0).abs() < 1e-9);
+        assert_eq!(p.closed, 2);
+        // маржи не хватает: 2000 при балансе 1048 и плече 1
+        p.set_perp(1.0);
+        let e = p
+            .order(
+                "BTCUSDT",
+                Side::Buy,
+                Amount::Qty(20.0),
+                None,
+                Some(&book_at(99.0, 100.0)),
+                &l,
+            )
+            .unwrap_err();
+        assert!(e.contains("маржи"), "{e}");
+    }
+
+    #[test]
+    fn perp_funding_and_liquidation() {
+        let mut p = Paper::new(&["BTCUSDT".into()], 100.0, 0.0, 0.0);
+        p.set_perp(10.0);
+        let l = Limits {
+            max_order_quote: 100_000.0,
+            ..lim()
+        };
+        p.order(
+            "BTCUSDT",
+            Side::Buy,
+            Amount::Qty(5.0),
+            None,
+            Some(&book_at(99.0, 100.0)),
+            &l,
+        )
+        .unwrap();
+        // лонг платит при положительной ставке: 5 × 100 × 0.0001
+        assert!((p.apply_funding("BTCUSDT", 0.0001, 100.0) - 0.05).abs() < 1e-12);
+        assert!((p.free("USDT") - 49.95).abs() < 1e-9);
+        // -9.6%: маржа 50 + (-48) = 2 < 0.5% × 452 — ликвидация, маржа потеряна
+        p.match_resting("BTCUSDT", &book_at(90.3, 90.5), &l);
+        assert!(p.positions.is_empty());
+        assert_eq!(p.liquidations, 1);
+        assert!((p.free("USDT") - 49.95).abs() < 1e-9);
+        let a = p.account_json(&HashMap::from([("BTCUSDT".to_string(), 90.4)]));
+        assert_eq!(a["market"], json!("perp"));
+        assert_eq!(a["liquidations"], json!(1));
+    }
+
+    #[test]
+    fn perp_limit_locks_margin_only_for_opening() {
+        let mut p = Paper::new(&["BTCUSDT".into()], 1000.0, 0.0, 0.0);
+        p.set_perp(5.0);
+        let l = Limits {
+            max_order_quote: 100_000.0,
+            ..lim()
+        };
+        let b = book_at(100.0, 101.0);
+        p.order("BTCUSDT", Side::Buy, Amount::Qty(2.0), None, Some(&b), &l)
+            .unwrap();
+        let free = p.free("USDT");
+        // продажа 2 по 105 только закрывает лонг — маржа не занимается
+        p.order(
+            "BTCUSDT",
+            Side::Sell,
+            Amount::Qty(2.0),
+            Some(105.0),
+            Some(&b),
+            &l,
+        )
+        .unwrap();
+        assert!((p.free("USDT") - free).abs() < 1e-9);
+        p.match_resting("BTCUSDT", &book_at(105.0, 106.0), &l);
+        assert!(p.positions.is_empty());
+        assert!((p.realized - 8.0).abs() < 1e-9);
     }
 }

@@ -81,12 +81,31 @@ pub fn free_of(c: &Value) -> f64 {
     (n("walletBalance") - n("locked")).max(0.0)
 }
 
+/// Позиция из ответа или события: символ, количество со знаком (Sell — шорт), цена входа.
+pub fn position(p: &Value) -> Option<(String, f64, f64)> {
+    let n = |k: &str| {
+        p[k].as_str()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    let size = n("size");
+    let qty = if p["side"] == "Sell" { -size } else { size };
+    let entry = if n("avgPrice") > 0.0 {
+        n("avgPrice")
+    } else {
+        n("entryPrice")
+    };
+    Some((p["symbol"].as_str()?.to_owned(), qty, entry))
+}
+
 pub struct Client {
     base: String,
     keys: Keys,
     http: reqwest::Client,
     offset_ms: AtomicI64,
     recv_window: u64,
+    /// "spot" или "linear" (USDT-перпы).
+    pub category: &'static str,
 }
 
 impl Client {
@@ -100,6 +119,7 @@ impl Client {
                 .expect("HTTP-клиент"),
             offset_ms: AtomicI64::new(0),
             recv_window: 5000,
+            category: "spot",
         }
     }
 
@@ -162,7 +182,7 @@ impl Client {
         qty: f64,
         price: Option<f64>,
     ) -> Result<OrderState, String> {
-        let mut b = json!({"category": "spot", "symbol": symbol, "side": if side == Side::Buy { "Buy" } else { "Sell" },
+        let mut b = json!({"category": self.category, "symbol": symbol, "side": if side == Side::Buy { "Buy" } else { "Sell" },
             "orderType": if price.is_some() { "Limit" } else { "Market" }, "qty": dec(qty), "orderLinkId": format!("hft{local}")});
         match price {
             Some(px) => {
@@ -170,7 +190,8 @@ impl Client {
                 b["timeInForce"] = Value::from("GTC");
             }
             // рыночная покупка на споте по умолчанию в котируемой валюте — единицу указываем явно
-            None => b["marketUnit"] = Value::from("baseCoin"),
+            None if self.category == "spot" => b["marketUnit"] = Value::from("baseCoin"),
+            None => {}
         }
         let r = self.call(true, "/v5/order/create", b.to_string()).await?;
         Ok(OrderState {
@@ -183,7 +204,7 @@ impl Client {
 
     /// Состояние ордера: открытые и недавние — /v5/order/realtime, иначе история.
     pub async fn query(&self, symbol: &str, id: &str) -> Result<OrderState, String> {
-        let q = format!("category=spot&orderId={id}&symbol={symbol}");
+        let q = format!("category={}&orderId={id}&symbol={symbol}", self.category);
         let r = self.call(false, "/v5/order/realtime", q.clone()).await?;
         let o = match r["list"].get(0) {
             Some(o) => o.clone(),
@@ -201,7 +222,7 @@ impl Client {
             .call(
                 true,
                 "/v5/order/cancel",
-                json!({"category": "spot", "symbol": symbol, "orderId": id}).to_string(),
+                json!({"category": self.category, "symbol": symbol, "orderId": id}).to_string(),
             )
             .await;
         self.query(symbol, id).await
@@ -224,6 +245,37 @@ impl Client {
             .filter_map(|c| Some((c["coin"].as_str()?.to_owned(), free_of(&c))))
             .filter(|(_, f)| *f > 0.0)
             .collect())
+    }
+
+    /// Позиции USDT-перпов: символ, количество со знаком, цена входа.
+    pub async fn positions(&self) -> Result<Vec<(String, f64, f64)>, String> {
+        let r = self
+            .call(
+                false,
+                "/v5/position/list",
+                "category=linear&settleCoin=USDT".into(),
+            )
+            .await?;
+        Ok(r["list"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(position)
+            .collect())
+    }
+
+    /// Плечо символа; «не изменено» (110043) — не ошибка.
+    pub async fn set_leverage(&self, symbol: &str, leverage: f64) -> Result<(), String> {
+        let l = format!("{}", leverage.round() as u64);
+        let b =
+            json!({"category": "linear", "symbol": symbol, "buyLeverage": l, "sellLeverage": l});
+        match self
+            .call(true, "/v5/position/set-leverage", b.to_string())
+            .await
+        {
+            Err(e) if e.contains("110043") => Ok(()),
+            r => r.map(|_| ()),
+        }
     }
 
     /// Вход в приватный поток.
@@ -254,6 +306,12 @@ mod tests {
         assert_eq!(
             free_of(&json!({"coin": "USDT", "walletBalance": "100", "locked": "30"})),
             70.0
+        );
+        assert_eq!(
+            position(
+                &json!({"symbol": "BTCUSDT", "side": "Sell", "size": "0.5", "avgPrice": "100"})
+            ),
+            Some(("BTCUSDT".into(), -0.5, 100.0))
         );
     }
 }

@@ -1,4 +1,4 @@
-//! Счёт биржи: бумажный или живой (Binance). Движок, стратегии и админка работают с ним одинаково.
+//! Счёт биржи: бумажный или живой (Binance, Bybit), спот или перпы. Движок, стратегии и админка работают с ним одинаково.
 
 use crate::book::Book;
 use crate::live::Live;
@@ -123,6 +123,19 @@ impl Account {
     }
     pub fn reset_kill_switch(&mut self) {
         self.ledger_mut().kill_switch = false
+    }
+
+    /// Счёт перпов с плечом.
+    pub fn set_perp(&mut self, leverage: f64) {
+        self.ledger_mut().set_perp(leverage)
+    }
+
+    /// Funding по позиции (только бумага: на живом счёте его списывает биржа, балансы приходят с неё).
+    pub fn apply_funding(&mut self, symbol: &str, rate: f64, mark: f64) -> f64 {
+        match self {
+            Account::Paper(p) => p.apply_funding(symbol, rate, mark),
+            Account::Live(_) => 0.0,
+        }
     }
 
     /// Показатели для /status: kill switch, дневной результат, принято/отклонено, последний отказ.

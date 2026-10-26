@@ -144,21 +144,44 @@ pub fn start(
         f.bbo_enabled = bbo;
     });
     let (ex, m) = (ex.to_owned(), market.clone());
-    if ex == "binance" {
-        let rest_url = params
-            .get("restUrl")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .unwrap_or_else(|| crate::rest::default_url(perp, testnet).to_owned());
-        return Plan::Run(tokio::spawn(async move {
-            tokio::join!(
-                run(m, ex.clone(), dialect),
-                rest_loop(market, ex, rest_url, perp, symbols)
-            );
-        }));
-    }
-    Plan::Run(tokio::spawn(run(m, ex, dialect)))
+    let rest_url = params
+        .get("restUrl")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            if ex == "bybit" {
+                crate::bybit_api::rest_url(testnet)
+            } else {
+                crate::rest::default_url(perp, testnet)
+            }
+            .to_owned()
+        });
+    let rest = (ex == "binance").then(|| {
+        rest_loop(
+            market.clone(),
+            ex.clone(),
+            rest_url.clone(),
+            perp,
+            symbols.clone(),
+        )
+    });
+    let funding = perp.then(|| funding_loop(market, ex.clone(), rest_url, symbols));
+    Plan::Run(tokio::spawn(async move {
+        tokio::join!(
+            run(m, ex, dialect),
+            async {
+                if let Some(r) = rest {
+                    r.await
+                }
+            },
+            async {
+                if let Some(f) = funding {
+                    f.await
+                }
+            }
+        );
+    }))
 }
 
 /// Применить обновление к стакану.
@@ -287,6 +310,19 @@ async fn rest_loop(
         }
         market.with_feed(&ex, |s| s.rest_error = err);
         tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
+/// Ставки funding перпов — раз в 30 с.
+async fn funding_loop(market: Arc<Market>, ex: String, base: String, symbols: Vec<String>) {
+    loop {
+        for s in &symbols {
+            match crate::rest::funding(&ex, &base, s).await {
+                Ok(f) => market.set_funding(&ex, s, f),
+                Err(e) => market.with_feed(&ex, |st| st.rest_error = format!("funding {s}: {e}")),
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
     }
 }
 

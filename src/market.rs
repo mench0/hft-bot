@@ -36,6 +36,16 @@ pub struct Market {
     filters: Mutex<HashMap<String, HashMap<String, Filter>>>,
     /// Оборот последних закрытых минут по (биржа, символ) и когда получен.
     minutes: Mutex<HashMap<(String, String), Minutes>>,
+    /// Funding перпов по (биржа, символ).
+    funding: Mutex<HashMap<(String, String), Funding>>,
+}
+
+/// Ставка funding: текущая (доля), время следующего списания (мс), цена маркировки.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Funding {
+    pub rate: f64,
+    pub next_ms: u64,
+    pub mark: f64,
 }
 
 impl Market {
@@ -75,6 +85,22 @@ impl Market {
         self.feeds.lock().unwrap().clear();
         self.filters.lock().unwrap().clear();
         self.minutes.lock().unwrap().clear();
+        self.funding.lock().unwrap().clear();
+    }
+
+    pub fn set_funding(&self, ex: &str, sym: &str, f: Funding) {
+        self.funding
+            .lock()
+            .unwrap()
+            .insert((ex.to_owned(), sym.to_owned()), f);
+    }
+
+    pub fn funding(&self, ex: &str, sym: &str) -> Option<Funding> {
+        self.funding
+            .lock()
+            .unwrap()
+            .get(&(ex.to_owned(), sym.to_owned()))
+            .copied()
     }
 
     /// Запомнить правила пар биржи.
@@ -120,8 +146,11 @@ impl Market {
         let syms = self.feed(ex).map(|f| f.symbols).unwrap_or_default();
         let mut root = Map::new();
         for s in syms {
+            let fund = self.funding(ex, &s);
             let node = match self.book(ex, &s).filter(Book::is_ready) {
                 Some(b) => json!({
+                    "funding_проц": fund.map(|f| f.rate * 100.0),
+                    "следующий_funding": fund.map(|f| f.next_ms),
                     "лучший_бид": b.best_bid().map(|x| x.0),
                     "лучший_аск": b.best_ask().map(|x| x.0),
                     "середина": b.mid(),
