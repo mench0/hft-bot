@@ -51,6 +51,8 @@ pub struct Bot {
     matcher: Mutex<Option<JoinHandle<()>>>,
     /// «Сбор спреда» по биржам.
     spreads: Mutex<HashMap<String, SpreadCapture>>,
+    /// Статарб по биржам.
+    statarbs: Mutex<HashMap<String, crate::statarb::StatArb>>,
     /// Последнее учтённое время funding по (биржа, символ).
     funding_applied: Mutex<HashMap<(String, String), u64>>,
 }
@@ -100,6 +102,7 @@ impl Bot {
             accounts: Arc::default(),
             matcher: Mutex::default(),
             spreads: Mutex::default(),
+            statarbs: Mutex::default(),
             funding_applied: Mutex::default(),
         };
         bot.persist();
@@ -563,13 +566,17 @@ impl Bot {
                 }
             }
             drop(applied);
+            let mut sas = self.statarbs.lock().unwrap();
+            let sa = sas.entry(ex.clone()).or_default();
+            let sa_held = sa.held();
             let mut all = self.spreads.lock().unwrap();
             let sc = all
                 .entry(ex.clone())
                 .or_insert_with(|| SpreadCapture::new(fee(&ex, "makerFeePct")));
             for sym in &selected {
                 let bound = saved.symbol_strategies.get(&ex).and_then(|m| m.get(sym));
-                let mine = bound.is_none_or(|ids| ids.is_empty() || ids.contains(spread::ID));
+                let mine = bound.is_none_or(|ids| ids.is_empty() || ids.contains(spread::ID))
+                    && !sa_held.contains(sym);
                 let book = books.get(sym);
                 if sp.enabled && lim.trading_enabled && mine {
                     let minutes =
@@ -584,6 +591,28 @@ impl Bot {
             for sym in sc.symbols().into_iter().filter(|s| !selected.contains(s)) {
                 sc.stop_symbol(paper, &sym, books.get(&sym), "монета убрана из выбранных");
             }
+            // статарб: монеты без привязки или привязанные к нему; занятые сбором спреда — не трогает
+            let sa_syms: Vec<String> = selected
+                .iter()
+                .filter(|s| {
+                    saved
+                        .symbol_strategies
+                        .get(&ex)
+                        .and_then(|m| m.get(*s))
+                        .is_none_or(|ids| ids.is_empty() || ids.contains(crate::statarb::ID))
+                })
+                .cloned()
+                .collect();
+            let busy: std::collections::HashSet<String> = sc.symbols().into_iter().collect();
+            sa.step(
+                &books,
+                paper,
+                &crate::statarb::Params::from(&params),
+                &lim,
+                &sa_syms,
+                &busy,
+                now,
+            );
         }
     }
 
@@ -598,8 +627,25 @@ impl Bot {
             .get(ex)
             .map(|s| s.stats(sp.enabled))
             .unwrap_or_else(|| SpreadCapture::new(fee(ex, "makerFeePct")).stats(sp.enabled));
+        let p = self.params(ex);
+        let syms = self
+            .snapshot()
+            .selection
+            .get(ex)
+            .cloned()
+            .unwrap_or_default();
+        let sa = self
+            .statarbs
+            .lock()
+            .unwrap()
+            .get(ex)
+            .map(|s| s.stats(&crate::statarb::Params::from(&p), &syms))
+            .unwrap_or_else(|| {
+                crate::statarb::StatArb::default().stats(&crate::statarb::Params::from(&p), &syms)
+            });
         let mut m = Map::new();
         m.insert("spreadCapture".into(), sc);
+        m.insert("statArb".into(), sa);
         Ok(Value::Object(m))
     }
 

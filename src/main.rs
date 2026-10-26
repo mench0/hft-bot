@@ -16,6 +16,7 @@ mod paper;
 mod rest;
 mod signed;
 mod spread;
+mod statarb;
 mod state;
 
 use std::net::SocketAddr;

@@ -1250,7 +1250,18 @@ mod tests {
         call(&r, "POST", "/trading/start", "").await;
         let (_, rs) = call(&r, "GET", "/exchanges/request-stats", "").await;
         assert_eq!(rs["bybit"]["mode"], json!("TESTNET"), "{rs}");
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (_, b) = call(&r, "GET", "/balances?exchange=bybit", "").await;
+            if b["свободно"]["USDT"] == json!(1000.0) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "баланс не получен: {b}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         let (c, v) = call(
             &r,
             "POST",
@@ -1475,7 +1486,18 @@ mod tests {
         call(&r, "POST", "/trading/start", "").await;
         let (_, rs) = call(&r, "GET", "/exchanges/request-stats", "").await;
         assert_eq!(rs["binance"]["mode"], json!("TESTNET"), "{rs}");
-        tokio::time::sleep(Duration::from_millis(800)).await; // стакан и балансы
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (_, b) = call(&r, "GET", "/balances?exchange=binance", "").await;
+            if b["свободно"]["USDT"] == json!(1000.0) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "баланс не получен: {b}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         let (c, v) = call(
             &r,
             "POST",

@@ -63,6 +63,30 @@ impl Account {
         }
     }
 
+    /// Рыночный выход без проверок торговли (спот — продажа, перп — уменьшение позиции в любую сторону).
+    pub fn exit_market(
+        &mut self,
+        symbol: &str,
+        side: Side,
+        qty: f64,
+        book: Option<&Book>,
+    ) -> Result<Fill, String> {
+        match self {
+            Account::Paper(p) => p.exit_market(symbol, side, qty, book),
+            Account::Live(l) => l.exit_market(symbol, side, qty, book),
+        }
+    }
+
+    /// Счёт перпов.
+    pub fn is_perp(&self) -> bool {
+        self.ledger().leverage().is_some()
+    }
+
+    /// Комиссия тейкера, доля.
+    pub fn taker_fee(&self) -> f64 {
+        self.ledger().fees().1
+    }
+
     pub fn cancel(&mut self, id: u64) -> bool {
         match self {
             Account::Paper(p) => p.cancel(id),

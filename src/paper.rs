@@ -999,33 +999,42 @@ impl Paper {
         qty: f64,
         book: Option<&Book>,
     ) -> Result<Fill, String> {
+        self.exit_market(symbol, Side::Sell, qty, book)
+    }
+
+    /// Сколько можно закрыть выходом: спот — продать имеющееся; перп — уменьшить позицию (не перевернуть).
+    pub fn exit_room(&self, symbol: &str, side: Side) -> f64 {
+        match (self.leverage, side) {
+            (Some(_), Side::Sell) => self.position(symbol).qty.max(0.0),
+            (Some(_), Side::Buy) => (-self.position(symbol).qty).max(0.0),
+            (None, Side::Sell) => split(symbol).map_or(0.0, |(b, _)| self.free(&b)),
+            (None, Side::Buy) => 0.0,
+        }
+    }
+
+    /// Рыночный выход без проверок торговли: спот — продажа, перп — уменьшение позиции в любую сторону.
+    pub fn exit_market(
+        &mut self,
+        symbol: &str,
+        side: Side,
+        qty: f64,
+        book: Option<&Book>,
+    ) -> Result<Fill, String> {
         let b = book.filter(|b| b.is_ready()).ok_or("стакан не готов")?;
         let (base, quote) = split(symbol).ok_or_else(|| format!("не разобрать символ {symbol}"))?;
-        let have = if self.leverage.is_some() {
-            self.position(symbol).qty.max(0.0)
-        } else {
-            self.free(&base)
-        };
-        let qty = qty.min(have);
+        let qty = qty.min(self.exit_room(symbol, side));
         let qty = self
             .filters
             .get(&symbol.to_uppercase())
             .map_or(qty, |f| f.round_qty(qty));
         if qty <= 0.0 {
-            return Err(format!("нет {base} для продажи"));
+            return Err(format!("нечего закрывать по {symbol}"));
         }
-        let (filled, avg) = walk(b, Side::Sell, qty, None);
-        self.fill(symbol, &base, &quote, Side::Sell, filled, avg, false, false)?;
+        let (filled, avg) = walk(b, side, qty, None);
+        self.fill(symbol, &base, &quote, side, filled, avg, false, false)?;
         let id = self.next_id;
         self.next_id += 1;
-        self.exec(
-            id,
-            symbol,
-            Side::Sell,
-            filled,
-            avg,
-            filled * avg * self.taker,
-        );
+        self.exec(id, symbol, side, filled, avg, filled * avg * self.taker);
         Ok(Fill {
             order_id: id,
             status: "FILLED",

@@ -146,24 +146,27 @@ impl Live {
         qty: f64,
         book: Option<&Book>,
     ) -> Result<Fill, String> {
+        self.exit_market(symbol, Side::Sell, qty, book)
+    }
+
+    /// Рыночный выход без проверок торговли: спот — продажа, перп — уменьшение позиции.
+    pub fn exit_market(
+        &mut self,
+        symbol: &str,
+        side: Side,
+        qty: f64,
+        book: Option<&Book>,
+    ) -> Result<Fill, String> {
         book.filter(|b| b.is_ready()).ok_or("стакан не готов")?;
-        let base = crate::paper::split(symbol)
-            .map(|x| x.0)
-            .ok_or("не разобрать символ")?;
-        let have = if self.ledger.leverage().is_some() {
-            self.ledger.position(symbol).qty.max(0.0)
-        } else {
-            self.ledger.free(&base)
-        };
-        let qty = qty.min(have);
+        let qty = qty.min(self.ledger.exit_room(symbol, side));
         let qty = self
             .ledger
             .filter(&symbol.to_uppercase())
             .map_or(qty, |f| f.round_qty(qty));
         if qty <= 0.0 {
-            return Err(format!("нет {base} для продажи"));
+            return Err(format!("нечего закрывать по {symbol}"));
         }
-        Ok(self.send(symbol, Side::Sell, qty, None))
+        Ok(self.send(symbol, side, qty, None))
     }
 
     /// Снять ордер; false — его уже нет.
