@@ -9,7 +9,7 @@ use crate::market::Market;
 use crate::paper::{Amount, Fill, Limits, Paper, Side};
 use crate::spread::{self, SpreadCapture};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -53,6 +53,8 @@ pub struct Bot {
     spreads: Mutex<HashMap<String, SpreadCapture>>,
     /// Статарб по биржам.
     statarbs: Mutex<HashMap<String, crate::statarb::StatArb>>,
+    /// Межбиржевой арбитраж на споте (один на процесс).
+    spotarb: Mutex<crate::spotarb::SpotArb>,
     /// Последнее учтённое время funding по (биржа, символ).
     funding_applied: Mutex<HashMap<(String, String), u64>>,
 }
@@ -103,6 +105,7 @@ impl Bot {
             matcher: Mutex::default(),
             spreads: Mutex::default(),
             statarbs: Mutex::default(),
+            spotarb: Mutex::default(),
             funding_applied: Mutex::default(),
         };
         bot.persist();
@@ -524,6 +527,7 @@ impl Bot {
         let saved = self.snapshot();
         let now = std::time::Instant::now();
         let exchanges: Vec<String> = self.accounts.lock().unwrap().keys().cloned().collect();
+        let mut cross: HashMap<String, (HashMap<String, Book>, Limits)> = HashMap::new();
         for ex in exchanges {
             let params = self.params(&ex);
             let lim = Limits::from_params(&params);
@@ -533,6 +537,7 @@ impl Bot {
                 .iter()
                 .filter_map(|s| self.market.book(&ex, s).map(|b| (s.clone(), b)))
                 .collect();
+            cross.insert(ex.clone(), (books.clone(), lim.clone()));
             let mut acc = self.accounts.lock().unwrap();
             let Some(paper) = acc.get_mut(&ex) else {
                 continue;
@@ -614,6 +619,40 @@ impl Bot {
                 now,
             );
         }
+        // межбиржевой арбитраж на споте: все счета сразу
+        let sp = crate::spotarb::Params::from(&self.settings());
+        let mut acc = self.accounts.lock().unwrap();
+        let mut venues: HashMap<String, crate::spotarb::Venue> = acc
+            .iter_mut()
+            .filter_map(|(ex, a)| {
+                let (books, lim) = cross.remove(ex)?;
+                Some((
+                    ex.clone(),
+                    crate::spotarb::Venue {
+                        account: a,
+                        trading: lim.trading_enabled,
+                        lim,
+                        books,
+                    },
+                ))
+            })
+            .collect();
+        self.spotarb.lock().unwrap().step(&mut venues, &sp, now);
+    }
+
+    /// Межбиржевые стратегии для /arbitrage (как в Java): spotPrice — арбитраж на споте; перп-арбитража и
+    /// lead-lag в Rust ещё нет.
+    pub fn arbitrage_json(&self) -> Value {
+        let off = json!({"running": false});
+        let spot = if self.running() {
+            self.spotarb
+                .lock()
+                .unwrap()
+                .stats(&crate::spotarb::Params::from(&self.settings()))
+        } else {
+            off.clone()
+        };
+        json!({"perpPrice": off, "spotPrice": spot, "leadLag": off})
     }
 
     /// Состояние стратегий биржи для админки (/strategies).

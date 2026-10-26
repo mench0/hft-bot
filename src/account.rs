@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // счетов единицы, хранятся в карте — размер не важен
 pub enum Account {
     Paper(Paper),
     Live(Live),
@@ -74,6 +75,26 @@ impl Account {
         match self {
             Account::Paper(p) => p.exit_market(symbol, side, qty, book),
             Account::Live(l) => l.exit_market(symbol, side, qty, book),
+        }
+    }
+
+    pub fn is_live(&self) -> bool {
+        matches!(self, Account::Live(_))
+    }
+
+    /// Живой счёт.
+    pub fn live(&mut self) -> Option<&mut Live> {
+        match self {
+            Account::Live(l) => Some(l),
+            Account::Paper(_) => None,
+        }
+    }
+
+    /// Бумажный счёт.
+    pub fn paper(&mut self) -> Option<&mut Paper> {
+        match self {
+            Account::Paper(p) => Some(p),
+            Account::Live(_) => None,
         }
     }
 

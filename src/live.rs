@@ -23,6 +23,24 @@ pub enum Cmd {
     Cancel {
         local: u64,
     },
+    /// Узнать сети монеты.
+    Networks {
+        coin: String,
+    },
+    /// Узнать адрес депозита монеты в сети.
+    Address {
+        coin: String,
+        network: String,
+    },
+    /// Вывести монету (номер перевода — свой).
+    Withdraw {
+        tid: u64,
+        coin: String,
+        network: String,
+        address: String,
+        tag: String,
+        amount: f64,
+    },
 }
 
 #[derive(Debug)]
@@ -55,6 +73,12 @@ pub struct Live {
     pub stream_ok: bool,
     /// Событий счёта получено.
     pub stream_events: u64,
+    /// Сети монет (ответы на Cmd::Networks): Err — ошибка запроса.
+    pub networks: HashMap<String, Result<Vec<crate::transfer::Net>, String>>,
+    /// Адреса депозита по (монета, сеть).
+    pub addresses: HashMap<(String, String), Result<(String, String), String>>,
+    /// Итог выводов по своему номеру: номер на бирже или ошибка.
+    pub withdrawals: HashMap<u64, Result<String, String>>,
 }
 
 impl Live {
@@ -75,6 +99,9 @@ impl Live {
             error: String::new(),
             stream_ok: false,
             stream_events: 0,
+            networks: HashMap::new(),
+            addresses: HashMap::new(),
+            withdrawals: HashMap::new(),
         }
     }
 
@@ -362,6 +389,11 @@ impl Live {
         }
     }
 
+    /// Запросить у биржи сети, адрес или вывод (ответ — в networks / addresses / withdrawals).
+    pub fn request(&self, cmd: Cmd) {
+        let _ = self.tx.send(cmd);
+    }
+
     /// Позиции с биржи: заменяют учётные (у кого на бирже позиции нет — закрыта).
     pub fn sync_positions(&mut self, ps: &[(String, f64, f64)]) {
         let known: Vec<String> = self.ledger.positions.keys().cloned().collect();
@@ -488,6 +520,31 @@ impl Venue {
             Venue::Bybit(c) => c.set_leverage(symbol, lev).await,
         }
     }
+    async fn networks(&self, coin: &str) -> Result<Vec<crate::transfer::Net>, String> {
+        match self {
+            Venue::Binance(c) => c.networks(coin).await,
+            Venue::Bybit(c) => c.networks(coin).await,
+        }
+    }
+    async fn deposit_address(&self, coin: &str, net: &str) -> Result<(String, String), String> {
+        match self {
+            Venue::Binance(c) => c.deposit_address(coin, net).await,
+            Venue::Bybit(c) => c.deposit_address(coin, net).await,
+        }
+    }
+    async fn withdraw(
+        &self,
+        coin: &str,
+        net: &str,
+        address: &str,
+        tag: &str,
+        amount: f64,
+    ) -> Result<String, String> {
+        match self {
+            Venue::Binance(c) => c.withdraw(coin, net, address, tag, amount).await,
+            Venue::Bybit(c) => c.withdraw(coin, net, address, tag, amount).await,
+        }
+    }
     async fn balances(&self) -> Result<std::collections::BTreeMap<String, f64>, String> {
         match self {
             Venue::Binance(c) => c.balances().await,
@@ -542,6 +599,22 @@ pub async fn worker(
                         }
                     }
                     Cmd::Cancel { local } => cancel(&acc, &ex, &client, local).await,
+                    Cmd::Networks { coin } => {
+                        let r = client.networks(&coin).await;
+                        with_live(&acc, &ex, |l| { l.networks.insert(coin, r); });
+                    }
+                    Cmd::Address { coin, network } => {
+                        let r = client.deposit_address(&coin, &network).await;
+                        with_live(&acc, &ex, |l| { l.addresses.insert((coin, network), r); });
+                    }
+                    Cmd::Withdraw { tid, coin, network, address, tag, amount } => {
+                        let r = client.withdraw(&coin, &network, &address, &tag, amount).await;
+                        match &r {
+                            Ok(id) => tracing::warn!("[{ex}] вывод {amount} {coin} по {network} на {address}: номер {id}"),
+                            Err(e) => tracing::warn!("[{ex}] вывод {amount} {coin} по {network} отклонён: {e}"),
+                        }
+                        with_live(&acc, &ex, |l| { l.withdrawals.insert(tid, r); });
+                    }
                 }
             }
             _ = poll.tick() => {

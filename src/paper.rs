@@ -759,6 +759,30 @@ impl Paper {
         self.check_loss(lim);
     }
 
+    /// Перевод с бумажного счёта: монета уходит со свободного баланса вместе с долей учёта средней цены.
+    /// Возвращает среднюю цену покупки уходящей монеты (0 — неизвестна).
+    pub fn withdraw(&mut self, asset: &str, qty: f64) -> Result<f64, String> {
+        if self.free(asset) + 1e-12 < qty {
+            return Err(format!(
+                "недостаточно {asset} для перевода: нужно {qty}, свободно {}",
+                self.free(asset)
+            ));
+        }
+        self.add(asset, -qty);
+        let lot = self.lots.entry(asset.to_owned()).or_default();
+        let avg = lot.avg;
+        lot.qty = (lot.qty - qty).max(0.0);
+        Ok(avg)
+    }
+
+    /// Перевод пришёл: монета на свободный баланс, учёт средней цены — с биржи-источника.
+    pub fn deposit(&mut self, asset: &str, qty: f64, avg: f64) {
+        self.add(asset, qty);
+        let lot = self.lots.entry(asset.to_owned()).or_default();
+        lot.avg = (lot.avg * lot.qty + avg * qty) / (lot.qty + qty).max(1e-18);
+        lot.qty += qty;
+    }
+
     /// Баланс одного актива с биржи (событие счёта).
     pub fn set_balance(&mut self, asset: &str, free: f64) {
         self.free.insert(asset.to_owned(), free);

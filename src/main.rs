@@ -15,9 +15,11 @@ mod market;
 mod paper;
 mod rest;
 mod signed;
+mod spotarb;
 mod spread;
 mod statarb;
 mod state;
+mod transfer;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

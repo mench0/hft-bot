@@ -119,6 +119,7 @@ pub fn router(bot: Arc<Bot>, cfg: AdminConfig) -> Router {
         .route("/discovery", get(discovery))
         .route("/market", get(market))
         .route("/strategies", get(strategies))
+        .route("/arbitrage", get(arbitrage))
         .route("/order", axum::routing::post(order))
         .route("/cancel-all", axum::routing::post(cancel_all))
         .route("/balances", get(balances))
@@ -439,6 +440,10 @@ async fn strategies(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, Ap
     Ok(Json(
         json!({"биржа": ex, "стратегии": a.bot.strategies_json(ex).map_err(bad)?}),
     ))
+}
+
+async fn arbitrage(State(a): State<App>) -> Json<Value> {
+    Json(a.bot.arbitrage_json())
 }
 
 async fn market(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiError> {
@@ -914,6 +919,232 @@ mod tests {
 
     /// Живой режим (testnet) против макета REST Binance: макет проверяет подпись каждого запроса, ведёт балансы и
     /// статусы ордеров. Рыночная покупка учитывается, лимитная продажа стоит, паника снимает её на «бирже».
+    /// Межбиржевой круг с реальным переводом: на Bybit дешевле, на Binance дороже, монеты на Binance нет —
+    /// покупка на Bybit, сети обеих бирж, адрес депозита Binance, вывод с Bybit по самой дешёвой сети, приход
+    /// (рост баланса на Binance) и продажа на Binance.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spot_arb_transfer_round_against_mock_exchanges() {
+        use axum::extract::RawQuery;
+        use axum::http::HeaderMap;
+        use futures_util::SinkExt;
+        use std::sync::Mutex;
+        use tokio_tungstenite::tungstenite::Message;
+        const BN: &str = "test-secret";
+        const BY: &str = "bybit-secret";
+        #[derive(Default)]
+        struct Ex {
+            /// X на Binance (приходит переводом) и USDT
+            bn_x: f64,
+            bn_usdt: f64,
+            by_x: f64,
+            by_usdt: f64,
+            by_orders: Vec<(String, f64)>,
+            withdraw: Option<Value>,
+            bn_sold: f64,
+            bad_sig: u32,
+        }
+        let ex = Arc::new(Mutex::new(Ex {
+            bn_usdt: 1000.0,
+            by_usdt: 1000.0,
+            ..Default::default()
+        }));
+        fn param(q: &str, k: &str) -> Option<String> {
+            q.split('&').find_map(|kv| {
+                kv.split_once('=')
+                    .filter(|(a, _)| *a == k)
+                    .map(|(_, v)| v.to_owned())
+            })
+        }
+        fn bn_ok(q: &str, h: &HeaderMap) -> bool {
+            let (body, sig) = q.rsplit_once("&signature=").unwrap_or((q, ""));
+            h.get("x-mbx-apikey").is_some_and(|k| k == "test-key")
+                && crate::signed::sign(BN, body) == sig
+        }
+        fn by_ok(h: &HeaderMap, payload: &str) -> bool {
+            let g = |k: &str| {
+                h.get(k)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_owned()
+            };
+            g("x-bapi-api-key") == "bybit-key"
+                && crate::signed::sign(
+                    BY,
+                    &format!(
+                        "{}bybit-key{}{payload}",
+                        g("x-bapi-timestamp"),
+                        g("x-bapi-recv-window")
+                    ),
+                ) == g("x-bapi-sign")
+        }
+        // Binance (спот, дороже)
+        let (e1, e2, e3, e4) = (ex.clone(), ex.clone(), ex.clone(), ex.clone());
+        let bn = Router::new()
+            .route("/api/v3/time", get(|| async { Json(json!({"serverTime": now_ms()})) }))
+            .route("/api/v3/exchangeInfo", get(|| async { Json(json!({"symbols": [{"symbol": "XUSDT", "filters": [
+                {"filterType": "PRICE_FILTER", "tickSize": "0.01"}, {"filterType": "LOT_SIZE", "stepSize": "0.01", "minQty": "0.01"}]}]})) }))
+            .route("/api/v3/klines", get(|| async { Json(json!([])) }))
+            .route("/api/v3/account", get(move |RawQuery(q): RawQuery, h: HeaderMap| async move {
+                let mut x = e1.lock().unwrap();
+                if !bn_ok(&q.unwrap_or_default(), &h) { x.bad_sig += 1; }
+                Json(json!({"balances": [{"asset": "USDT", "free": format!("{}", x.bn_usdt)}, {"asset": "X", "free": format!("{}", x.bn_x)}]}))
+            }))
+            .route("/sapi/v1/capital/config/getall", get(move |RawQuery(q): RawQuery, h: HeaderMap| async move {
+                if !bn_ok(&q.unwrap_or_default(), &h) { e2.lock().unwrap().bad_sig += 1; }
+                Json(json!([{"coin": "X", "networkList": [
+                    {"network": "ETH", "withdrawFee": "0.5", "withdrawMin": "1", "withdrawEnable": true, "depositEnable": true},
+                    {"network": "TRX", "withdrawFee": "0.2", "withdrawMin": "1", "withdrawEnable": true, "depositEnable": true}]}]))
+            }))
+            .route("/sapi/v1/capital/deposit/address", get(move |RawQuery(q): RawQuery, h: HeaderMap| async move {
+                let q = q.unwrap_or_default();
+                if !bn_ok(&q, &h) { e3.lock().unwrap().bad_sig += 1; }
+                assert_eq!(param(&q, "network").as_deref(), Some("TRX"));
+                Json(json!({"coin": "X", "address": "TXdepositAddr", "tag": ""}))
+            }))
+            .route("/api/v3/order", axum::routing::post(move |RawQuery(q): RawQuery, h: HeaderMap| async move {
+                let q = q.unwrap_or_default();
+                let mut x = e4.lock().unwrap();
+                if !bn_ok(&q, &h) { x.bad_sig += 1; }
+                let qty: f64 = param(&q, "quantity").unwrap().parse().unwrap();
+                assert_eq!(param(&q, "side").as_deref(), Some("SELL"));
+                x.bn_x -= qty;
+                x.bn_usdt += qty * 10.3;
+                x.bn_sold += qty;
+                Json(json!({"orderId": 77, "status": "FILLED", "executedQty": format!("{qty}"), "cummulativeQuoteQty": format!("{}", qty * 10.3)}))
+            }));
+        // Bybit (спот, дешевле)
+        let (b1, b2, b3, b4, b5) = (ex.clone(), ex.clone(), ex.clone(), ex.clone(), ex.clone());
+        let by = Router::new()
+            .route("/v5/market/time", get(|| async { Json(json!({"retCode": 0, "time": now_ms()})) }))
+            .route("/v5/account/wallet-balance", get(move |RawQuery(q): RawQuery, h: HeaderMap| async move {
+                let mut x = b1.lock().unwrap();
+                if !by_ok(&h, &q.unwrap_or_default()) { x.bad_sig += 1; }
+                Json(json!({"retCode": 0, "result": {"list": [{"coin": [
+                    {"coin": "USDT", "walletBalance": format!("{}", x.by_usdt), "locked": "0"},
+                    {"coin": "X", "walletBalance": format!("{}", x.by_x), "locked": "0"}]}]}}))
+            }))
+            .route("/v5/order/create", axum::routing::post(move |h: HeaderMap, body: String| async move {
+                let mut x = b2.lock().unwrap();
+                if !by_ok(&h, &body) { x.bad_sig += 1; }
+                let b: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(b["side"], "Buy");
+                let qty: f64 = b["qty"].as_str().unwrap().parse().unwrap();
+                x.by_x += qty;
+                x.by_usdt -= qty * 10.0;
+                let id = format!("by-{}", x.by_orders.len());
+                x.by_orders.push((id.clone(), qty));
+                Json(json!({"retCode": 0, "result": {"orderId": id}}))
+            }))
+            .route("/v5/order/realtime", get(move |RawQuery(q): RawQuery, h: HeaderMap| async move {
+                let q = q.unwrap_or_default();
+                let x = b3.lock().unwrap();
+                let _ = by_ok(&h, &q);
+                let id = param(&q, "orderId").unwrap();
+                let o = x.by_orders.iter().find(|o| o.0 == id).unwrap();
+                Json(json!({"retCode": 0, "result": {"list": [{"orderId": o.0, "orderStatus": "Filled",
+                    "cumExecQty": format!("{}", o.1), "cumExecValue": format!("{}", o.1 * 10.0)}]}}))
+            }))
+            .route("/v5/asset/coin/query-info", get(move |RawQuery(q): RawQuery, h: HeaderMap| async move {
+                if !by_ok(&h, &q.unwrap_or_default()) { b4.lock().unwrap().bad_sig += 1; }
+                Json(json!({"retCode": 0, "result": {"rows": [{"coin": "X", "chains": [
+                    {"chain": "ETH", "withdrawFee": "0.3", "withdrawMin": "1", "chainWithdraw": "1", "chainDeposit": "1"},
+                    {"chain": "TRX", "withdrawFee": "0.1", "withdrawMin": "1", "chainWithdraw": "1", "chainDeposit": "1"}]}]}}))
+            }))
+            .route("/v5/asset/withdraw/create", axum::routing::post(move |h: HeaderMap, body: String| async move {
+                let mut x = b5.lock().unwrap();
+                if !by_ok(&h, &body) { x.bad_sig += 1; }
+                let b: Value = serde_json::from_str(&body).unwrap();
+                let amount: f64 = b["amount"].as_str().unwrap().parse().unwrap();
+                x.by_x -= amount;
+                x.bn_x += amount - 0.1; // пришло на Binance за вычетом комиссии сети
+                x.withdraw = Some(b);
+                Json(json!({"retCode": 0, "result": {"id": "w-1"}}))
+            }));
+        let mut addrs = Vec::new();
+        for router in [bn, by] {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            addrs.push(l.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
+        }
+        // стаканы: Binance 10.30/10.31, Bybit 9.99/10.00
+        let mut feeds = Vec::new();
+        for (binance, bid, ask) in [(true, "10.3", "10.31"), (false, "9.99", "10")] {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            feeds.push(l.local_addr().unwrap());
+            tokio::spawn(async move {
+                let (tcp, _) = l.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                for i in 1..2000u64 {
+                    let m = if binance {
+                        format!(
+                            r#"{{"stream":"xusdt@depth20@100ms","data":{{"lastUpdateId":{i},"bids":[["{bid}","100"]],"asks":[["{ask}","100"]]}}}}"#
+                        )
+                    } else {
+                        format!(
+                            r#"{{"topic":"orderbook.50.XUSDT","type":"snapshot","data":{{"s":"XUSDT","b":[["{bid}","100"]],"a":[["{ask}","100"]],"u":{i},"seq":{i}}}}}"#
+                        )
+                    };
+                    if ws.send(Message::text(m)).await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            });
+        }
+        // SAFETY: ключи — те же, что в других тестах живого режима
+        unsafe {
+            std::env::set_var("BINANCE_TESTNET_API_KEY", "test-key");
+            std::env::set_var("BINANCE_TESTNET_API_SECRET", BN);
+            std::env::set_var("BYBIT_TESTNET_API_KEY", "bybit-key");
+            std::env::set_var("BYBIT_TESTNET_API_SECRET", BY);
+        }
+        let (_d, r) = app("");
+        for (exn, rest, feed) in [
+            ("binance", addrs[0], format!("ws://{}/stream", feeds[0])),
+            ("bybit", addrs[1], format!("ws://{}", feeds[1])),
+        ] {
+            let sel = format!(
+                "/control/select?exchange={exn}&symbols=XUSDT&market=spot&testnet=true&wsUrl={feed}&restUrl=http://{rest}&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
+            );
+            assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
+        }
+        let (c, v) = call(&r, "POST", "/settings?spotArbLiveWithdraw=true&spotArbOrderQuote=100&spotArbMaxBookAgeMs=60000&spotArbCooldownMs=600000", "").await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        call(&r, "POST", "/control/start", "").await;
+        call(&r, "POST", "/trading/start", "").await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let (_, a) = call(&r, "GET", "/arbitrage", "").await;
+            if a["spotPrice"]["rounds"] == json!(1) {
+                assert!(a["spotPrice"]["pnl"].as_f64().unwrap() > 0.5, "{a}");
+                break;
+            }
+            assert!(tokio::time::Instant::now() < until, "круг не закрыт: {a}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        {
+            let x = ex.lock().unwrap();
+            let w = x.withdraw.clone().expect("вывод был");
+            assert_eq!(
+                (
+                    w["coin"].as_str(),
+                    w["chain"].as_str(),
+                    w["address"].as_str()
+                ),
+                (Some("X"), Some("TRX"), Some("TXdepositAddr")),
+                "самая дешёвая общая сеть"
+            );
+            assert_eq!(w["amount"], json!("10"));
+            assert!(
+                (x.bn_sold - 9.9).abs() < 1e-9,
+                "продано пришедшее: {}",
+                x.bn_sold
+            );
+            assert_eq!(x.bad_sig, 0, "все подписи верны");
+        }
+        call(&r, "POST", "/control/stop", "").await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn live_perp_flow_against_mock_binance_futures() {
         use axum::extract::RawQuery;
