@@ -24,6 +24,8 @@
   - **Hyperliquid** — перпы: `l2Book` по монете (снимки);
   - **BingX** — спот и перпы: `depth20` (кадры gzip, ответ на пинг сервера);
   - **KuCoin** — спот и перпы: токен `bullet-public`, `level2Depth50` (перпы — объём лота × multiplier);
+  - **MEXC** — спот: `spot@public.limit.depth.v3.api.pb` (protobuf, свой разбор, до 30 подписок); перпы: `sub.depth.full`
+    (JSON, объём × contractSize);
   - **LBank**, **Upbit** — спот: снимки `depth` / `orderbook` (у Upbit кадры бинарные);
   - funding перпов всех этих бирж — их REST (Hyperliquid — `metaAndAssetCtxs`, раз в час);
   - Перпы OKX и Gate: объёмы в контрактах переводятся в монеты по размеру контракта (OKX `ctVal`, Gate

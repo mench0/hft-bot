@@ -211,6 +211,7 @@ pub async fn funding(ex: &str, base: &str, symbol: &str) -> Result<crate::market
             ))
             .await?
         }
+        "mexc" => get(format!("{base}/api/v1/contract/funding_rate/{b}_{q}")).await?,
         "kucoin" => {
             let c = if b == "BTC" { "XBT" } else { b.as_str() };
             get(format!("{base}/api/v1/funding-rate/{c}{q}M/current")).await?
@@ -277,6 +278,14 @@ pub fn parse_funding(
                 t["lastFundingRate"].clone(),
                 t["nextFundingTime"].clone(),
                 t["markPrice"].clone(),
+            )
+        }
+        "mexc" => {
+            let t = &v["data"];
+            (
+                t["fundingRate"].clone(),
+                t["nextSettleTime"].clone(),
+                serde_json::Value::Null,
             )
         }
         "kucoin" => {
@@ -452,6 +461,13 @@ mod tests {
         assert_eq!(g.next_ms, 1_700_000_000_000);
         let x = parse_funding("bingx", "BTC", &json!({"code": 0, "data": {"lastFundingRate": "0.0002", "nextFundingTime": 5, "markPrice": "2"}})).unwrap();
         assert_eq!((x.rate, x.next_ms), (0.0002, 5));
+        let m = parse_funding(
+            "mexc",
+            "BTC",
+            &json!({"success": true, "data": {"fundingRate": 0.0001, "nextSettleTime": 11}}),
+        )
+        .unwrap();
+        assert_eq!((m.rate, m.next_ms), (0.0001, 11));
         let k = parse_funding(
             "kucoin",
             "BTC",
