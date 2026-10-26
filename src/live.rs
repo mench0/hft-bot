@@ -469,6 +469,7 @@ pub enum Venue {
     Binance(crate::signed::Client),
     Bybit(crate::bybit_api::Client),
     Aster(crate::aster_api::Client),
+    Okx(crate::okx_api::Client),
 }
 
 impl Venue {
@@ -477,6 +478,7 @@ impl Venue {
             Venue::Binance(c) => c.sync_time().await,
             Venue::Bybit(c) => c.sync_time().await,
             Venue::Aster(_) => Ok(()),
+            Venue::Okx(c) => c.sync_time().await,
         }
     }
     async fn place(
@@ -491,6 +493,7 @@ impl Venue {
             Venue::Binance(c) => c.place(local, symbol, side, qty, price).await,
             Venue::Bybit(c) => c.place(local, symbol, side, qty, price).await,
             Venue::Aster(c) => c.place(local, symbol, side, qty, price).await,
+            Venue::Okx(c) => c.place(local, symbol, side, qty, price).await,
         }
     }
     async fn query(&self, symbol: &str, id: &str) -> Result<OrderState, String> {
@@ -498,6 +501,7 @@ impl Venue {
             Venue::Binance(c) => c.query(symbol, id).await,
             Venue::Bybit(c) => c.query(symbol, id).await,
             Venue::Aster(c) => c.query(symbol, id).await,
+            Venue::Okx(c) => c.query(symbol, id).await,
         }
     }
     async fn cancel(&self, symbol: &str, id: &str) -> Result<OrderState, String> {
@@ -505,6 +509,7 @@ impl Venue {
             Venue::Binance(c) => c.cancel(symbol, id).await,
             Venue::Bybit(c) => c.cancel(symbol, id).await,
             Venue::Aster(c) => c.cancel(symbol, id).await,
+            Venue::Okx(c) => c.cancel(symbol, id).await,
         }
     }
     fn perp(&self) -> bool {
@@ -512,6 +517,7 @@ impl Venue {
             Venue::Binance(c) => c.perp,
             Venue::Bybit(c) => c.category == "linear",
             Venue::Aster(c) => c.perp,
+            Venue::Okx(c) => c.perp,
         }
     }
     async fn positions(&self) -> Result<Vec<(String, f64, f64)>, String> {
@@ -519,6 +525,7 @@ impl Venue {
             Venue::Binance(c) => c.positions().await,
             Venue::Bybit(c) => c.positions().await,
             Venue::Aster(c) => c.positions().await,
+            Venue::Okx(c) => c.positions().await,
         }
     }
     async fn set_leverage(&self, symbol: &str, lev: f64) -> Result<(), String> {
@@ -526,20 +533,25 @@ impl Venue {
             Venue::Binance(c) => c.set_leverage(symbol, lev).await,
             Venue::Bybit(c) => c.set_leverage(symbol, lev).await,
             Venue::Aster(c) => c.set_leverage(symbol, lev).await,
+            Venue::Okx(c) => c.set_leverage(symbol, lev).await,
         }
     }
     async fn networks(&self, coin: &str) -> Result<Vec<crate::transfer::Net>, String> {
         match self {
             Venue::Binance(c) => c.networks(coin).await,
             Venue::Bybit(c) => c.networks(coin).await,
-            Venue::Aster(_) => Err("Aster: переводы в Rust-бэкенде не поддерживаются".into()),
+            Venue::Aster(_) | Venue::Okx(_) => {
+                Err("переводы с этой биржи в Rust-бэкенде не поддерживаются".into())
+            }
         }
     }
     async fn deposit_address(&self, coin: &str, net: &str) -> Result<(String, String), String> {
         match self {
             Venue::Binance(c) => c.deposit_address(coin, net).await,
             Venue::Bybit(c) => c.deposit_address(coin, net).await,
-            Venue::Aster(_) => Err("Aster: переводы в Rust-бэкенде не поддерживаются".into()),
+            Venue::Aster(_) | Venue::Okx(_) => {
+                Err("переводы с этой биржи в Rust-бэкенде не поддерживаются".into())
+            }
         }
     }
     async fn withdraw(
@@ -553,7 +565,9 @@ impl Venue {
         match self {
             Venue::Binance(c) => c.withdraw(coin, net, address, tag, amount).await,
             Venue::Bybit(c) => c.withdraw(coin, net, address, tag, amount).await,
-            Venue::Aster(_) => Err("Aster: переводы в Rust-бэкенде не поддерживаются".into()),
+            Venue::Aster(_) | Venue::Okx(_) => {
+                Err("переводы с этой биржи в Rust-бэкенде не поддерживаются".into())
+            }
         }
     }
     async fn balances(&self) -> Result<std::collections::BTreeMap<String, f64>, String> {
@@ -561,6 +575,7 @@ impl Venue {
             Venue::Binance(c) => c.balances().await,
             Venue::Bybit(c) => c.balances().await,
             Venue::Aster(c) => c.balances().await,
+            Venue::Okx(c) => c.balances().await,
         }
     }
 }
@@ -695,6 +710,7 @@ impl Venue {
             }
             Venue::Binance(_) => Ok(crate::signed::ws_api_url(testnet)),
             Venue::Bybit(_) => Ok(crate::bybit_api::private_url(testnet)),
+            Venue::Okx(_) => Ok(crate::okx_api::private_url(testnet)),
             Venue::Aster(c) => {
                 let k = c
                     .listen_key(reqwest::Method::POST)
@@ -715,6 +731,7 @@ impl Venue {
                 vec![c.ws_request(sub, "userDataStream.subscribe.signature")]
             }
             Venue::Bybit(c) => vec![c.auth_message()],
+            Venue::Okx(c) => vec![c.login()],
             _ => Vec::new(),
         }
     }
@@ -723,6 +740,7 @@ impl Venue {
     fn stream_ping(&self) -> Option<String> {
         match self {
             Venue::Bybit(_) => Some(r#"{"op":"ping"}"#.into()),
+            Venue::Okx(_) => Some("ping".into()),
             _ => None,
         }
     }
@@ -766,6 +784,59 @@ impl Venue {
                     }
                     None => StreamMsg::Ignore,
                 },
+            },
+            Venue::Okx(c) => match v["event"].as_str() {
+                Some("login") if v["code"] == "0" => StreamMsg::Send(c.subscribe()),
+                Some("login") | Some("error") => {
+                    StreamMsg::Fail(format!("OKX {}: {}", v["code"], v["msg"]))
+                }
+                Some("subscribe") => StreamMsg::Ready,
+                Some(_) => StreamMsg::Ignore,
+                None => {
+                    let data: Vec<serde_json::Value> =
+                        v["data"].as_array().cloned().unwrap_or_default();
+                    match v["arg"]["channel"].as_str() {
+                        Some("orders") => {
+                            let states: Vec<(u64, OrderState)> = data
+                                .iter()
+                                .filter_map(|o| {
+                                    let local =
+                                        o["clOrdId"].as_str()?.strip_prefix("hft")?.parse().ok()?;
+                                    Some((local, c.order_state(o)))
+                                })
+                                .collect();
+                            StreamMsg::Apply(Box::new(move |l: &mut Live| {
+                                l.stream_events += 1;
+                                for (local, st) in &states {
+                                    l.on_state(*local, st);
+                                }
+                            }))
+                        }
+                        Some("account") => {
+                            let b = data
+                                .first()
+                                .map(|d| crate::okx_api::parse_balances(d, c.perp))
+                                .unwrap_or_default();
+                            StreamMsg::Apply(Box::new(move |l: &mut Live| {
+                                l.stream_events += 1;
+                                for (a, f) in &b {
+                                    l.ledger.set_balance(a, *f);
+                                }
+                            }))
+                        }
+                        Some("positions") => {
+                            let ps: Vec<(String, f64, f64)> =
+                                data.iter().filter_map(|p| c.position(p)).collect();
+                            StreamMsg::Apply(Box::new(move |l: &mut Live| {
+                                l.stream_events += 1;
+                                for (s, q, e) in &ps {
+                                    l.ledger.set_position(s, *q, *e);
+                                }
+                            }))
+                        }
+                        _ => StreamMsg::Ignore,
+                    }
+                }
             },
             Venue::Binance(c) if !c.perp => {
                 if v.get("event").is_some() {

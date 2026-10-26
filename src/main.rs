@@ -15,6 +15,7 @@ mod feed;
 mod leadlag;
 mod live;
 mod market;
+mod okx_api;
 mod paper;
 mod perparb;
 mod rest;
@@ -25,6 +26,7 @@ mod spread;
 mod statarb;
 mod state;
 mod transfer;
+mod util;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

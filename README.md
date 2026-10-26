@@ -99,6 +99,10 @@
   кошельком-агентом — `ASTER_API_KEY` = адрес основного кошелька (user), `ASTER_API_SECRET` = приватный ключ агента
   (signer, без права вывода); nonce в микросекундах, монотонно. События счёта — поток по listenKey
   (`ASTER_STREAM_URL` — свой адрес). Переводов между биржами с Aster нет.
+- **Реальные ордера OKX** (спот и перпы SWAP): подпись Base64(HMAC-SHA256(время ISO + метод + путь + тело)) в
+  заголовках OK-ACCESS-*, ключи `OKX_API_KEY`/`_SECRET` и `OKX_PASSPHRASE` (testnet — `OKX_TESTNET_*`, демо-торговля
+  заголовком x-simulated-trading); перпы — tdMode=cross, объём в контрактах (монеты / ctVal, вниз до lotSz). Приватный
+  поток: login, каналы orders, account, positions (`OKX_WS_PRIVATE_URL` — свой адрес).
 - **Перпы (USDT)** — параметр `market=perp`, плечо — `leverage`. Бумага: лонг и шорт, изолированная маржа, комиссии
   перпов из каталога, funding по ставке биржи в момент списания (ставки — Binance `/fapi/v1/premiumIndex`, Bybit
   `/v5/market/tickers`, раз в 30 с; видны в `/market` как `funding_проц`), ликвидация при марже ниже 0.5% объёма.

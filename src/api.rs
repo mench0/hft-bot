@@ -1338,6 +1338,226 @@ mod tests {
         call(&r, "POST", "/control/stop", "").await;
     }
 
+    /// Живые перпы OKX против макета: подпись OK-ACCESS-SIGN каждого запроса, демо-заголовок, размеры контрактов,
+    /// объём ордера в контрактах (монеты / ctVal), вход в приватный поток (подпись login), события orders и positions.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_okx_perp_against_mock() {
+        use axum::http::HeaderMap;
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::Mutex;
+        use tokio_tungstenite::tungstenite::Message;
+        const SECRET: &str = "okx-secret";
+        #[derive(Default)]
+        struct Ex {
+            orders: Vec<Value>,
+            leverage: Vec<Value>,
+            bad: u32,
+            pos: f64,
+        }
+        let ex = Arc::new(Mutex::new(Ex::default()));
+        // подпись: время + метод + путь_с_query + тело; ключ, passphrase и демо-заголовок
+        fn ok(h: &HeaderMap, method: &str, path: &str, body: &str) -> bool {
+            let g = |k: &str| {
+                h.get(k)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_owned()
+            };
+            g("ok-access-key") == "okx-key"
+                && g("ok-access-passphrase") == "pass"
+                && g("x-simulated-trading") == "1"
+                && crate::util::hmac_b64(
+                    SECRET,
+                    &format!("{}{method}{path}{body}", g("ok-access-timestamp")),
+                ) == g("ok-access-sign")
+        }
+        use axum::extract::OriginalUri;
+        let (e1, e2, e3, e4, e5) = (ex.clone(), ex.clone(), ex.clone(), ex.clone(), ex.clone());
+        let rest = Router::new()
+            .route("/api/v5/public/instruments", get(|| async { Json(json!({"code": "0", "data": [{"instId": "BTC-USDT-SWAP", "ctType": "linear", "ctVal": "0.01", "lotSz": "1"}]})) }))
+            .route("/api/v5/public/funding-rate", get(|| async { Json(json!({"code": "0", "data": [{"fundingRate": "0.0001", "fundingTime": "9999999999999"}]})) }))
+            .route("/api/v5/account/balance", get(move |h: HeaderMap, u: OriginalUri| async move {
+                if !ok(&h, "GET", &u.0.to_string(), "") { e1.lock().unwrap().bad += 1; }
+                Json(json!({"code": "0", "data": [{"details": [{"ccy": "USDT", "availBal": "900", "availEq": "1000"}]}]}))
+            }))
+            .route("/api/v5/account/positions", get(move |h: HeaderMap, u: OriginalUri| async move {
+                let mut x = e2.lock().unwrap();
+                if !ok(&h, "GET", &u.0.to_string(), "") { x.bad += 1; }
+                Json(json!({"code": "0", "data": [{"instId": "BTC-USDT-SWAP", "pos": format!("{}", x.pos), "avgPx": "100", "posSide": "net"}]}))
+            }))
+            .route("/api/v5/account/set-leverage", axum::routing::post(move |h: HeaderMap, body: String| async move {
+                let mut x = e3.lock().unwrap();
+                if !ok(&h, "POST", "/api/v5/account/set-leverage", &body) { x.bad += 1; }
+                x.leverage.push(serde_json::from_str(&body).unwrap());
+                Json(json!({"code": "0", "data": [{}]}))
+            }))
+            .route("/api/v5/trade/order", axum::routing::post(move |h: HeaderMap, body: String| async move {
+                let mut x = e4.lock().unwrap();
+                if !ok(&h, "POST", "/api/v5/trade/order", &body) { x.bad += 1; }
+                let b: Value = serde_json::from_str(&body).unwrap();
+                let id = format!("o{}", x.orders.len());
+                let c: f64 = b["sz"].as_str().unwrap().parse().unwrap();
+                x.pos += if b["side"] == "sell" { -c } else { c };
+                x.orders.push(b);
+                Json(json!({"code": "0", "data": [{"ordId": id, "sCode": "0"}]}))
+            }).get(move |h: HeaderMap, u: OriginalUri| async move {
+                let x = e5.lock().unwrap();
+                let _ = ok(&h, "GET", &u.0.to_string(), "");
+                let id = u.0.query().unwrap_or("").split('&').find_map(|kv| kv.strip_prefix("ordId=")).unwrap_or("").to_owned();
+                let n: usize = id.trim_start_matches('o').parse().unwrap_or(0);
+                let c = x.orders.get(n).map(|o| o["sz"].as_str().unwrap().to_owned()).unwrap_or_default();
+                Json(json!({"code": "0", "data": [{"instId": "BTC-USDT-SWAP", "ordId": id, "state": "filled", "accFillSz": c, "avgPx": "100"}]}))
+            }));
+        let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let raddr = rl.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(rl, rest).await.unwrap() });
+        // публичный стакан SWAP (объём — контракты)
+        let wl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let waddr = wl.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = wl.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            for i in 1..500u64 {
+                let m = format!(
+                    r#"{{"arg":{{"channel":"books","instId":"BTC-USDT-SWAP"}},"action":"snapshot","data":[{{"bids":[["99.9","10000","0","1"]],"asks":[["100","10000","0","1"]],"seqId":{i}}}]}}"#
+                );
+                if ws.send(Message::text(m)).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        // приватный поток: проверить login, ответить, принять подписку, слать события
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let login_ok = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lo = login_ok.clone();
+        let pl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let paddr = pl.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = pl.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let Some(Ok(Message::Text(t))) = ws.next().await else {
+                return;
+            };
+            let v: Value = serde_json::from_str(&t).unwrap();
+            let a = &v["args"][0];
+            let good = v["op"] == "login"
+                && a["apiKey"] == "okx-key"
+                && a["passphrase"] == "pass"
+                && crate::util::hmac_b64(
+                    SECRET,
+                    &format!("{}GET/users/self/verify", a["timestamp"].as_str().unwrap()),
+                ) == a["sign"].as_str().unwrap();
+            lo.store(good, std::sync::atomic::Ordering::SeqCst);
+            ws.send(Message::text(
+                json!({"event": "login", "code": if good { "0" } else { "60009" }, "msg": ""})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+            let Some(Ok(Message::Text(t))) = ws.next().await else {
+                return;
+            };
+            let v: Value = serde_json::from_str(&t).unwrap();
+            assert_eq!(
+                v["args"].as_array().unwrap().len(),
+                3,
+                "orders, account, positions"
+            );
+            ws.send(Message::text(
+                json!({"event": "subscribe", "arg": {"channel": "orders"}}).to_string(),
+            ))
+            .await
+            .unwrap();
+            while let Some(e) = ev_rx.recv().await {
+                if ws.send(Message::text(e)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        // SAFETY: эти переменные задаёт только этот тест
+        unsafe {
+            std::env::set_var("OKX_WS_PRIVATE_URL", format!("ws://{paddr}"));
+            std::env::set_var("OKX_TESTNET_API_KEY", "okx-key");
+            std::env::set_var("OKX_TESTNET_API_SECRET", SECRET);
+            std::env::set_var("OKX_TESTNET_PASSPHRASE", "pass");
+        }
+        let (_d, r) = app("");
+        let sel = format!(
+            "/control/select?exchange=okx&symbols=BTCUSDT&market=perp&leverage=3&testnet=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
+        );
+        assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
+        call(&r, "POST", "/control/start", "").await;
+        call(&r, "POST", "/trading/start", "").await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (_, b) = call(&r, "GET", "/balances?exchange=okx", "").await;
+            let (_, s) = call(&r, "GET", "/status", "").await;
+            let (_, m) = call(&r, "GET", "/market?exchange=okx", "").await;
+            if b["свободно"]["USDT"] == json!(1000.0)
+                && s["okx"]["поток_событий_счёта"] == json!(true)
+                && m["BTCUSDT"]["лучший_бид"].is_number()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "баланс или поток: {b} {s}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            login_ok.load(std::sync::atomic::Ordering::SeqCst),
+            "подпись входа верна"
+        );
+        // шорт 0.5 BTC = 50 контрактов по 0.01
+        let (c, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=okx&symbol=BTCUSDT&side=SELL&type=MARKET&qty=0.5",
+            "",
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (_, a) = call(&r, "GET", "/status", "").await;
+            if a["okx"]["тестовый_счёт"]["positions"][0]["qty"] == json!(-0.5) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < until, "шорт не учтён: {a}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        {
+            let x = ex.lock().unwrap();
+            assert_eq!(x.orders[0]["sz"], json!("50"), "объём в контрактах");
+            assert_eq!(
+                (
+                    x.orders[0]["tdMode"].as_str(),
+                    x.orders[0]["ordType"].as_str()
+                ),
+                (Some("cross"), Some("market"))
+            );
+            assert_eq!(x.leverage[0]["lever"], json!("3"));
+        }
+        // позиция закрыта на бирже — событие positions
+        ev_tx.send(json!({"arg": {"channel": "positions", "instType": "SWAP"}, "data": [{"instId": "BTC-USDT-SWAP", "pos": "0", "avgPx": "", "posSide": "net"}]}).to_string()).unwrap();
+        let until = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let (_, a) = call(&r, "GET", "/status", "").await;
+            if a["okx"]["тестовый_счёт"]["positions"] == json!([]) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "событие не учтено: {a}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(ex.lock().unwrap().bad, 0, "все подписи REST верны");
+        call(&r, "POST", "/control/stop", "").await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn live_perp_flow_against_mock_binance_futures() {
         use axum::extract::RawQuery;
