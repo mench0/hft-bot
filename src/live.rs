@@ -670,37 +670,141 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Поток событий счёта через WebSocket API: подписка userDataStream.subscribe.signature, события executionReport и
-/// outboundAccountPosition; при обрыве — переподключение с паузой 0.5 → 30 с (пока нет потока — частый опрос).
+/// Что сделать с сообщением приватного потока.
+pub enum StreamMsg {
+    Ignore,
+    /// Вход и подписка подтверждены — события пойдут.
+    Ready,
+    /// Отправить ответ (подписка после входа).
+    Send(String),
+    Fail(String),
+    /// Применить событие к живому счёту.
+    Apply(Box<dyn FnOnce(&mut Live) + Send>),
+}
+
+impl Venue {
+    /// Адрес приватного потока (для потоков по listenKey — с новым ключом).
+    async fn stream_url(&self, testnet: bool) -> Result<String, String> {
+        match self {
+            Venue::Binance(c) if c.perp => {
+                let k = c
+                    .listen_key(reqwest::Method::POST)
+                    .await
+                    .map_err(|e| format!("listenKey: {e}"))?;
+                Ok(format!("{}/{k}", crate::signed::fstream_url(testnet)))
+            }
+            Venue::Binance(_) => Ok(crate::signed::ws_api_url(testnet)),
+            Venue::Bybit(_) => Ok(crate::bybit_api::private_url(testnet)),
+            Venue::Aster(c) => {
+                let k = c
+                    .listen_key(reqwest::Method::POST)
+                    .await
+                    .map_err(|e| format!("listenKey: {e}"))?;
+                Ok(format!(
+                    "{}/{k}",
+                    crate::aster_api::stream_url(c.perp, testnet)
+                ))
+            }
+        }
+    }
+
+    /// Сообщения сразу после подключения (вход, подписка); пусто — поток готов сразу (listenKey).
+    fn stream_hello(&self, sub: &str) -> Vec<String> {
+        match self {
+            Venue::Binance(c) if !c.perp => {
+                vec![c.ws_request(sub, "userDataStream.subscribe.signature")]
+            }
+            Venue::Bybit(c) => vec![c.auth_message()],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Пинг приложения раз в 20 с.
+    fn stream_ping(&self) -> Option<String> {
+        match self {
+            Venue::Bybit(_) => Some(r#"{"op":"ping"}"#.into()),
+            _ => None,
+        }
+    }
+
+    /// Продлить listenKey (раз в 30 мин).
+    async fn keepalive(&self) -> Result<(), String> {
+        match self {
+            Venue::Binance(c) if c.perp => c.listen_key(reqwest::Method::PUT).await.map(|_| ()),
+            Venue::Aster(c) => c.listen_key(reqwest::Method::PUT).await.map(|_| ()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Разбор сообщения приватного потока.
+    fn stream_parse(&self, text: &str, sub: &str) -> StreamMsg {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+            return StreamMsg::Ignore;
+        };
+        match self {
+            Venue::Bybit(c) => match v["op"].as_str() {
+                // перпам — ещё позиции
+                Some("auth") if v["success"] == true => {
+                    StreamMsg::Send(if c.category == "linear" {
+                        r#"{"op":"subscribe","args":["order","wallet","position"]}"#.into()
+                    } else {
+                        r#"{"op":"subscribe","args":["order","wallet"]}"#.into()
+                    })
+                }
+                Some("auth") => {
+                    StreamMsg::Fail(format!("вход в приватный поток отклонён: {}", v["ret_msg"]))
+                }
+                Some("subscribe") if v["success"] == true => StreamMsg::Ready,
+                Some("subscribe") => StreamMsg::Fail(format!(
+                    "подписка на события счёта отклонена: {}",
+                    v["ret_msg"]
+                )),
+                _ => match v["topic"].as_str() {
+                    Some(t) => {
+                        let t = t.to_owned();
+                        StreamMsg::Apply(Box::new(move |l: &mut Live| l.on_bybit(&t, &v["data"])))
+                    }
+                    None => StreamMsg::Ignore,
+                },
+            },
+            Venue::Binance(c) if !c.perp => {
+                if v.get("event").is_some() {
+                    StreamMsg::Apply(Box::new(move |l: &mut Live| l.on_event(&v["event"])))
+                } else if v["id"] == sub {
+                    if v["status"] == 200 {
+                        StreamMsg::Ready
+                    } else {
+                        StreamMsg::Fail(format!(
+                            "подписка на события счёта отклонена: {}",
+                            v["error"]
+                        ))
+                    }
+                } else {
+                    StreamMsg::Ignore
+                }
+            }
+            // потоки по listenKey: события сразу в формате Binance
+            _ if v["e"] == "listenKeyExpired" => StreamMsg::Fail("listenKey истёк".into()),
+            _ => StreamMsg::Apply(Box::new(move |l: &mut Live| l.on_event(&v))),
+        }
+    }
+}
+
+/// Приватный поток событий счёта: подключение, вход и подписка (по бирже), пинги, события в учёт; при обрыве —
+/// переподключение с паузой 0.5 → 30 с (пока нет потока — частый опрос).
 async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
     let mut backoff = crate::feed::Backoff::default();
     let mut seq = 0u64;
-    // поток по listenKey (без подписки): перпы Binance и Aster (спот и перпы)
-    let fstream = matches!(venue.as_ref(), Venue::Binance(c) if c.perp)
-        || matches!(venue.as_ref(), Venue::Aster(_));
     loop {
-        // перпы Binance: поток по listenKey (без подписки), ключ продлевается каждые 30 мин
-        let url = match venue.as_ref() {
-            Venue::Binance(c) if c.perp => match c.listen_key(reqwest::Method::POST).await {
-                Ok(k) => format!("{}/{k}", crate::signed::fstream_url(testnet)),
-                Err(e) => {
-                    with_live(&acc, &ex, |l| l.error = format!("listenKey: {e}"));
-                    tokio::time::sleep(backoff.next()).await;
-                    continue;
-                }
-            },
-            Venue::Aster(c) => match c.listen_key(reqwest::Method::POST).await {
-                Ok(k) => format!("{}/{k}", crate::aster_api::stream_url(c.perp, testnet)),
-                Err(e) => {
-                    with_live(&acc, &ex, |l| l.error = format!("listenKey: {e}"));
-                    tokio::time::sleep(backoff.next()).await;
-                    continue;
-                }
-            },
-            Venue::Binance(_) => crate::signed::ws_api_url(testnet),
-            Venue::Bybit(_) => crate::bybit_api::private_url(testnet),
+        let url = match venue.stream_url(testnet).await {
+            Ok(u) => u,
+            Err(e) => {
+                with_live(&acc, &ex, |l| l.error = e);
+                tokio::time::sleep(backoff.next()).await;
+                continue;
+            }
         };
         let mut pings = 0u32;
         let err = match tokio_tungstenite::connect_async(url.as_str()).await {
@@ -712,112 +816,57 @@ async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) 
                 );
                 seq += 1;
                 let sub = format!("sub{seq}");
-                let req = match venue.as_ref() {
-                    Venue::Binance(c) if c.perp => None,
-                    Venue::Aster(_) => None,
-                    Venue::Binance(c) => {
-                        Some(c.ws_request(&sub, "userDataStream.subscribe.signature"))
-                    }
-                    Venue::Bybit(c) => Some(c.auth_message()),
+                let hello = venue.stream_hello(&sub);
+                let mut err = String::new();
+                let ready = |acc: &Shared| {
+                    tracing::info!("[{ex}] поток событий счёта подключён");
+                    with_live(acc, &ex, |l| l.stream_ok = true);
                 };
-                let mut err = match req {
-                    Some(r) => ws
-                        .send(Message::text(r))
-                        .await
-                        .err()
-                        .map(|e| e.to_string())
-                        .unwrap_or_default(),
-                    None => {
-                        tracing::info!("[{ex}] поток событий счёта перпов подключён");
-                        backoff.reset();
-                        with_live(&acc, &ex, |l| l.stream_ok = true);
-                        String::new()
+                if hello.is_empty() {
+                    backoff.reset();
+                    ready(&acc);
+                }
+                for m in hello {
+                    if let Err(e) = ws.send(Message::text(m)).await {
+                        err = e.to_string();
                     }
-                };
+                }
                 while err.is_empty() {
                     let msg = tokio::select! {
                         m = ws.next() => m,
                         _ = ping.tick() => {
                             pings += 1;
-                            match venue.as_ref() {
-                                Venue::Bybit(_) => {
-                                    err = ws.send(Message::text(r#"{"op":"ping"}"#)).await.err().map(|e| e.to_string()).unwrap_or_default();
-                                }
-                                Venue::Binance(c) if c.perp && pings.is_multiple_of(90) => {
-                                    if let Err(e) = c.listen_key(reqwest::Method::PUT).await {
-                                        tracing::warn!("[{ex}] listenKey не продлён: {e}");
-                                    }
-                                }
-                                Venue::Aster(c) if pings.is_multiple_of(90) => {
-                                    if let Err(e) = c.listen_key(reqwest::Method::PUT).await {
-                                        tracing::warn!("[{ex}] listenKey не продлён: {e}");
-                                    }
-                                }
-                                _ => {}
+                            if let Some(p) = venue.stream_ping() {
+                                err = ws.send(Message::text(p)).await.err().map(|e| e.to_string()).unwrap_or_default();
+                            }
+                            if pings.is_multiple_of(90)
+                                && let Err(e) = venue.keepalive().await
+                            {
+                                tracing::warn!("[{ex}] listenKey не продлён: {e}");
                             }
                             continue;
                         }
                     };
                     match msg {
-                        Some(Ok(Message::Text(t))) => {
-                            let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) else {
-                                continue;
-                            };
-                            if let Venue::Bybit(_) = venue.as_ref() {
-                                match v["op"].as_str() {
-                                    Some("auth") if v["success"] == true => {
-                                        let sub = r#"{"op":"subscribe","args":["order","wallet"]}"#;
-                                        err = ws
-                                            .send(Message::text(sub))
-                                            .await
-                                            .err()
-                                            .map(|e| e.to_string())
-                                            .unwrap_or_default();
-                                    }
-                                    Some("auth") => {
-                                        err = format!(
-                                            "вход в приватный поток отклонён: {}",
-                                            v["ret_msg"]
-                                        )
-                                    }
-                                    Some("subscribe") if v["success"] == true => {
-                                        tracing::info!("[{ex}] поток событий счёта подключён");
-                                        backoff.reset();
-                                        with_live(&acc, &ex, |l| l.stream_ok = true);
-                                    }
-                                    Some("subscribe") => {
-                                        err = format!(
-                                            "подписка на события счёта отклонена: {}",
-                                            v["ret_msg"]
-                                        )
-                                    }
-                                    _ => {
-                                        if let Some(topic) = v["topic"].as_str() {
-                                            with_live(&acc, &ex, |l| l.on_bybit(topic, &v["data"]));
-                                        }
-                                    }
-                                }
-                            } else if fstream {
-                                if v["e"] == "listenKeyExpired" {
-                                    err = "listenKey истёк".into();
-                                } else {
-                                    with_live(&acc, &ex, |l| l.on_event(&v));
-                                }
-                            } else if let Some(e) = v.get("event") {
-                                with_live(&acc, &ex, |l| l.on_event(e));
-                            } else if v["id"] == sub.as_str() {
-                                if v["status"] == 200 {
-                                    tracing::info!("[{ex}] поток событий счёта подключён");
-                                    backoff.reset();
-                                    with_live(&acc, &ex, |l| l.stream_ok = true);
-                                } else {
-                                    err = format!(
-                                        "подписка на события счёта отклонена: {}",
-                                        v["error"]
-                                    );
-                                }
+                        Some(Ok(Message::Text(t))) => match venue.stream_parse(&t, &sub) {
+                            StreamMsg::Ignore => {}
+                            StreamMsg::Ready => {
+                                backoff.reset();
+                                ready(&acc);
                             }
-                        }
+                            StreamMsg::Send(m) => {
+                                err = ws
+                                    .send(Message::text(m))
+                                    .await
+                                    .err()
+                                    .map(|e| e.to_string())
+                                    .unwrap_or_default()
+                            }
+                            StreamMsg::Fail(e) => err = e,
+                            StreamMsg::Apply(f) => {
+                                with_live(&acc, &ex, f);
+                            }
+                        },
                         Some(Ok(Message::Ping(p))) => {
                             let _ = ws.send(Message::Pong(p)).await;
                         }
