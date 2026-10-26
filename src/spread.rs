@@ -11,6 +11,7 @@
 
 use crate::book::Book;
 use crate::paper::{Amount, Exec, Limits, Paper, Side};
+use crate::rest::Filter;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -33,6 +34,11 @@ pub struct Params {
     pub min_book_levels: usize,
     pub max_drop_percent: f64,
     pub max_top_changes_per_sec: f64,
+    pub min_trade_minutes: f64,
+    pub min_minute_volume_multiple: f64,
+    pub min_spread_presence_percent: f64,
+    pub jump_ticks: f64,
+    pub max_jumps_per_min: usize,
 }
 
 impl Params {
@@ -55,6 +61,11 @@ impl Params {
             min_book_levels: f("scMinBookLevels", 0.0) as usize,
             max_drop_percent: f("scMaxDropPercent", 0.0),
             max_top_changes_per_sec: f("scMaxTopChangesPerSec", 0.0),
+            min_trade_minutes: f("scMinTradeMinutes", 0.0),
+            min_minute_volume_multiple: f("scMinMinuteVolumeMultiple", 0.0),
+            min_spread_presence_percent: f("scMinSpreadPresencePercent", 0.0),
+            jump_ticks: f("scJumpTicks", 0.0),
+            max_jumps_per_min: f("scMaxJumpsPerMin", 6.0) as usize,
         }
     }
 }
@@ -86,7 +97,17 @@ struct State {
     pnl: f64,
     trades: u64,
     last_step: Option<Instant>,
-    mids: VecDeque<(Instant, f64)>,
+    /// Середина цены и «спред после комиссий был достаточным» по шагам (15 минут).
+    mids: VecDeque<(Instant, f64, bool)>,
+    /// Когда начали следить (первую минуту постоянство спреда не оценивается).
+    since: Option<Instant>,
+    flow: Option<String>,
+    trade_minutes: Option<usize>,
+    minute_volume: Option<f64>,
+    presence: Option<f64>,
+    jumps: u64,
+    jump_ts: VecDeque<Instant>,
+    jump_pause_until: Option<Instant>,
     last_top: (f64, f64),
     top_changes: u32,
     top_window: Option<Instant>,
@@ -211,6 +232,8 @@ impl SpreadCapture {
     }
 
     /// Один шаг по символу (вызывается часто: смены лучшей цены считаются на каждом шаге, заявки — раз в requote).
+    /// `minutes` — оборот последних закрытых минут (None — свечей нет или устарели), `filter` — правила пары.
+    #[allow(clippy::too_many_arguments)]
     pub fn step(
         &mut self,
         sym: &str,
@@ -219,6 +242,8 @@ impl SpreadCapture {
         p: &Params,
         lim: &Limits,
         now: Instant,
+        minutes: Option<&[f64]>,
+        filter: Option<Filter>,
     ) {
         self.absorb(&paper.execs.clone());
         let ready =
@@ -260,8 +285,10 @@ impl SpreadCapture {
         }
         let edge = (ask - bid) / mid * 100.0 - 2.0 * self.maker * 100.0;
         let s = self.states.get_mut(sym).unwrap();
-        s.market = market_issue(s, p, mid, now);
+        s.since.get_or_insert(now);
+        s.market = market_issue(s, p, mid, now, edge >= p.min_edge_percent);
         s.thin = thin_book(b, p, bid, ask);
+        s.flow = flow_issue(s, p, minutes, now);
         if edge < p.min_edge_percent {
             s.decision = format!(
                 "заявки сняты: спред после комиссий {edge:.3}% < {:.3}%",
@@ -270,13 +297,14 @@ impl SpreadCapture {
             self.cancel_quotes(paper, sym);
             return;
         }
-        let qty = p.order_quote / mid;
+        let qty = filter.map_or(p.order_quote / mid, |f| f.round_qty(p.order_quote / mid));
         let quote = crate::paper::split(sym).map(|x| x.1).unwrap_or_default();
         let s = &self.states[sym];
         let held = s.bid.map_or(0.0, |q| q.qty * q.price);
         let want_bid = qty > 0.0
             && s.thin.is_none()
             && s.market.is_none()
+            && s.flow.is_none()
             && s.inv * mid + qty * bid <= p.max_inventory_quote + 1e-9
             && paper.free(&quote) + held >= qty * bid * (1.0 + self.maker);
         let decision = if want_bid {
@@ -287,6 +315,7 @@ impl SpreadCapture {
                 s.thin
                     .clone()
                     .or_else(|| s.market.clone())
+                    .or_else(|| s.flow.clone())
                     .unwrap_or_else(|| "лимит купленного или нет денег".into())
             )
         };
@@ -297,18 +326,85 @@ impl SpreadCapture {
             0.0
         };
         self.states.get_mut(sym).unwrap().decision = decision;
-        self.requote(paper, sym, Side::Buy, want_bid, bid, qty, b, lim);
+        // перебить чужую лучшую цену на scJumpTicks шагов, если спред после этого ещё достаточный и нет ценовой войны
+        let step = self.jump_step(sym, p, filter, bid, ask, mid, now);
+        let (bid_px, ask_base) = (bid + step, ask - step);
+        let cur_bid = self.states[sym].bid.map(|q| q.price);
+        if step > 0.0 && want_bid && cur_bid != Some(bid_px) {
+            self.count_jump(sym, p, now);
+        }
+        self.requote(paper, sym, Side::Buy, want_bid, bid_px, qty, b, lim);
         let ask_qty = if inv <= qty * 1.5 { inv } else { qty };
+        let ask_px = ask_base.max(floor);
+        let cur_ask = self.states[sym].ask.map(|q| q.price);
+        if step > 0.0 && ask_qty > 0.0 && ask_px == ask_base && cur_ask != Some(ask_px) {
+            self.count_jump(sym, p, now);
+        }
         self.requote(
             paper,
             sym,
             Side::Sell,
             ask_qty > 0.0,
-            ask.max(floor),
+            ask_px,
             ask_qty,
             b,
             lim,
         );
+    }
+
+    /// На сколько сдвинуть цену от чужой лучшей: scJumpTicks шагов цены, если шаг известен, нет паузы после
+    /// ценовой войны, заявки не сходятся и спред после сдвига минус две комиссии мейкера ≥ scMinEdgePercent; иначе 0.
+    #[allow(clippy::too_many_arguments)]
+    fn jump_step(
+        &self,
+        sym: &str,
+        p: &Params,
+        filter: Option<Filter>,
+        bid: f64,
+        ask: f64,
+        mid: f64,
+        now: Instant,
+    ) -> f64 {
+        let tick = filter.map_or(0.0, |f| f.tick);
+        if p.jump_ticks <= 0.0
+            || tick <= 0.0
+            || self.states[sym].jump_pause_until.is_some_and(|t| now < t)
+        {
+            return 0.0;
+        }
+        let step = p.jump_ticks * tick;
+        if bid + step >= ask - step {
+            return 0.0;
+        }
+        let edge = (ask - bid - 2.0 * step) / mid * 100.0 - 2.0 * self.maker * 100.0;
+        if edge >= p.min_edge_percent {
+            step
+        } else {
+            0.0
+        }
+    }
+
+    /// Учесть перебивание; больше scMaxJumpsPerMin за минуту — ценовая война: минуту не перебивать.
+    fn count_jump(&mut self, sym: &str, p: &Params, now: Instant) {
+        let s = self.states.get_mut(sym).unwrap();
+        s.jumps += 1;
+        s.jump_ts.push_back(now);
+        while s
+            .jump_ts
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(60))
+        {
+            s.jump_ts.pop_front();
+        }
+        if s.jump_ts.len() > p.max_jumps_per_min {
+            s.jump_pause_until = Some(now + Duration::from_secs(60));
+            s.jump_ts.clear();
+            s.decision = format!(
+                "ценовая война: перебиваний больше {} в минуту — минуту встаю в очередь",
+                p.max_jumps_per_min
+            );
+            tracing::info!("[spread-capture] {sym}: {}", s.decision);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -378,7 +474,12 @@ impl SpreadCapture {
             "market": s.market.as_ref().map_or("можно покупать".to_owned(), |m| format!("{m} — только продажа")),
             "topChangesPerSec": (s.top_per_sec * 10.0).round() / 10.0,
             "decision": s.decision,
-            "bidQueue": queue_json(&s.q_bid), "askQueue": queue_json(&s.q_ask), "jumps": 0,
+            "bidQueue": queue_json(&s.q_bid), "askQueue": queue_json(&s.q_ask), "jumps": s.jumps,
+            "jumpPauseSec": s.jump_pause_until.filter(|t| *t > Instant::now()).map(|t| (t - Instant::now()).as_secs()),
+            "flow": s.flow.as_ref().map_or("сделки и спред в порядке".to_owned(), |f| format!("{f} — только продажа")),
+            "tradeMinutes": s.trade_minutes.map(|n| format!("{n} из 5")),
+            "minuteVolume": s.minute_volume.map(f64::round),
+            "spreadPresencePercent": s.presence.map(f64::round),
         })).collect();
         json!({
             "enabled": enabled, "makerFeePercent": self.maker * 100.0,
@@ -441,12 +542,18 @@ fn count_top(s: &mut State, bid: f64, ask: f64, now: Instant) {
 }
 
 /// Падение цены за 15 минут и конкуренция; None — можно покупать.
-fn market_issue(s: &mut State, p: &Params, mid: f64, now: Instant) -> Option<String> {
-    s.mids.push_back((now, mid));
+fn market_issue(
+    s: &mut State,
+    p: &Params,
+    mid: f64,
+    now: Instant,
+    spread_ok: bool,
+) -> Option<String> {
+    s.mids.push_back((now, mid, spread_ok));
     while s
         .mids
         .front()
-        .is_some_and(|(t, _)| now.duration_since(*t) > Duration::from_secs(900))
+        .is_some_and(|(t, _, _)| now.duration_since(*t) > Duration::from_secs(900))
     {
         s.mids.pop_front();
     }
@@ -471,6 +578,62 @@ fn market_issue(s: &mut State, p: &Params, mid: f64, now: Instant) -> Option<Str
         ));
     }
     None
+}
+
+/// Сделки по минутным свечам (идут каждую минуту, оборот) и постоянство спреда за 5 минут; None — в порядке.
+/// Нет свечей — сделки не проверяются (как в Java: проверка только при данных).
+fn flow_issue(s: &mut State, p: &Params, minutes: Option<&[f64]>, now: Instant) -> Option<String> {
+    let mut issue = None;
+    match minutes.filter(|v| !v.is_empty()) {
+        Some(v) => {
+            let last = &v[v.len().saturating_sub(5)..];
+            let with = last.iter().filter(|x| **x > 0.0).count();
+            let avg = last.iter().map(|x| x.max(0.0)).sum::<f64>() / last.len() as f64;
+            s.trade_minutes = Some(with);
+            s.minute_volume = Some(avg);
+            let need = (p.min_trade_minutes.round() as usize).min(last.len());
+            if p.min_trade_minutes > 0.0 && with < need {
+                issue = Some(format!(
+                    "сделки идут не каждую минуту: {with} из {} мин (порог {need})",
+                    last.len()
+                ));
+            } else if p.min_minute_volume_multiple > 0.0
+                && avg < p.min_minute_volume_multiple * p.order_quote
+            {
+                issue = Some(format!(
+                    "мало сделок: оборот {avg:.0} в минуту < {:.0} ({} заявки)",
+                    p.min_minute_volume_multiple * p.order_quote,
+                    p.min_minute_volume_multiple
+                ));
+            }
+        }
+        None => {
+            s.trade_minutes = None;
+            s.minute_volume = None;
+        }
+    }
+    let recent: Vec<bool> = s
+        .mids
+        .iter()
+        .filter(|x| now.duration_since(x.0) <= Duration::from_secs(300))
+        .map(|x| x.2)
+        .collect();
+    s.presence = (!recent.is_empty())
+        .then(|| recent.iter().filter(|x| **x).count() as f64 * 100.0 / recent.len() as f64);
+    let warmed = s
+        .since
+        .is_some_and(|t| now.duration_since(t) >= Duration::from_secs(60));
+    if issue.is_none()
+        && warmed
+        && p.min_spread_presence_percent > 0.0
+        && let Some(pr) = s.presence.filter(|pr| *pr < p.min_spread_presence_percent)
+    {
+        issue = Some(format!(
+            "спред непостоянный: достаточный {pr:.0}% времени за 5 мин (порог {:.0}%)",
+            p.min_spread_presence_percent
+        ));
+    }
+    issue
 }
 
 /// Ликвиден ли стакан: в полосе от лучших цен не меньше уровней и глубины; None — ликвиден.
@@ -541,7 +704,7 @@ mod tests {
         let p = params();
         let t = Instant::now();
         let b = book(99.0, 101.0, 1);
-        sc.step("XYZUSDT", Some(&b), &mut paper, &p, &lim(), t);
+        sc.step("XYZUSDT", Some(&b), &mut paper, &p, &lim(), t, None, None);
         let s = &sc.states["XYZUSDT"];
         assert_eq!(s.bid.map(|q| q.price), Some(99.0), "{}", s.decision);
         assert!(s.ask.is_none(), "без купленного продажи нет");
@@ -555,6 +718,8 @@ mod tests {
             &p,
             &lim(),
             t + Duration::from_millis(1),
+            None,
+            None,
         );
         let s = &sc.states["XYZUSDT"];
         assert!((s.inv - 20.0 / 100.0).abs() < 1e-9 && (s.avg - 99.0 * 1.001).abs() < 1e-9);
@@ -571,6 +736,8 @@ mod tests {
             &p,
             &lim(),
             t + Duration::from_millis(2),
+            None,
+            None,
         );
         let ask = sc.states["XYZUSDT"].ask.unwrap().price;
         paper.match_resting("XYZUSDT", &book(ask + 1.0, ask + 1.5, 4), &lim());
@@ -581,6 +748,8 @@ mod tests {
             &p,
             &lim(),
             t + Duration::from_millis(3),
+            None,
+            None,
         );
         let s = &sc.states["XYZUSDT"];
         assert_eq!(s.trades, 1);
@@ -600,6 +769,8 @@ mod tests {
             &p,
             &lim(),
             t,
+            None,
+            None,
         );
         assert_eq!(paper.open_orders(), 1);
         sc.step(
@@ -609,6 +780,8 @@ mod tests {
             &p,
             &lim(),
             t + Duration::from_millis(1),
+            None,
+            None,
         );
         assert_eq!(
             paper.open_orders(),
@@ -623,6 +796,8 @@ mod tests {
             &p,
             &lim(),
             t + Duration::from_millis(2),
+            None,
+            None,
         );
         paper.match_resting("XYZUSDT", &book(97.0, 98.0, 4), &lim());
         sc.step(
@@ -632,6 +807,8 @@ mod tests {
             &p,
             &lim(),
             t + Duration::from_millis(3),
+            None,
+            None,
         );
         let s = &sc.states["XYZUSDT"];
         assert_eq!(s.inv, 0.0);
@@ -652,8 +829,142 @@ mod tests {
             &p,
             &lim(),
             Instant::now(),
+            None,
+            None,
         );
         assert_eq!(paper.open_orders(), 0);
         assert!(sc.states["XYZUSDT"].decision.contains("уровней"));
+    }
+
+    fn filt() -> Option<Filter> {
+        Some(Filter {
+            tick: 0.01,
+            step: 0.0001,
+            min_qty: 0.0001,
+            min_notional: 1.0,
+        })
+    }
+
+    #[test]
+    fn jump_one_tick_and_price_war_pause() {
+        let mut paper = Paper::new(&["XYZUSDT".into()], 1000.0, 0.1, 0.1);
+        paper.set_filters(&HashMap::from([("XYZUSDT".to_owned(), filt().unwrap())]));
+        let mut sc = SpreadCapture::new(0.1);
+        let mut p = params();
+        p.jump_ticks = 1.0;
+        p.max_jumps_per_min = 3;
+        let t = Instant::now();
+        sc.step(
+            "XYZUSDT",
+            Some(&book(99.0, 101.0, 1)),
+            &mut paper,
+            &p,
+            &lim(),
+            t,
+            None,
+            filt(),
+        );
+        assert_eq!(
+            sc.states["XYZUSDT"].bid.map(|q| q.price),
+            Some(99.01),
+            "покупка на тик выше чужой лучшей"
+        );
+        // чужая лучшая цена каждый раз выше нашей — перебиваем, пока не началась война
+        for i in 0..5u64 {
+            let our = sc.states["XYZUSDT"].bid.unwrap().price;
+            sc.step(
+                "XYZUSDT",
+                Some(&book(our + 0.01, 101.0, 2 + i)),
+                &mut paper,
+                &p,
+                &lim(),
+                t + Duration::from_millis(1 + i),
+                None,
+                filt(),
+            );
+        }
+        let s = &sc.states["XYZUSDT"];
+        assert!(
+            s.jump_pause_until.is_some_and(|u| u > t),
+            "ценовая война — пауза"
+        );
+        let before = s.bid.unwrap().price;
+        sc.step(
+            "XYZUSDT",
+            Some(&book(before + 0.01, 101.0, 20)),
+            &mut paper,
+            &p,
+            &lim(),
+            t + Duration::from_millis(10),
+            None,
+            filt(),
+        );
+        assert!(
+            (sc.states["XYZUSDT"].bid.unwrap().price - (before + 0.01)).abs() < 1e-9,
+            "в паузе встаёт в очередь, не перебивает"
+        );
+        // узкий спред — перебивать нельзя: встаёт по лучшей цене
+        let mut sc2 = SpreadCapture::new(0.1);
+        let mut paper2 = Paper::new(&["XYZUSDT".into()], 1000.0, 0.1, 0.1);
+        sc2.step(
+            "XYZUSDT",
+            Some(&book(100.0, 100.31, 1)),
+            &mut paper2,
+            &p,
+            &lim(),
+            t,
+            None,
+            filt(),
+        );
+        assert_eq!(sc2.states["XYZUSDT"].bid.map(|q| q.price), Some(100.0));
+    }
+
+    #[test]
+    fn minute_trades_check() {
+        let mut paper = Paper::new(&["XYZUSDT".into()], 1000.0, 0.1, 0.1);
+        let mut sc = SpreadCapture::new(0.1);
+        let mut p = params();
+        p.min_trade_minutes = 4.0;
+        p.min_minute_volume_multiple = 2.0;
+        let t = Instant::now();
+        sc.step(
+            "XYZUSDT",
+            Some(&book(99.0, 101.0, 1)),
+            &mut paper,
+            &p,
+            &lim(),
+            t,
+            Some(&[100.0, 0.0, 0.0, 100.0, 100.0]),
+            None,
+        );
+        assert!(
+            sc.states["XYZUSDT"].decision.contains("не каждую минуту"),
+            "{}",
+            sc.states["XYZUSDT"].decision
+        );
+        assert_eq!(paper.open_orders(), 0);
+        sc.step(
+            "XYZUSDT",
+            Some(&book(99.0, 101.0, 2)),
+            &mut paper,
+            &p,
+            &lim(),
+            t + Duration::from_millis(1),
+            Some(&[10.0; 5]),
+            None,
+        );
+        assert!(sc.states["XYZUSDT"].decision.contains("мало сделок"));
+        sc.step(
+            "XYZUSDT",
+            Some(&book(99.0, 101.0, 3)),
+            &mut paper,
+            &p,
+            &lim(),
+            t + Duration::from_millis(2),
+            Some(&[100.0; 5]),
+            None,
+        );
+        assert_eq!(sc.states["XYZUSDT"].decision, "покупаем и продаём");
+        assert_eq!(sc.states["XYZUSDT"].trade_minutes, Some(5));
     }
 }

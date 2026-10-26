@@ -2,6 +2,7 @@
 //! риск-проверки как у Java-бота (торговля включена, размер, проскальзывание, частота, свежесть стакана, дневной убыток).
 
 use crate::book::Book;
+use crate::rest::Filter;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -125,6 +126,8 @@ pub struct Paper {
     /// Исполнения по порядку (стратегии забирают свои по номеру заявки); хранятся последние EXECS_KEEP.
     pub execs: VecDeque<Exec>,
     exec_seq: u64,
+    /// Правила торговли пар (шаг цены и объёма, минимумы); нет — ордер не округляется.
+    filters: HashMap<String, Filter>,
 }
 
 /// Исполнение заявки.
@@ -182,6 +185,7 @@ impl Paper {
             kill_switch: false,
             execs: VecDeque::new(),
             exec_seq: 0,
+            filters: HashMap::new(),
         };
         for s in symbols {
             if let Some((_, q)) = split(s) {
@@ -199,6 +203,18 @@ impl Paper {
         {
             self.free.insert(q, start_balance);
         }
+    }
+
+    /// Задать правила торговли пар.
+    pub fn set_filters(&mut self, f: &HashMap<String, Filter>) {
+        for (k, v) in f {
+            self.filters.insert(k.clone(), *v);
+        }
+    }
+
+    /// Правила торговли пары.
+    pub fn filter(&self, symbol: &str) -> Option<Filter> {
+        self.filters.get(symbol).copied()
     }
 
     /// Свободный баланс актива.
@@ -281,6 +297,8 @@ impl Paper {
         };
         let b = book.expect("проверено в precheck");
         let (best_bid, best_ask) = (b.best_bid().unwrap().0, b.best_ask().unwrap().0);
+        let filter = self.filters.get(&symbol.to_uppercase()).copied();
+        let limit = limit.map(|p| filter.map_or(p, |f| f.round_price(p, side == Side::Sell)));
         let ref_px = limit.unwrap_or(if side == Side::Buy {
             best_ask
         } else {
@@ -306,8 +324,24 @@ impl Paper {
                 }
             }
         };
+        let qty = filter.map_or(qty, |f| f.round_qty(qty));
         if qty.is_nan() || qty <= 0.0 {
             return self.reject("объём должен быть больше нуля".into());
+        }
+        if let Some(f) = filter {
+            if qty < f.min_qty - 1e-12 {
+                return self.reject(format!(
+                    "объём {qty} меньше минимального {} для {symbol}",
+                    f.min_qty
+                ));
+            }
+            if qty * ref_px < f.min_notional - 1e-9 {
+                return self.reject(format!(
+                    "сумма ордера {:.4} меньше минимальной {} для {symbol}",
+                    qty * ref_px,
+                    f.min_notional
+                ));
+            }
         }
         let notional = qty * ref_px;
         if notional > lim.max_order_quote + 1e-9 {
@@ -575,6 +609,10 @@ impl Paper {
         let b = book.filter(|b| b.is_ready()).ok_or("стакан не готов")?;
         let (base, quote) = split(symbol).ok_or_else(|| format!("не разобрать символ {symbol}"))?;
         let qty = qty.min(self.free(&base));
+        let qty = self
+            .filters
+            .get(&symbol.to_uppercase())
+            .map_or(qty, |f| f.round_qty(qty));
         if qty <= 0.0 {
             return Err(format!("нет {base} для продажи"));
         }
@@ -886,5 +924,59 @@ mod tests {
         let a = p.account_json(&mids);
         assert!((a["byQuote"]["USDT"]["pnl"].as_f64().unwrap() - (-0.5)).abs() < 1e-9); // купили по 101, стоит 100.5
         assert_eq!(a["openPositions"], json!(1));
+    }
+
+    #[test]
+    fn filters_round_and_minimums() {
+        let mut p = Paper::new(&["BTCUSDT".into()], 1000.0, 0.1, 0.1);
+        p.set_filters(&HashMap::from([(
+            "BTCUSDT".to_owned(),
+            Filter {
+                tick: 0.5,
+                step: 0.01,
+                min_qty: 0.02,
+                min_notional: 5.0,
+            },
+        )]));
+        let b = book();
+        let f = p
+            .order(
+                "BTCUSDT",
+                Side::Buy,
+                Amount::Qty(0.0667),
+                Some(90.3),
+                Some(&b),
+                &lim(),
+            )
+            .unwrap();
+        assert_eq!(f.status, "NEW");
+        assert!(
+            (p.free("USDT") - (1000.0 - 0.06 * 90.0 * 1.001)).abs() < 1e-9,
+            "объём 0.06, цена 90.0"
+        );
+        assert!(
+            p.order(
+                "BTCUSDT",
+                Side::Buy,
+                Amount::Qty(0.015),
+                None,
+                Some(&b),
+                &lim()
+            )
+            .unwrap_err()
+            .contains("меньше минимального")
+        );
+        assert!(
+            p.order(
+                "BTCUSDT",
+                Side::Buy,
+                Amount::Qty(0.05),
+                Some(90.0),
+                Some(&b),
+                &lim()
+            )
+            .unwrap_err()
+            .contains("сумма ордера")
+        );
     }
 }

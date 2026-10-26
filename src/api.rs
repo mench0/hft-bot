@@ -293,6 +293,9 @@ fn status_json(bot: &Bot) -> Value {
             if !f.last_error.is_empty() {
                 e["ошибка"] = Value::String(f.last_error);
             }
+            if !f.rest_error.is_empty() {
+                e["ошибка_rest"] = Value::String(f.rest_error);
+            }
             if !f.unsupported.is_empty() {
                 e["нет_фида"] = Value::String(f.unsupported);
             }
@@ -845,10 +848,25 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         });
+        // REST биржи: правила пары и оборот минутных свечей
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let rest = Router::new()
+            .route("/api/v3/exchangeInfo", get(|| async { Json(json!({"symbols": [{"symbol": "XYZUSDT", "filters": [
+                {"filterType": "PRICE_FILTER", "tickSize": "0.01"}, {"filterType": "LOT_SIZE", "stepSize": "0.0001", "minQty": "0.0001"},
+                {"filterType": "NOTIONAL", "minNotional": "1"}]}]})) }))
+            .route("/api/v3/klines", get(move || async move {
+                Json(json!((0..6).map(|i| json!([0, "1", "1", "1", "1", "1", now - 60_000 * (6 - i), "500", 5])).collect::<Vec<_>>()))
+            }));
+        let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let raddr = rl.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(rl, rest).await.unwrap() });
         let (_d, r) = app("");
         let sel = format!(
-            "/control/select?exchange=binance&symbols=XYZUSDT&market=spot&wsUrl=ws://{addr}/stream&strategy=spread-capture\
-            &scRequoteMs=200&scStopLossPercent=50&scMaxDropPercent=0&scMinBookLevels=0&scMinDepthMultiple=0&scMaxTopChangesPerSec=0&maxOrdersPerMinute=10000"
+            "/control/select?exchange=binance&symbols=XYZUSDT&market=spot&wsUrl=ws://{addr}/stream&restUrl=http://{raddr}&strategy=spread-capture\
+            &scJumpTicks=1&scMaxJumpsPerMin=600&scMinTradeMinutes=4&scMinMinuteVolumeMultiple=2&scRequoteMs=200&scStopLossPercent=50&scMaxDropPercent=0&scMinBookLevels=0&scMinDepthMultiple=0&scMaxTopChangesPerSec=0&maxOrdersPerMinute=10000"
         );
         assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
         call(&r, "POST", "/control/start", "").await;
@@ -865,6 +883,8 @@ mod tests {
         };
         assert!(st["pnl"].as_f64().unwrap() > 0.0, "{st}");
         assert_eq!(st["symbols"][0]["symbol"], json!("XYZUSDT"));
+        assert_eq!(st["symbols"][0]["tradeMinutes"], json!("5 из 5"), "{st}");
+        assert!(st["symbols"][0]["jumps"].as_u64().unwrap() > 0, "{st}");
         assert!(!st["symbols"][0]["decision"].as_str().unwrap().is_empty());
         // выключили торговлю — заявки сняты, купленное продано
         call(&r, "POST", "/trading/stop", "").await;

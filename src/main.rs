@@ -10,6 +10,7 @@ mod data;
 mod feed;
 mod market;
 mod paper;
+mod rest;
 mod spread;
 mod state;
 

@@ -423,6 +423,7 @@ impl Bot {
             let Some(paper) = acc.get_mut(&ex) else {
                 continue;
             };
+            paper.set_filters(&self.market.filters(&ex));
             for (sym, b) in &books {
                 if b.is_ready() {
                     paper.match_resting(sym, b, &lim);
@@ -437,7 +438,11 @@ impl Bot {
                 let mine = bound.is_none_or(|ids| ids.is_empty() || ids.contains(spread::ID));
                 let book = books.get(sym);
                 if sp.enabled && lim.trading_enabled && mine {
-                    sc.step(sym, book, paper, &sp, &lim, now);
+                    let minutes =
+                        self.market
+                            .minutes(&ex, sym, std::time::Duration::from_secs(180));
+                    let filter = paper.filter(sym);
+                    sc.step(sym, book, paper, &sp, &lim, now, minutes.as_deref(), filter);
                 } else if sc.active() {
                     sc.stop_symbol(paper, sym, book, "стратегия или торговля выключена");
                 }
@@ -501,7 +506,11 @@ impl Bot {
             return Err(format!("{sym} не выбран на {ex}"));
         }
         let book = self.market.book(ex, &sym);
-        let res = self.accounts.lock().unwrap().get_mut(ex).unwrap().order(
+        let filters = self.market.filters(ex);
+        let mut acc = self.accounts.lock().unwrap();
+        let paper = acc.get_mut(ex).unwrap();
+        paper.set_filters(&filters);
+        let res = paper.order(
             &sym,
             side,
             amount,

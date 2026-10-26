@@ -1,6 +1,7 @@
 //! Рыночные данные всех бирж: стаканы по символам и состояние фидов (подключение, сообщения, ошибки).
 
 use crate::book::Book;
+use crate::rest::Filter;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -19,13 +20,22 @@ pub struct FeedState {
     pub bbo_enabled: bool,
     pub bbo_updates: u64,
     pub stale: u64,
+    /// Ошибка REST (правила пар, свечи); пусто — в порядке.
+    pub rest_error: String,
 }
+
+/// Оборот последних закрытых минут и когда получен.
+type Minutes = (std::time::Instant, Vec<f64>);
 
 /// Стаканы и фиды.
 #[derive(Default)]
 pub struct Market {
     books: Mutex<HashMap<String, HashMap<String, Book>>>,
     feeds: Mutex<BTreeMap<String, FeedState>>,
+    /// Правила торговли пар по биржам.
+    filters: Mutex<HashMap<String, HashMap<String, Filter>>>,
+    /// Оборот последних закрытых минут по (биржа, символ) и когда получен.
+    minutes: Mutex<HashMap<(String, String), Minutes>>,
 }
 
 impl Market {
@@ -63,6 +73,46 @@ impl Market {
     pub fn clear(&self) {
         self.books.lock().unwrap().clear();
         self.feeds.lock().unwrap().clear();
+        self.filters.lock().unwrap().clear();
+        self.minutes.lock().unwrap().clear();
+    }
+
+    /// Запомнить правила пар биржи.
+    pub fn set_filters(&self, ex: &str, f: HashMap<String, Filter>) {
+        self.filters
+            .lock()
+            .unwrap()
+            .entry(ex.to_owned())
+            .or_default()
+            .extend(f);
+    }
+
+    /// Правила пар биржи.
+    pub fn filters(&self, ex: &str) -> HashMap<String, Filter> {
+        self.filters
+            .lock()
+            .unwrap()
+            .get(ex)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Запомнить оборот последних минут.
+    pub fn set_minutes(&self, ex: &str, sym: &str, v: Vec<f64>) {
+        self.minutes.lock().unwrap().insert(
+            (ex.to_owned(), sym.to_owned()),
+            (std::time::Instant::now(), v),
+        );
+    }
+
+    /// Оборот последних минут, если получен не раньше max_age назад.
+    pub fn minutes(&self, ex: &str, sym: &str, max_age: std::time::Duration) -> Option<Vec<f64>> {
+        self.minutes
+            .lock()
+            .unwrap()
+            .get(&(ex.to_owned(), sym.to_owned()))
+            .filter(|(t, _)| t.elapsed() <= max_age)
+            .map(|(_, v)| v.clone())
     }
 
     /// Ответ /market?exchange= в формате Java-бота: символ → лучшие цены, середина, спред, дисбаланс, возраст.
