@@ -5,7 +5,10 @@
 //! (через запятую), `STATE_FILE` (state.json), `RUST_LOG` (info).
 
 mod api;
+mod book;
 mod data;
+mod feed;
+mod market;
 mod state;
 
 use std::net::SocketAddr;
@@ -20,6 +23,7 @@ fn env(key: &str, def: &str) -> String {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = rustls::crypto::ring::default_provider().install_default(); // TLS для wss:// бирж
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),

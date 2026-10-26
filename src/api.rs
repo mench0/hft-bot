@@ -110,15 +110,13 @@ pub fn router(bot: Arc<Bot>, cfg: AdminConfig) -> Router {
             "/exchanges/catalog",
             get(|| async { Json(data::catalog().clone()) }),
         )
-        .route(
-            "/exchanges/request-stats",
-            get(|| async { Json(json!({})) }),
-        )
+        .route("/exchanges/request-stats", get(request_stats))
         .route(
             "/requests/live",
             get(|| async { Json(json!({"ts": now_ms(), "exchanges": {}})) }),
         )
         .route("/discovery", get(discovery))
+        .route("/market", get(market))
         .route("/settings", get(settings).post(settings_update))
         .route(
             "/exchange/params/schema",
@@ -193,14 +191,94 @@ fn control_status_json(bot: &Bot) -> Value {
         "поддерживаемые_биржи": data::exchange_ids(),
         "торговля_включена": trading,
         "убрать": removable,
-        "стакан": {},
+        "стакан": book_feeds(bot),
         "баны": {},
         "только_выход": {},
     })
 }
 
+/// /status в формате Java-бота: признак запуска и по каждой выбранной бирже — подключение, сообщения, символы.
+/// «стакан» в /control/status: откуда идёт стакан подключённых бирж (у Rust-бэкенда — только WebSocket, ордеров пока нет).
+fn book_feeds(bot: &Bot) -> Value {
+    let mut m = Map::new();
+    if bot.running() {
+        for ex in bot.snapshot().selection.keys() {
+            let Some(f) = bot.market.feed(ex).filter(|f| f.unsupported.is_empty()) else {
+                continue;
+            };
+            let feed = if f.connected {
+                "websocket"
+            } else {
+                "нет данных"
+            };
+            m.insert(
+                ex.clone(),
+                json!({"feed": feed, "entries": "ордеров пока нет", "exits": "ордеров пока нет",
+                "restEntriesBlocked": 0, "restExits": 0}),
+            );
+        }
+    }
+    Value::Object(m)
+}
+
+/// /exchanges/request-stats в формате Java: режим, рынок и состояние сокета стакана по подключённым биржам.
+fn request_stats_json(bot: &Bot) -> Value {
+    let mut m = Map::new();
+    if bot.running() {
+        for ex in bot.snapshot().selection.keys() {
+            let Some(f) = bot.market.feed(ex).filter(|f| f.unsupported.is_empty()) else {
+                continue;
+            };
+            let p = bot.params(ex);
+            let testnet = p.get("testnet").and_then(Value::as_bool).unwrap_or(false);
+            m.insert(ex.clone(), json!({
+                "mode": "PAPER",
+                "modeTitle": "Rust-бэкенд: только рыночные данные, ордеров пока нет",
+                "network": if testnet { "TESTNET" } else { "LIVE" },
+                "market": p.get("market").cloned().unwrap_or(Value::Null),
+                "marketData": {"ws": {
+                    "connected": f.connected, "transport": "tokio-tungstenite", "reconnects": f.reconnects,
+                    "lastError": if f.last_error.is_empty() { Value::Null } else { Value::String(f.last_error.clone()) },
+                    "bboEnabled": f.bbo_enabled, "bboUpdates": f.bbo_updates, "bboStale": f.stale,
+                }},
+            }));
+        }
+    }
+    Value::Object(m)
+}
+
+async fn request_stats(State(a): State<App>) -> Json<Value> {
+    Json(request_stats_json(&a.bot))
+}
+
 fn status_json(bot: &Bot) -> Value {
-    json!({"бот_запущен": bot.running()})
+    let mut m = Map::new();
+    m.insert("бот_запущен".into(), Value::Bool(bot.running()));
+    if bot.running() {
+        for ex in bot.snapshot().selection.keys() {
+            let f = bot.market.feed(ex).unwrap_or_default();
+            let trading = bot
+                .params(ex)
+                .get("tradingEnabled")
+                .cloned()
+                .unwrap_or(Value::Bool(false));
+            let mut e = json!({
+                "торговля_включена": trading,
+                "подключение": f.connected,
+                "получено_сообщений": f.messages,
+                "переподключений": f.reconnects,
+                "символы": f.symbols,
+            });
+            if !f.last_error.is_empty() {
+                e["ошибка"] = Value::String(f.last_error);
+            }
+            if !f.unsupported.is_empty() {
+                e["нет_фида"] = Value::String(f.unsupported);
+            }
+            m.insert(ex.clone(), e);
+        }
+    }
+    Value::Object(m)
 }
 
 fn discovery_json(_bot: &Bot) -> Value {
@@ -217,7 +295,7 @@ fn topic_json(bot: &Bot, topic: &str) -> Option<Value> {
     Some(match topic {
         "/control/status" => control_status_json(bot),
         "/status" => status_json(bot),
-        "/exchanges/request-stats" => json!({}),
+        "/exchanges/request-stats" => request_stats_json(bot),
         "/discovery" => discovery_json(bot),
         _ => return None,
     })
@@ -235,6 +313,14 @@ async fn status(State(a): State<App>) -> Json<Value> {
 
 async fn discovery(State(a): State<App>) -> Json<Value> {
     Json(discovery_json(&a.bot))
+}
+
+async fn market(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiError> {
+    let ex = need(&q, "exchange")?;
+    if !a.bot.running() {
+        return Err(bad("Соединения не подняты"));
+    }
+    Ok(Json(a.bot.market.market_json(ex)))
 }
 
 /// Параметры из строки запроса без служебных ключей.
@@ -300,7 +386,7 @@ async fn deselect(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiE
 async fn start(State(a): State<App>) -> Result<Json<Value>, ApiError> {
     a.bot.start().map_err(bad)?;
     Ok(ok(
-        "Соединения подняты (Rust-каркас: подключений к биржам ещё нет)",
+        "Соединения подняты: стаканы по WebSocket (ордеров в Rust-бэкенде пока нет)",
     ))
 }
 

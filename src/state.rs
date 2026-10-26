@@ -2,11 +2,15 @@
 //! Хранится в JSON-файле (запись через временный файл и rename — файл не бывает наполовину записан).
 
 use crate::data;
+use crate::feed;
+use crate::market::Market;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use tokio::task::JoinHandle;
 
 /// Сохраняемая часть состояния.
 #[derive(Default, Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -33,6 +37,10 @@ pub struct Bot {
     saved: Mutex<Saved>,
     running: Mutex<bool>,
     path: PathBuf,
+    /// Стаканы и состояние фидов.
+    pub market: Arc<Market>,
+    /// Задачи фидов по биржам (пока соединения подняты).
+    feeds: Mutex<HashMap<String, JoinHandle<()>>>,
 }
 
 impl Bot {
@@ -55,6 +63,8 @@ impl Bot {
             saved: Mutex::new(saved),
             running: Mutex::new(false),
             path,
+            market: Arc::default(),
+            feeds: Mutex::default(),
         };
         bot.persist();
         bot
@@ -137,6 +147,7 @@ impl Bot {
         }
         tracing::info!("Биржа {ex} выбрана с символами {symbols:?}");
         self.persist();
+        self.restart_feed(ex);
         Ok(())
     }
 
@@ -155,6 +166,7 @@ impl Bot {
             Self::bind(&mut s, ex, std::slice::from_ref(&sym), strategy);
         }
         self.persist();
+        self.restart_feed(ex); // соединения подняты — подписаться на новую монету сразу
         Ok(())
     }
 
@@ -171,6 +183,7 @@ impl Bot {
             Self::unbind(&mut s, ex, &sym);
         }
         self.persist();
+        self.restart_feed(ex);
         Ok(())
     }
 
@@ -255,7 +268,7 @@ impl Bot {
         Ok(())
     }
 
-    /// Поднять соединения. Подключения к биржам в Rust-бэкенде ещё нет — меняется только признак.
+    /// Поднять соединения: фиды рыночных данных по выбранным биржам (ордеров пока нет).
     pub fn start(&self) -> ActionResult<()> {
         if self
             .saved
@@ -267,19 +280,71 @@ impl Bot {
         {
             return Err("Не выбрано ни одной монеты — выберите их в «Торговле»".into());
         }
-        let mut r = self.running.lock().unwrap();
-        if *r {
-            return Err("Бот уже запущен".into());
+        {
+            let mut r = self.running.lock().unwrap();
+            if *r {
+                return Err("Бот уже запущен".into());
+            }
+            *r = true;
         }
-        *r = true;
-        tracing::info!("Соединения подняты (каркас: подключения к биржам ещё нет)");
+        let exchanges: Vec<String> = self
+            .saved
+            .lock()
+            .unwrap()
+            .selection
+            .keys()
+            .cloned()
+            .collect();
+        for ex in &exchanges {
+            self.restart_feed(ex);
+        }
+        tracing::info!("Соединения подняты: {exchanges:?}");
         Ok(())
     }
 
-    /// Остановить соединения.
+    /// Остановить соединения: фиды снимаются, стаканы забываются.
     pub fn stop(&self) {
         *self.running.lock().unwrap() = false;
+        for (_, t) in self.feeds.lock().unwrap().drain() {
+            t.abort();
+        }
+        self.market.clear();
         tracing::info!("Соединения остановлены");
+    }
+
+    /// Перезапустить фид биржи с текущими монетами и параметрами (соединения не подняты — ничего).
+    fn restart_feed(&self, ex: &str) {
+        if !self.running() {
+            return;
+        }
+        if let Some(t) = self.feeds.lock().unwrap().remove(ex) {
+            t.abort();
+        }
+        let symbols = self
+            .saved
+            .lock()
+            .unwrap()
+            .selection
+            .get(ex)
+            .cloned()
+            .unwrap_or_default();
+        if symbols.is_empty() {
+            self.market.with_feed(ex, |f| *f = Default::default());
+            return;
+        }
+        match feed::start(self.market.clone(), ex, symbols.clone(), &self.params(ex)) {
+            feed::Plan::Run(h) => {
+                self.feeds.lock().unwrap().insert(ex.to_owned(), h);
+            }
+            feed::Plan::Unsupported(why) => {
+                tracing::warn!("{why}");
+                self.market.with_feed(ex, |f| {
+                    f.symbols = symbols;
+                    f.unsupported = why;
+                    f.connected = false;
+                });
+            }
+        }
     }
 }
 
@@ -327,8 +392,8 @@ mod tests {
         assert_eq!(m["tradingEnabled"], Value::Bool(true));
     }
 
-    #[test]
-    fn start_needs_symbols() {
+    #[tokio::test]
+    async fn start_needs_symbols() {
         let (_d, b) = bot();
         assert!(b.start().is_err());
         b.select("bybit", vec!["BTCUSDT".into()], &Map::new(), None)
