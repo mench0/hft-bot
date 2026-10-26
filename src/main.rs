@@ -7,6 +7,7 @@
 mod account;
 mod api;
 mod book;
+mod bybit_api;
 mod data;
 mod feed;
 mod live;

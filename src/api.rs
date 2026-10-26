@@ -914,6 +914,234 @@ mod tests {
 
     /// Живой режим (testnet) против макета REST Binance: макет проверяет подпись каждого запроса, ведёт балансы и
     /// статусы ордеров. Рыночная покупка учитывается, лимитная продажа стоит, паника снимает её на «бирже».
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_testnet_flow_against_mock_bybit() {
+        use axum::http::HeaderMap;
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::Mutex;
+        use tokio_tungstenite::tungstenite::Message;
+        const SECRET: &str = "bybit-secret";
+        #[derive(Default)]
+        struct Ex {
+            usdt: f64,
+            btc: f64,
+            /// номер, orderLinkId, статус, исполнено, сумма
+            orders: Vec<(String, String, String, f64, f64)>,
+            bad_sig: u32,
+        }
+        let ex = Arc::new(Mutex::new(Ex {
+            usdt: 1000.0,
+            ..Default::default()
+        }));
+        // подпись: время + ключ + recvWindow + (строка запроса | тело)
+        fn check(h: &HeaderMap, payload: &str) -> bool {
+            let g = |k: &str| {
+                h.get(k)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_owned()
+            };
+            g("x-bapi-api-key") == "bybit-key"
+                && crate::signed::sign(
+                    SECRET,
+                    &format!(
+                        "{}{}{}{payload}",
+                        g("x-bapi-timestamp"),
+                        "bybit-key",
+                        g("x-bapi-recv-window")
+                    ),
+                ) == g("x-bapi-sign")
+        }
+        let bad = || Json(json!({"retCode": 10004, "retMsg": "sign"}));
+        let (e1, e2, e3) = (ex.clone(), ex.clone(), ex.clone());
+        let rest = Router::new()
+            .route("/v5/market/time", get(|| async { Json(json!({"retCode": 0, "time": now_ms()})) }))
+            .route("/v5/account/wallet-balance", get(move |axum::extract::RawQuery(q): axum::extract::RawQuery, h: HeaderMap| async move {
+                let mut x = e1.lock().unwrap();
+                if !check(&h, &q.unwrap_or_default()) { x.bad_sig += 1; return bad(); }
+                Json(json!({"retCode": 0, "result": {"list": [{"coin": [
+                    {"coin": "USDT", "walletBalance": format!("{}", x.usdt), "locked": "0"},
+                    {"coin": "BTC", "walletBalance": format!("{}", x.btc), "locked": "0"}]}]}}))
+            }))
+            .route("/v5/order/create", axum::routing::post(move |h: HeaderMap, body: String| async move {
+                let mut x = e2.lock().unwrap();
+                if !check(&h, &body) { x.bad_sig += 1; return bad(); }
+                let b: Value = serde_json::from_str(&body).unwrap();
+                let qty: f64 = b["qty"].as_str().unwrap().parse().unwrap();
+                let id = format!("uuid-{}", x.orders.len());
+                let link = b["orderLinkId"].as_str().unwrap().to_owned();
+                if b["orderType"] == "Market" {
+                    assert_eq!(b["marketUnit"], "baseCoin");
+                    x.usdt -= qty * 101.0;
+                    x.btc += qty;
+                    x.orders.push((id.clone(), link, "Filled".into(), qty, qty * 101.0));
+                } else {
+                    x.orders.push((id.clone(), link, "New".into(), 0.0, 0.0));
+                }
+                Json(json!({"retCode": 0, "result": {"orderId": id, "orderLinkId": b["orderLinkId"]}}))
+            }))
+            .route("/v5/order/realtime", get(move |axum::extract::RawQuery(q): axum::extract::RawQuery, h: HeaderMap| async move {
+                let q = q.unwrap_or_default();
+                let x = e3.lock().unwrap();
+                if !check(&h, &q) { return bad(); }
+                let id = q.split('&').find_map(|kv| kv.strip_prefix("orderId=")).unwrap_or("");
+                let list: Vec<Value> = x.orders.iter().filter(|o| o.0 == id).map(|o| json!({"orderId": o.0, "orderLinkId": o.1,
+                    "orderStatus": o.2, "cumExecQty": format!("{}", o.3), "cumExecValue": format!("{}", o.4)})).collect();
+                Json(json!({"retCode": 0, "result": {"list": list}}))
+            }));
+        let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let raddr = rl.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(rl, rest).await.unwrap() });
+        // публичный стакан
+        let wl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let waddr = wl.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = wl.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            for i in 1..500u64 {
+                let m = format!(
+                    r#"{{"topic":"orderbook.50.BTCUSDT","type":"snapshot","data":{{"s":"BTCUSDT","b":[["100","10"]],"a":[["101","10"]],"u":{i},"seq":{i}}}}}"#
+                );
+                if ws.send(Message::text(m)).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        // приватный поток: проверить вход, подписку, затем слать события
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let auth_ok = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let auth_ok2 = auth_ok.clone();
+        let pl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let paddr = pl.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = pl.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let Some(Ok(Message::Text(t))) = ws.next().await else {
+                return;
+            };
+            let v: Value = serde_json::from_str(&t).unwrap();
+            let a = &v["args"];
+            let ok = v["op"] == "auth"
+                && a[0] == "bybit-key"
+                && crate::signed::sign(SECRET, &format!("GET/realtime{}", a[1]))
+                    == a[2].as_str().unwrap();
+            auth_ok2.store(ok, std::sync::atomic::Ordering::SeqCst);
+            ws.send(Message::text(
+                json!({"op": "auth", "success": ok, "ret_msg": ""}).to_string(),
+            ))
+            .await
+            .unwrap();
+            let Some(Ok(Message::Text(t))) = ws.next().await else {
+                return;
+            };
+            let v: Value = serde_json::from_str(&t).unwrap();
+            assert_eq!(v["args"], json!(["order", "wallet"]));
+            ws.send(Message::text(
+                json!({"op": "subscribe", "success": true}).to_string(),
+            ))
+            .await
+            .unwrap();
+            while let Some(e) = ev_rx.recv().await {
+                if ws.send(Message::text(e)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        // SAFETY: только этот тест задаёт эти переменные
+        unsafe {
+            std::env::set_var("BYBIT_WS_PRIVATE_URL", format!("ws://{paddr}"));
+            std::env::set_var("BYBIT_TESTNET_API_KEY", "bybit-key");
+            std::env::set_var("BYBIT_TESTNET_API_SECRET", SECRET);
+        }
+        let (_d, r) = app("");
+        let sel = format!(
+            "/control/select?exchange=bybit&symbols=BTCUSDT&market=spot&testnet=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&spreadCaptureEnabled=false&maxPositionQuote=1000"
+        );
+        assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
+        call(&r, "POST", "/control/start", "").await;
+        call(&r, "POST", "/trading/start", "").await;
+        let (_, rs) = call(&r, "GET", "/exchanges/request-stats", "").await;
+        assert_eq!(rs["bybit"]["mode"], json!("TESTNET"), "{rs}");
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let (c, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=bybit&symbol=BTCUSDT&side=BUY&type=MARKET&qty=1",
+            "",
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (_, b) = call(&r, "GET", "/balances?exchange=bybit", "").await;
+            if b["свободно"]["BTC"] == json!(1.0) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "покупка не учтена: {b}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (_, s) = call(&r, "GET", "/status", "").await;
+            if s["bybit"]["поток_событий_счёта"] == json!(true) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "поток событий не подключён: {s}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            auth_ok.load(std::sync::atomic::Ordering::SeqCst),
+            "подпись входа верна"
+        );
+        let (_, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=bybit&symbol=BTCUSDT&side=BUY&type=LIMIT&qty=1&price=99",
+            "",
+        )
+        .await;
+        assert_eq!(v["статус"], json!("NEW"), "{v}");
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        let (oid, link) = loop {
+            if let Some(o) = ex.lock().unwrap().orders.get(1).cloned() {
+                break (o.0, o.1);
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "лимитная заявка не дошла до биржи"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        // исполнение узнаём из потока (опрос — раз в 5 с, а в мок-REST ордер остаётся New)
+        ev_tx.send(json!({"topic": "order", "data": [{"orderId": oid, "orderLinkId": link, "orderStatus": "Filled",
+            "cumExecQty": "1", "cumExecValue": "99"}]}).to_string()).unwrap();
+        ev_tx.send(json!({"topic": "wallet", "data": [{"coin": [{"coin": "BTC", "walletBalance": "2", "locked": "0"}]}]}).to_string()).unwrap();
+        let until = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let (_, a) = call(&r, "GET", "/status", "").await;
+            let (_, b) = call(&r, "GET", "/balances?exchange=bybit", "").await;
+            if b["свободно"]["BTC"] == json!(2.0)
+                && a["bybit"]["тестовый_счёт"]["openOrders"] == json!(0)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "событие не учтено: {b} {a}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(ex.lock().unwrap().bad_sig, 0, "все подписи REST верны");
+        call(&r, "POST", "/control/stop", "").await;
+    }
+
     #[tokio::test]
     async fn live_testnet_flow_against_mock_binance() {
         use axum::extract::RawQuery;

@@ -156,6 +156,69 @@ impl Client {
     }
 }
 
+impl Client {
+    /// Новый ордер (clientOrderId hft<номер>); ответ RESULT — состояние сразу.
+    pub async fn place(
+        &self,
+        local: u64,
+        symbol: &str,
+        side: crate::paper::Side,
+        qty: f64,
+        price: Option<f64>,
+    ) -> Result<OrderState, String> {
+        let mut p = vec![
+            ("symbol", symbol.to_owned()),
+            (
+                "side",
+                if side == crate::paper::Side::Buy {
+                    "BUY"
+                } else {
+                    "SELL"
+                }
+                .into(),
+            ),
+            (
+                "type",
+                if price.is_some() { "LIMIT" } else { "MARKET" }.into(),
+            ),
+            ("quantity", dec(qty)),
+            ("newClientOrderId", format!("hft{local}")),
+            ("newOrderRespType", "RESULT".into()),
+        ];
+        if let Some(px) = price {
+            p.push(("price", dec(px)));
+            p.push(("timeInForce", "GTC".into()));
+        }
+        OrderState::from(
+            &self
+                .signed(reqwest::Method::POST, "/api/v3/order", &p)
+                .await?,
+        )
+    }
+
+    /// Состояние ордера.
+    pub async fn query(&self, symbol: &str, id: &str) -> Result<OrderState, String> {
+        let p = [("symbol", symbol.to_owned()), ("orderId", id.to_owned())];
+        OrderState::from(
+            &self
+                .signed(reqwest::Method::GET, "/api/v3/order", &p)
+                .await?,
+        )
+    }
+
+    /// Снять ордер; уже исполнен или снят — узнать итог.
+    pub async fn cancel(&self, symbol: &str, id: &str) -> Result<OrderState, String> {
+        let p = [("symbol", symbol.to_owned()), ("orderId", id.to_owned())];
+        match self
+            .signed(reqwest::Method::DELETE, "/api/v3/order", &p)
+            .await
+        {
+            Ok(v) => OrderState::from(&v),
+            Err(_) => self.query(symbol, id).await,
+        }
+    }
+}
+
 /// Адрес WebSocket API Binance (события счёта); переменная BINANCE_WS_API_URL — свой адрес (проверки, прокси).
 pub fn ws_api_url(testnet: bool) -> String {
     std::env::var("BINANCE_WS_API_URL")
@@ -173,7 +236,8 @@ pub fn ws_api_url(testnet: bool) -> String {
 /// Состояние ордера на бирже: статус, исполнено, сумма исполненного в котируемой валюте.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OrderState {
-    pub id: u64,
+    /// Номер ордера на бирже (у Bybit — строка).
+    pub id: String,
     pub status: String,
     pub executed: f64,
     pub quote: f64,
@@ -189,7 +253,8 @@ impl OrderState {
         Ok(OrderState {
             id: v["orderId"]
                 .as_u64()
-                .ok_or_else(|| format!("нет orderId: {v}"))?,
+                .ok_or_else(|| format!("нет orderId: {v}"))?
+                .to_string(),
             status: v["status"].as_str().unwrap_or("").to_owned(),
             executed: n("executedQty"),
             quote: n("cummulativeQuoteQty"),
@@ -241,7 +306,7 @@ mod tests {
         assert_eq!(
             s,
             OrderState {
-                id: 7,
+                id: "7".into(),
                 status: "PARTIALLY_FILLED".into(),
                 executed: 0.5,
                 quote: 50.25

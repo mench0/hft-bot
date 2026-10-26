@@ -377,7 +377,7 @@ impl Bot {
     }
 
     /// Режим счёта биржи по параметрам и ключам, как в Java: paper — бумага; live или testnet с ключами — реальные
-    /// ордера (в Rust пока только Binance спот); иначе — бумага. Возвращает ключи и testnet для живого счёта.
+    /// ордера (в Rust пока Binance и Bybit спот); иначе — бумага. Возвращает ключи и testnet для живого счёта.
     fn live_mode(&self, ex: &str) -> Option<(crate::signed::Keys, bool)> {
         let p = self.params(ex);
         let flag = |k: &str| p.get(k).and_then(Value::as_bool).unwrap_or(false);
@@ -385,9 +385,11 @@ impl Bot {
         if flag("paper") || !(flag("live") || testnet) {
             return None;
         }
-        if ex != "binance" || p.get("market").and_then(Value::as_str) == Some("perp") {
+        if !matches!(ex, "binance" | "bybit")
+            || p.get("market").and_then(Value::as_str) == Some("perp")
+        {
             tracing::warn!(
-                "[{ex}] реальные ордера в Rust-бэкенде пока только для Binance спот — бумажный режим"
+                "[{ex}] реальные ордера в Rust-бэкенде пока только для Binance и Bybit спот — бумажный режим"
             );
             return None;
         }
@@ -423,11 +425,22 @@ impl Bot {
                         .and_then(Value::as_str)
                         .filter(|s| !s.is_empty())
                         .map(str::to_owned)
-                        .unwrap_or_else(|| crate::rest::default_url(false, testnet).to_owned());
+                        .unwrap_or_else(|| {
+                            if ex == "bybit" {
+                                crate::bybit_api::rest_url(testnet)
+                            } else {
+                                crate::rest::default_url(false, testnet)
+                            }
+                            .to_owned()
+                        });
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                     let mode = if testnet { "TESTNET" } else { "LIVE" };
                     tracing::warn!("[{ex}] режим {mode}: ордера пойдут на биржу ({base})");
-                    let client = Arc::new(crate::signed::Client::new(&base, keys));
+                    let client = Arc::new(if ex == "bybit" {
+                        crate::live::Venue::Bybit(crate::bybit_api::Client::new(&base, keys))
+                    } else {
+                        crate::live::Venue::Binance(crate::signed::Client::new(&base, keys))
+                    });
                     tokio::spawn(crate::live::worker(
                         self.accounts.clone(),
                         ex.to_owned(),

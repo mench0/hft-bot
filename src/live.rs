@@ -1,10 +1,10 @@
-//! Живой счёт Binance (спот, основная сеть или testnet). Ордер проверяется теми же правилами, что бумажный,
+//! Живой счёт Binance или Bybit (спот, основная сеть или testnet). Ордер проверяется теми же правилами, что бумажный,
 //! и уходит на биржу в фоновой задаче — движок не ждёт сеть. Статусы своих ордеров опрашиваются раз в 0.5 с,
 //! балансы — раз в 5 с. Исполнения учитываются тем же учётом, что на бумаге (средняя цена, результат, журнал).
 
 use crate::book::Book;
 use crate::paper::{Amount, Fill, Limits, Paper, Side};
-use crate::signed::{Client, OrderState, dec};
+use crate::signed::OrderState;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -31,7 +31,7 @@ struct Order {
     side: Side,
     /// Лимитный ордер — комиссия мейкера (оценка: биржа может взять тейкера, если ордер сразу исполнился).
     maker: bool,
-    exch: Option<u64>,
+    exch: Option<String>,
     executed: f64,
     quote: f64,
     done: bool,
@@ -209,7 +209,9 @@ impl Live {
         if st.executed < o.executed - 1e-12 {
             return; // устаревший ответ (опрос пришёл позже события) — исполнение уже учтено
         }
-        o.exch = Some(st.id);
+        if !st.id.is_empty() {
+            o.exch = Some(st.id.clone());
+        }
         let (dq, dquote) = (st.executed - o.executed, st.quote - o.quote);
         o.executed = st.executed;
         o.quote = st.quote;
@@ -262,7 +264,7 @@ impl Live {
                 self.on_state(
                     local,
                     &OrderState {
-                        id,
+                        id: id.to_string(),
                         status: status.to_owned(),
                         executed: n("z"),
                         quote: n("Z"),
@@ -284,6 +286,32 @@ impl Live {
         }
     }
 
+    /// Событие приватного потока Bybit: order — состояние своих ордеров (orderLinkId hft<номер>), wallet — балансы.
+    pub fn on_bybit(&mut self, topic: &str, data: &serde_json::Value) {
+        self.stream_events += 1;
+        for d in data.as_array().into_iter().flatten() {
+            match topic {
+                "order" => {
+                    let local = d["orderLinkId"]
+                        .as_str()
+                        .and_then(|c| c.strip_prefix("hft"))
+                        .and_then(|x| x.parse::<u64>().ok());
+                    if let (Some(local), Ok(st)) = (local, crate::bybit_api::order_state(d)) {
+                        self.on_state(local, &st);
+                    }
+                }
+                "wallet" => {
+                    for c in d["coin"].as_array().into_iter().flatten() {
+                        if let Some(a) = c["coin"].as_str() {
+                            self.ledger.set_balance(a, crate::bybit_api::free_of(c));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Биржа отказала в ордере.
     pub fn on_error(&mut self, local: u64, err: &str) {
         if let Some(o) = self.orders.get_mut(&local) {
@@ -294,20 +322,20 @@ impl Live {
     }
 
     /// Ордера, которые надо опросить: стоят на бирже (номер известен) и не закончились.
-    fn pending(&self) -> Vec<(u64, String, u64)> {
+    fn pending(&self) -> Vec<(u64, String, String)> {
         self.orders
             .iter()
             .filter(|(_, o)| !o.done)
-            .filter_map(|(id, o)| Some((*id, o.symbol.clone(), o.exch?)))
+            .filter_map(|(id, o)| Some((*id, o.symbol.clone(), o.exch.clone()?)))
             .collect()
     }
 
     /// Снятие запрошено, а номер ордера на бирже уже известен.
-    fn cancel_target(&self, local: u64) -> Option<(String, u64)> {
+    fn cancel_target(&self, local: u64) -> Option<(String, String)> {
         self.orders
             .get(&local)
             .filter(|o| !o.done)
-            .and_then(|o| Some((o.symbol.clone(), o.exch?)))
+            .and_then(|o| Some((o.symbol.clone(), o.exch.clone()?)))
     }
 
     fn wants_cancel(&self, local: u64) -> bool {
@@ -341,23 +369,68 @@ fn with_live<R>(acc: &Shared, ex: &str, f: impl FnOnce(&mut Live) -> R) -> Optio
     }
 }
 
+/// Торговый API биржи для живого счёта.
+pub enum Venue {
+    Binance(crate::signed::Client),
+    Bybit(crate::bybit_api::Client),
+}
+
+impl Venue {
+    async fn sync_time(&self) -> Result<(), String> {
+        match self {
+            Venue::Binance(c) => c.sync_time().await,
+            Venue::Bybit(c) => c.sync_time().await,
+        }
+    }
+    async fn place(
+        &self,
+        local: u64,
+        symbol: &str,
+        side: Side,
+        qty: f64,
+        price: Option<f64>,
+    ) -> Result<OrderState, String> {
+        match self {
+            Venue::Binance(c) => c.place(local, symbol, side, qty, price).await,
+            Venue::Bybit(c) => c.place(local, symbol, side, qty, price).await,
+        }
+    }
+    async fn query(&self, symbol: &str, id: &str) -> Result<OrderState, String> {
+        match self {
+            Venue::Binance(c) => c.query(symbol, id).await,
+            Venue::Bybit(c) => c.query(symbol, id).await,
+        }
+    }
+    async fn cancel(&self, symbol: &str, id: &str) -> Result<OrderState, String> {
+        match self {
+            Venue::Binance(c) => c.cancel(symbol, id).await,
+            Venue::Bybit(c) => c.cancel(symbol, id).await,
+        }
+    }
+    async fn balances(&self) -> Result<std::collections::BTreeMap<String, f64>, String> {
+        match self {
+            Venue::Binance(c) => c.balances().await,
+            Venue::Bybit(c) => c.balances().await,
+        }
+    }
+}
+
 /// Фоновая задача живого счёта: сверка часов, балансы, отправка и снятие ордеров, опрос статусов.
 pub async fn worker(
     acc: Shared,
     ex: String,
-    client: Arc<Client>,
+    client: Arc<Venue>,
     mut rx: mpsc::UnboundedReceiver<Cmd>,
 ) {
     if let Err(e) = client.sync_time().await {
         tracing::warn!("[{ex}] время сервера не получено: {e}");
     }
-    let ws_url =
-        crate::signed::ws_api_url(with_live(&acc, &ex, |l| l.mode == "TESTNET").unwrap_or(false));
+    let testnet = with_live(&acc, &ex, |l| l.mode == "TESTNET").unwrap_or(false);
     let _stream = AbortOnDrop(tokio::spawn(user_stream(
         acc.clone(),
         ex.clone(),
         client.clone(),
-        ws_url,
+        testnet,
     )));
     let mut poll = tokio::time::interval(Duration::from_millis(500));
     let mut n: u64 = 0;
@@ -367,14 +440,7 @@ pub async fn worker(
                 let Some(cmd) = cmd else { return };
                 match cmd {
                     Cmd::Place { local, symbol, side, qty, price } => {
-                        let mut p = vec![("symbol", symbol.clone()), ("side", if side == Side::Buy { "BUY" } else { "SELL" }.into()),
-                            ("type", if price.is_some() { "LIMIT" } else { "MARKET" }.into()), ("quantity", dec(qty)),
-                            ("newClientOrderId", format!("hft{local}")), ("newOrderRespType", "RESULT".into())];
-                        if let Some(px) = price {
-                            p.push(("price", dec(px)));
-                            p.push(("timeInForce", "GTC".into()));
-                        }
-                        let r = client.signed(reqwest::Method::POST, "/api/v3/order", &p).await.and_then(|v| OrderState::from(&v));
+                        let r = client.place(local, &symbol, side, qty, price).await;
                         let cancel_now = with_live(&acc, &ex, |l| match &r {
                             Ok(st) => { l.on_state(local, st); l.wants_cancel(local) }
                             Err(e) => { tracing::warn!("[{ex}] ордер {symbol} отклонён: {e}"); l.on_error(local, e); false }
@@ -396,8 +462,7 @@ pub async fn worker(
                     with_live(&acc, &ex, |l| { l.trim(); l.pending() }).unwrap_or_default()
                 };
                 for (local, symbol, id) in pending {
-                    match client.signed(reqwest::Method::GET, "/api/v3/order", &[("symbol", symbol), ("orderId", id.to_string())]).await
-                        .and_then(|v| OrderState::from(&v)) {
+                    match client.query(&symbol, &id).await {
                         Ok(st) => { with_live(&acc, &ex, |l| l.on_state(local, &st)); }
                         Err(e) => { with_live(&acc, &ex, |l| l.error = e); }
                     }
@@ -424,17 +489,25 @@ impl Drop for AbortOnDrop {
 
 /// Поток событий счёта через WebSocket API: подписка userDataStream.subscribe.signature, события executionReport и
 /// outboundAccountPosition; при обрыве — переподключение с паузой 0.5 → 30 с (пока нет потока — частый опрос).
-async fn user_stream(acc: Shared, ex: String, client: Arc<Client>, url: String) {
+async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
     let mut backoff = crate::feed::Backoff::default();
     let mut seq = 0u64;
+    let url = match venue.as_ref() {
+        Venue::Binance(_) => crate::signed::ws_api_url(testnet),
+        Venue::Bybit(_) => crate::bybit_api::private_url(testnet),
+    };
+    let mut ping = tokio::time::interval(Duration::from_secs(20));
     loop {
         let err = match tokio_tungstenite::connect_async(url.as_str()).await {
             Ok((mut ws, _)) => {
                 seq += 1;
                 let sub = format!("sub{seq}");
-                let req = client.ws_request(&sub, "userDataStream.subscribe.signature");
+                let req = match venue.as_ref() {
+                    Venue::Binance(c) => c.ws_request(&sub, "userDataStream.subscribe.signature"),
+                    Venue::Bybit(c) => c.auth_message(),
+                };
                 let mut err = ws
                     .send(Message::text(req))
                     .await
@@ -442,12 +515,55 @@ async fn user_stream(acc: Shared, ex: String, client: Arc<Client>, url: String) 
                     .map(|e| e.to_string())
                     .unwrap_or_default();
                 while err.is_empty() {
-                    match ws.next().await {
+                    let msg = tokio::select! {
+                        m = ws.next() => m,
+                        _ = ping.tick() => {
+                            if matches!(venue.as_ref(), Venue::Bybit(_)) {
+                                err = ws.send(Message::text(r#"{"op":"ping"}"#)).await.err().map(|e| e.to_string()).unwrap_or_default();
+                            }
+                            continue;
+                        }
+                    };
+                    match msg {
                         Some(Ok(Message::Text(t))) => {
                             let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) else {
                                 continue;
                             };
-                            if let Some(e) = v.get("event") {
+                            if let Venue::Bybit(_) = venue.as_ref() {
+                                match v["op"].as_str() {
+                                    Some("auth") if v["success"] == true => {
+                                        let sub = r#"{"op":"subscribe","args":["order","wallet"]}"#;
+                                        err = ws
+                                            .send(Message::text(sub))
+                                            .await
+                                            .err()
+                                            .map(|e| e.to_string())
+                                            .unwrap_or_default();
+                                    }
+                                    Some("auth") => {
+                                        err = format!(
+                                            "вход в приватный поток отклонён: {}",
+                                            v["ret_msg"]
+                                        )
+                                    }
+                                    Some("subscribe") if v["success"] == true => {
+                                        tracing::info!("[{ex}] поток событий счёта подключён");
+                                        backoff.reset();
+                                        with_live(&acc, &ex, |l| l.stream_ok = true);
+                                    }
+                                    Some("subscribe") => {
+                                        err = format!(
+                                            "подписка на события счёта отклонена: {}",
+                                            v["ret_msg"]
+                                        )
+                                    }
+                                    _ => {
+                                        if let Some(topic) = v["topic"].as_str() {
+                                            with_live(&acc, &ex, |l| l.on_bybit(topic, &v["data"]));
+                                        }
+                                    }
+                                }
+                            } else if let Some(e) = v.get("event") {
                                 with_live(&acc, &ex, |l| l.on_event(e));
                             } else if v["id"] == sub.as_str() {
                                 if v["status"] == 200 {
@@ -489,23 +605,11 @@ async fn user_stream(acc: Shared, ex: String, client: Arc<Client>, url: String) 
 }
 
 /// Снять ордер на бирже; номера ещё нет — снимется, когда ордер встанет (см. Place).
-async fn cancel(acc: &Shared, ex: &str, client: &Client, local: u64) {
+async fn cancel(acc: &Shared, ex: &str, client: &Venue, local: u64) {
     let Some((symbol, id)) = with_live(acc, ex, |l| l.cancel_target(local)).flatten() else {
         return;
     };
-    let p = [("symbol", symbol.clone()), ("orderId", id.to_string())];
-    let r = match client
-        .signed(reqwest::Method::DELETE, "/api/v3/order", &p)
-        .await
-    {
-        Ok(v) => OrderState::from(&v),
-        // уже исполнен или снят — узнать итог
-        Err(_) => client
-            .signed(reqwest::Method::GET, "/api/v3/order", &p)
-            .await
-            .and_then(|v| OrderState::from(&v)),
-    };
-    match r {
+    match client.cancel(&symbol, &id).await {
         Ok(st) => {
             with_live(acc, ex, |l| l.on_state(local, &st));
         }
