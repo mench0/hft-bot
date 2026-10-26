@@ -130,6 +130,10 @@
   (SHA512 параметров) в Authorization; рыночная покупка на сумму (ord_type=price), цена лимита — по tick_size из
   /v1/orderbook/instruments; приватный поток /websocket/v1/private (JWT в рукопожатии) — myOrder и myAsset. Ключи UPBIT_API_KEY/
   UPBIT_API_SECRET. Проверено на заглушках.
+- **Реальные свопы Uniswap V2** (и совместимых: PancakeSwap V2, SushiSwap) через Router02: рыночный и лимитный (как IOC)
+  ордер — своп с защитой по цене (minOut / maxIn, uniSlippagePercent, по умолчанию 0.5 %), approve ровно на сумму,
+  legacy-транзакции EIP-155 (подпись сверена с примером из EIP), итог — по квитанции и разнице балансов. Параметры:
+  restUrl — RPC-узел, uniRouter, uniTokens="WETH=0x…:18;USDC=0x…:6"; ключ — UNISWAPV2_API_SECRET (горячий кошелёк!). Газ — в ETH.
 - **Перпы (USDT)** — параметр `market=perp`, плечо — `leverage`. Бумага: лонг и шорт, изолированная маржа, комиссии
   перпов из каталога, funding по ставке биржи в момент списания (ставки — Binance `/fapi/v1/premiumIndex`, Bybit
   `/v5/market/tickers`, раз в 30 с; видны в `/market` как `funding_проц`), ликвидация при марже ниже 0.5% объёма.

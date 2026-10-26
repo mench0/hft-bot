@@ -496,6 +496,7 @@ pub enum Venue {
     Hyperliquid(crate::hyperliquid_api::Client),
     Lbank(crate::lbank_api::Client),
     Upbit(crate::upbit_api::Client),
+    Uniswap(crate::uniswap_api::Client),
 }
 
 impl Venue {
@@ -512,6 +513,7 @@ impl Venue {
             Venue::Hyperliquid(c) => c.sync_time().await,
             Venue::Lbank(c) => c.sync_time().await,
             Venue::Upbit(c) => c.sync_time().await,
+            Venue::Uniswap(c) => c.sync_time().await,
         }
     }
     async fn place(
@@ -531,6 +533,7 @@ impl Venue {
             Venue::Hyperliquid(c) => c.place(local, symbol, side, qty, price, ref_px).await,
             Venue::Lbank(c) => c.place(local, symbol, side, qty, price, ref_px).await,
             Venue::Upbit(c) => c.place(local, symbol, side, qty, price, ref_px).await,
+            Venue::Uniswap(c) => c.place(local, symbol, side, qty, price).await,
             Venue::Binance(c) => c.place(local, symbol, side, qty, price).await,
             Venue::Bybit(c) => c.place(local, symbol, side, qty, price).await,
             Venue::Aster(c) => c.place(local, symbol, side, qty, price).await,
@@ -550,6 +553,7 @@ impl Venue {
             Venue::Hyperliquid(c) => c.query(symbol, id).await,
             Venue::Lbank(c) => c.query(symbol, id).await,
             Venue::Upbit(c) => c.query(symbol, id).await,
+            Venue::Uniswap(c) => c.query(symbol, id).await,
         }
     }
     async fn cancel(&self, symbol: &str, id: &str) -> Result<OrderState, String> {
@@ -565,6 +569,7 @@ impl Venue {
             Venue::Hyperliquid(c) => c.cancel(symbol, id).await,
             Venue::Lbank(c) => c.cancel(symbol, id).await,
             Venue::Upbit(c) => c.cancel(symbol, id).await,
+            Venue::Uniswap(c) => c.cancel(symbol, id).await,
         }
     }
     fn perp(&self) -> bool {
@@ -578,7 +583,7 @@ impl Venue {
             Venue::Bingx(c) => c.perp,
             Venue::Mexc(c) => c.perp,
             Venue::Hyperliquid(c) => c.perp,
-            Venue::Lbank(_) | Venue::Upbit(_) => false,
+            Venue::Lbank(_) | Venue::Upbit(_) | Venue::Uniswap(_) => false,
         }
     }
     async fn positions(&self) -> Result<Vec<(String, f64, f64)>, String> {
@@ -592,7 +597,7 @@ impl Venue {
             Venue::Bingx(c) => c.positions().await,
             Venue::Mexc(c) => c.positions().await,
             Venue::Hyperliquid(c) => c.positions().await,
-            Venue::Lbank(_) | Venue::Upbit(_) => Ok(Vec::new()),
+            Venue::Lbank(_) | Venue::Upbit(_) | Venue::Uniswap(_) => Ok(Vec::new()),
         }
     }
     async fn set_leverage(&self, symbol: &str, lev: f64) -> Result<(), String> {
@@ -606,7 +611,7 @@ impl Venue {
             Venue::Bingx(c) => c.set_leverage(symbol, lev).await,
             Venue::Mexc(c) => c.set_leverage(symbol, lev).await,
             Venue::Hyperliquid(c) => c.set_leverage(symbol, lev).await,
-            Venue::Lbank(_) | Venue::Upbit(_) => Ok(()),
+            Venue::Lbank(_) | Venue::Upbit(_) | Venue::Uniswap(_) => Ok(()),
         }
     }
     async fn networks(&self, coin: &str) -> Result<Vec<crate::transfer::Net>, String> {
@@ -650,6 +655,7 @@ impl Venue {
             Venue::Hyperliquid(c) => c.balances().await,
             Venue::Lbank(c) => c.balances().await,
             Venue::Upbit(c) => c.balances().await,
+            Venue::Uniswap(c) => c.balances().await,
         }
     }
 }
@@ -676,12 +682,15 @@ pub async fn worker(
         }
     }
     let testnet = with_live(&acc, &ex, |l| l.mode == "TESTNET").unwrap_or(false);
-    let _stream = AbortOnDrop(tokio::spawn(user_stream(
-        acc.clone(),
-        ex.clone(),
-        client.clone(),
-        testnet,
-    )));
+    // Uniswap: потока событий нет — итог свопа известен по квитанции
+    let _stream = (!matches!(client.as_ref(), Venue::Uniswap(_))).then(|| {
+        AbortOnDrop(tokio::spawn(user_stream(
+            acc.clone(),
+            ex.clone(),
+            client.clone(),
+            testnet,
+        )))
+    });
     let mut poll = tokio::time::interval(Duration::from_millis(500));
     let mut n: u64 = 0;
     loop {
@@ -793,6 +802,7 @@ impl Venue {
             Venue::Mexc(c) => c.stream_url().await,
             Venue::Lbank(c) => c.stream_url().await,
             Venue::Upbit(_) => Ok(crate::upbit_api::stream_url()),
+            Venue::Uniswap(_) => Err("у Uniswap нет потока событий".into()),
             Venue::Hyperliquid(_) => Ok(crate::hyperliquid_api::stream_url(testnet)),
             Venue::Aster(c) => {
                 let k = c

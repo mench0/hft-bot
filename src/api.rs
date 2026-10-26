@@ -2008,6 +2008,208 @@ mod tests {
         call(&r, "POST", "/control/stop", "").await;
     }
 
+    /// Живые свопы Uniswap V2 против макета ноды: резервы пула в стакан, approve ровно на нужную сумму, затем
+    /// swapTokensForExactTokens с maxIn = getAmountsIn × 1.005; транзакции подписаны (EIP-155), итог — по балансам.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_uniswap_against_mock() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::Mutex;
+        use tokio_tungstenite::tungstenite::Message;
+        const KEY: &str = "0x4646464646464646464646464646464646464646464646464646464646464646";
+        let router = "0x00000000000000000000000000000000000000f0";
+        let (tx_x, tx_usdc, pair) = (
+            "0x00000000000000000000000000000000000000a1",
+            "0x00000000000000000000000000000000000000a2",
+            "0x00000000000000000000000000000000000000b1",
+        );
+        let me = crate::evm::Wallet::from_hex(KEY).unwrap().address;
+        #[derive(Default)]
+        struct Node {
+            bal: std::collections::HashMap<String, u128>,
+            allowance: u128,
+            pending: Option<(String, String)>,
+            nonce: u128,
+            sent: Vec<String>,
+            bad: u32,
+        }
+        let node = Arc::new(Mutex::new(Node::default()));
+        node.lock()
+            .unwrap()
+            .bal
+            .insert(tx_usdc.into(), 1_000_000_000); // 1000 USDC
+        let n1 = node.clone();
+        let me2 = me.clone();
+        let rpc = Router::new().route(
+            "/",
+            axum::routing::post(move |Json(b): Json<Value>| async move {
+                let mut n = n1.lock().unwrap();
+                let p = &b["params"];
+                let w = |x: u128| format!("{x:064x}");
+                let word = |d: &str, i: usize| {
+                    u128::from_str_radix(&d[8 + 64 * i + 32..8 + 64 * (i + 1)], 16).unwrap()
+                };
+                let r = match b["method"].as_str().unwrap() {
+                    "eth_chainId" => json!("0x1"),
+                    "eth_gasPrice" => json!("0x3b9aca00"),
+                    "eth_estimateGas" => {
+                        n.pending = Some((
+                            p[0]["to"].as_str().unwrap().into(),
+                            p[0]["data"].as_str().unwrap()[2..].into(),
+                        ));
+                        json!("0x30d40")
+                    }
+                    "eth_getTransactionCount" => json!(format!("0x{:x}", n.nonce)),
+                    "eth_getBalance" => json!("0xde0b6b3a7640000"),
+                    "eth_getTransactionReceipt" => json!({"status": "0x1"}),
+                    "eth_sendRawTransaction" => {
+                        let (to, data) = n.pending.take().unwrap();
+                        let w8 = crate::evm::Wallet::from_hex(KEY).unwrap();
+                        let want = crate::uniswap_api::sign_tx(
+                            &w8,
+                            1,
+                            n.nonce,
+                            1_100_000_000,
+                            260_000,
+                            &to,
+                            0,
+                            &hex::decode(&data).unwrap(),
+                        )
+                        .unwrap();
+                        if want != p[0] {
+                            n.bad += 1;
+                        }
+                        n.nonce += 1;
+                        match &data[..8] {
+                            "095ea7b3" => n.allowance = word(&data, 1),
+                            "8803dbee" => {
+                                let (out, max_in) = (word(&data, 0), word(&data, 1));
+                                let need = out / 1_000_000_000_000 * 10_030 / 1000; // 10.03 USDC за X
+                                assert!(need <= max_in && need <= n.allowance);
+                                *n.bal
+                                    .entry("0x00000000000000000000000000000000000000a1".into())
+                                    .or_default() += out;
+                                *n.bal
+                                    .entry("0x00000000000000000000000000000000000000a2".into())
+                                    .or_default() -= need;
+                            }
+                            _ => n.bad += 1,
+                        }
+                        n.sent.push(data[..8].to_owned());
+                        json!(format!("0x{:064x}", n.nonce))
+                    }
+                    "eth_call" => {
+                        let to = p[0]["to"].as_str().unwrap().to_owned();
+                        let d = &p[0]["data"].as_str().unwrap()[2..];
+                        match &d[..8] {
+                            "70a08231" => {
+                                assert!(d.ends_with(&me2[2..]));
+                                json!(format!("0x{}", w(*n.bal.get(&to).unwrap_or(&0))))
+                            }
+                            "dd62ed3e" => json!(format!("0x{}", w(n.allowance))),
+                            "1f00ca74" => {
+                                let out = word(d, 0);
+                                json!(format!(
+                                    "0x{}{}{}{}",
+                                    w(32),
+                                    w(2),
+                                    w(out / 1_000_000_000_000 * 10_030 / 1000),
+                                    w(out)
+                                ))
+                            }
+                            _ => json!("0x"),
+                        }
+                    }
+                    m => panic!("метод {m}"),
+                };
+                Json(json!({"jsonrpc": "2.0", "id": b["id"], "result": r}))
+            }),
+        );
+        let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let raddr = rl.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(rl, rpc).await.unwrap() });
+        // нода по WS для стакана: резервы пула 1000 X / 10000 USDC
+        let wl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let waddr = wl.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = wl.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            while let Some(Ok(Message::Text(t))) = ws.next().await {
+                let v: Value = serde_json::from_str(t.as_str()).unwrap();
+                let r = if v["method"] == "eth_call" {
+                    json!(format!(
+                        "0x{:064x}{:064x}{:064x}",
+                        1000u128 * 10u128.pow(18),
+                        10_000u128 * 10u128.pow(6),
+                        1
+                    ))
+                } else {
+                    json!("0x1")
+                };
+                if ws
+                    .send(Message::text(
+                        json!({"jsonrpc": "2.0", "id": v["id"], "result": r}).to_string(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            loop {
+                let _ = wl.accept().await;
+            }
+        });
+        crate::util::set_env("UNISWAPV2_API_KEY", &me);
+        crate::util::set_env("UNISWAPV2_API_SECRET", KEY);
+        let (_d, r) = app("");
+        let sel = format!(
+            "/control/select?exchange=uniswapv2&symbols=XUSDC&live=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}/&uniRouter={router}&uniTokens=X={tx_x}:18;USDC={tx_usdc}:6&uniPools=XUSDC={pair}:true:18:6&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
+        );
+        assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
+        call(&r, "POST", "/control/start", "").await;
+        call(&r, "POST", "/trading/start", "").await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let (_, b) = call(&r, "GET", "/balances?exchange=uniswapv2", "").await;
+            let (_, m) = call(&r, "GET", "/market?exchange=uniswapv2", "").await;
+            if b["свободно"]["USDC"] == json!(1000.0) && m["XUSDC"]["лучший_аск"].is_number()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "баланс или стакан: {b} {m}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let (c, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=uniswapv2&symbol=XUSDC&side=BUY&type=MARKET&qty=2",
+            "",
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let (_, b) = call(&r, "GET", "/balances?exchange=uniswapv2", "").await;
+            if b["свободно"]["X"].as_f64().unwrap_or(0.0) >= 2.0 - 1e-9 {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < until, "своп не учтён: {b}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let n = node.lock().unwrap();
+        assert_eq!(n.bad, 0, "все транзакции подписаны верно");
+        assert_eq!(n.sent, ["095ea7b3", "8803dbee"]);
+        // approve — на maxIn: 20.06 USDC × 1.005
+        assert_eq!(n.allowance, 20_160_300);
+        assert_eq!(
+            n.bal["0x00000000000000000000000000000000000000a2"],
+            1_000_000_000 - 20_060_000
+        );
+    }
+
     /// Живой спот Upbit за USDT против макета: JWT (HS256, query_hash SHA512) в REST и в рукопожатии потока,
     /// рыночная покупка на сумму, шаг цены лимитного ордера, myOrder по identifier, готовность по {"status":"UP"}.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

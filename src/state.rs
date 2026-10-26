@@ -429,9 +429,10 @@ impl Bot {
                 | "hyperliquid"
                 | "lbank"
                 | "upbit"
+                | "uniswapv2"
         ) {
             tracing::warn!(
-                "[{ex}] реальные ордера в Rust-бэкенде пока только для Binance, Bybit, Aster, OKX, Gate, KuCoin, BingX, MEXC, Hyperliquid, LBank и Upbit (спот и USDT-перпы) — бумажный режим"
+                "[{ex}] реальные ордера в Rust-бэкенде пока только для Binance, Bybit, Aster, OKX, Gate, KuCoin, BingX, MEXC, Hyperliquid, LBank, Upbit и Uniswap V2 (спот и USDT-перпы) — бумажный режим"
             );
             return None;
         }
@@ -447,6 +448,15 @@ impl Bot {
                     "[hyperliquid] HYPERLIQUID_API_KEY — адрес счёта 0x…, HYPERLIQUID_API_SECRET — приватный ключ агента (hex) — бумажный режим"
                 );
                 None
+            }
+            Some(k) if ex == "uniswapv2" => {
+                match uniswap_client(&p, crate::uniswap_api::DEFAULT_RPC, &k.secret) {
+                    Ok(_) => Some((k, testnet)),
+                    Err(e) => {
+                        tracing::warn!("[uniswapv2] {e} — бумажный режим");
+                        None
+                    }
+                }
             }
             Some(k) if ex == "aster" && crate::evm::Wallet::from_hex(&k.secret).is_err() => {
                 tracing::warn!(
@@ -535,6 +545,7 @@ impl Bot {
                                 "hyperliquid" => crate::hyperliquid_api::rest_url(testnet),
                                 "lbank" => crate::lbank_api::REST,
                                 "upbit" => crate::upbit_api::REST,
+                                "uniswapv2" => crate::uniswap_api::DEFAULT_RPC,
                                 _ => crate::rest::default_url(perp, testnet),
                             }
                             .to_owned()
@@ -542,7 +553,12 @@ impl Bot {
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                     let mode = if testnet { "TESTNET" } else { "LIVE" };
                     tracing::warn!("[{ex}] режим {mode}: ордера пойдут на биржу ({base})");
-                    let client = Arc::new(if ex == "upbit" {
+                    let client = Arc::new(if ex == "uniswapv2" {
+                        // параметры проверены в live_mode
+                        crate::live::Venue::Uniswap(
+                            uniswap_client(&p, &base, &keys.secret).expect("параметры Uniswap"),
+                        )
+                    } else if ex == "upbit" {
                         crate::live::Venue::Upbit(crate::upbit_api::Client::new(
                             &base, keys, symbols,
                         ))
@@ -1132,6 +1148,21 @@ impl Bot {
         }
         Ok(())
     }
+}
+
+/// Клиент Uniswap V2 из параметров биржи: uniRouter, uniTokens, uniSlippagePercent (по умолчанию 0.5).
+fn uniswap_client(
+    p: &serde_json::Map<String, Value>,
+    rpc: &str,
+    secret: &str,
+) -> Result<crate::uniswap_api::Client, String> {
+    let s = |k: &str| p.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+    let slip = p
+        .get("uniSlippagePercent")
+        .and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse().ok()))
+        .unwrap_or(0.5);
+    crate::uniswap_api::Client::new(rpc, secret, &s("uniRouter"), &s("uniTokens"), slip)
+        .map_err(|e| e.replace("uniswapv2: ", ""))
 }
 
 #[cfg(test)]
