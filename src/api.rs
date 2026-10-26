@@ -1558,6 +1558,217 @@ mod tests {
         call(&r, "POST", "/control/stop", "").await;
     }
 
+    /// Живой спот Gate против макета: подпись SHA512 каждого запроса, рыночная покупка — сумма в котируемой валюте
+    /// (IOC), подписки потока с подписью, исполнение лимитной заявки из события spot.orders.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_gate_spot_against_mock() {
+        use axum::extract::{OriginalUri, RawQuery};
+        use axum::http::HeaderMap;
+        use futures_util::{SinkExt, StreamExt};
+        use sha2::Digest;
+        use std::sync::Mutex;
+        use tokio_tungstenite::tungstenite::Message;
+        const SECRET: &str = "gate-secret";
+        #[derive(Default)]
+        struct Ex {
+            orders: Vec<Value>,
+            bad: u32,
+            x: f64,
+        }
+        let ex = Arc::new(Mutex::new(Ex::default()));
+        fn ok(h: &HeaderMap, method: &str, path: &str, query: &str, body: &str) -> bool {
+            let g = |k: &str| {
+                h.get(k)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_owned()
+            };
+            let bh = hex::encode(sha2::Sha512::digest(body.as_bytes()));
+            g("key") == "gate-key"
+                && crate::gate_api::hmac512(
+                    SECRET,
+                    &format!("{method}\n{path}\n{query}\n{bh}\n{}", g("timestamp")),
+                ) == g("sign")
+        }
+        let (e1, e2, e3) = (ex.clone(), ex.clone(), ex.clone());
+        let rest = Router::new()
+            .route("/api/v4/spot/accounts", get(move |h: HeaderMap| async move {
+                let mut x = e1.lock().unwrap();
+                if !ok(&h, "GET", "/api/v4/spot/accounts", "", "") { x.bad += 1; }
+                Json(json!([{"currency": "USDT", "available": "1000"}, {"currency": "X", "available": format!("{}", x.x)}]))
+            }))
+            .route("/api/v4/spot/orders", axum::routing::post(move |h: HeaderMap, body: String| async move {
+                let mut x = e2.lock().unwrap();
+                if !ok(&h, "POST", "/api/v4/spot/orders", "", &body) { x.bad += 1; }
+                let b: Value = serde_json::from_str(&body).unwrap();
+                let id = format!("{}", 100 + x.orders.len());
+                x.orders.push(b.clone());
+                if b["type"] == "market" {
+                    let quote: f64 = b["amount"].as_str().unwrap().parse().unwrap();
+                    x.x += quote / 10.0;
+                    Json(json!({"id": id, "text": b["text"], "status": "closed", "finish_as": "filled", "type": "market", "side": "buy",
+                        "amount": b["amount"], "left": "0", "filled_total": format!("{quote}"), "avg_deal_price": "10"}))
+                } else {
+                    Json(json!({"id": id, "text": b["text"], "status": "open", "type": "limit", "side": b["side"], "amount": b["amount"], "left": b["amount"], "filled_total": "0"}))
+                }
+            }))
+            .route("/api/v4/spot/orders/{id}", get(move |h: HeaderMap, u: OriginalUri, RawQuery(q): RawQuery| async move {
+                let q = q.unwrap_or_default();
+                let x = e3.lock().unwrap();
+                let _ = ok(&h, "GET", u.0.path(), &q, "");
+                let id = u.0.path().rsplit('/').next().unwrap().to_owned();
+                let n: usize = id.parse::<usize>().unwrap() - 100;
+                let o = &x.orders[n];
+                Json(json!({"id": id, "text": o["text"], "status": "open", "type": o["type"], "side": o["side"], "amount": o["amount"], "left": o["amount"], "filled_total": "0"}))
+            }));
+        let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let raddr = rl.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(rl, rest).await.unwrap() });
+        let wl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let waddr = wl.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = wl.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            for i in 1..500u64 {
+                let m = format!(
+                    r#"{{"channel":"spot.order_book","event":"update","result":{{"t":1,"lastUpdateId":{i},"s":"X_USDT","bids":[["9.99","100"]],"asks":[["10","100"]]}}}}"#
+                );
+                if ws.send(Message::text(m)).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let subs_ok = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let so = subs_ok.clone();
+        let pl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let paddr = pl.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = pl.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            for _ in 0..2 {
+                let Some(Ok(Message::Text(t))) = ws.next().await else {
+                    return;
+                };
+                let v: Value = serde_json::from_str(&t).unwrap();
+                let ch = v["channel"].as_str().unwrap().to_owned();
+                let good = v["auth"]["KEY"] == "gate-key"
+                    && crate::gate_api::hmac512(
+                        SECRET,
+                        &format!("channel={ch}&event=subscribe&time={}", v["time"]),
+                    ) == v["auth"]["SIGN"].as_str().unwrap();
+                if good {
+                    so.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                ws.send(Message::text(
+                    json!({"channel": ch, "event": "subscribe", "result": {"status": "success"}})
+                        .to_string(),
+                ))
+                .await
+                .unwrap();
+            }
+            while let Some(e) = ev_rx.recv().await {
+                if ws.send(Message::text(e)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        // SAFETY: эти переменные задаёт только этот тест
+        unsafe {
+            std::env::set_var("GATE_WS_PRIVATE_URL", format!("ws://{paddr}"));
+            std::env::set_var("GATE_TESTNET_API_KEY", "gate-key");
+            std::env::set_var("GATE_TESTNET_API_SECRET", SECRET);
+        }
+        let (_d, r) = app("");
+        let sel = format!(
+            "/control/select?exchange=gate&symbols=XUSDT&market=spot&testnet=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
+        );
+        assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
+        call(&r, "POST", "/control/start", "").await;
+        call(&r, "POST", "/trading/start", "").await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (_, b) = call(&r, "GET", "/balances?exchange=gate", "").await;
+            let (_, s) = call(&r, "GET", "/status", "").await;
+            let (_, m) = call(&r, "GET", "/market?exchange=gate", "").await;
+            if b["свободно"]["USDT"] == json!(1000.0)
+                && s["gate"]["поток_событий_счёта"] == json!(true)
+                && m["XUSDT"]["лучший_аск"].is_number()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "баланс, поток или стакан: {b} {s} {m}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            subs_ok.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "подписи подписок верны"
+        );
+        let (c, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=gate&symbol=XUSDT&side=BUY&type=MARKET&qty=2",
+            "",
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        let (_, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=gate&symbol=XUSDT&side=BUY&type=LIMIT&qty=1&price=9.5",
+            "",
+        )
+        .await;
+        assert_eq!(v["статус"], json!("NEW"), "{v}");
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        let (oid, text) = loop {
+            if let Some(o) = ex.lock().unwrap().orders.get(1).cloned() {
+                break ("101".to_string(), o["text"].as_str().unwrap().to_owned());
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "лимитная заявка не дошла"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        {
+            let x = ex.lock().unwrap();
+            let m = &x.orders[0];
+            assert_eq!(
+                (m["type"].as_str(), m["time_in_force"].as_str()),
+                (Some("market"), Some("ioc"))
+            );
+            let quote: f64 = m["amount"].as_str().unwrap().parse().unwrap();
+            assert!(
+                (quote - 2.0 * 10.0 * 1.005).abs() < 1e-6,
+                "покупка суммой в USDT: {quote}"
+            );
+        }
+        ev_tx.send(json!({"channel": "spot.orders", "event": "update", "result": [{"id": oid, "text": text, "status": "closed", "finish_as": "filled",
+            "type": "limit", "side": "buy", "amount": "1", "left": "0", "filled_total": "9.5", "avg_deal_price": "9.5"}]}).to_string()).unwrap();
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (_, a) = call(&r, "GET", "/status", "").await;
+            if a["gate"]["тестовый_счёт"]["openOrders"] == json!(0)
+                && a["gate"]["событий_счёта"].as_u64().unwrap_or(0) >= 1
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "событие не учтено: {a}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(ex.lock().unwrap().bad, 0, "все подписи REST верны");
+        call(&r, "POST", "/control/stop", "").await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn live_perp_flow_against_mock_binance_futures() {
         use axum::extract::RawQuery;

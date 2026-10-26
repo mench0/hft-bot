@@ -19,6 +19,8 @@ pub enum Cmd {
         side: Side,
         qty: f64,
         price: Option<f64>,
+        /// Ориентир цены (рыночная покупка Gate задаётся суммой в котируемой валюте).
+        ref_px: f64,
     },
     Cancel {
         local: u64,
@@ -105,7 +107,14 @@ impl Live {
         }
     }
 
-    fn send(&mut self, symbol: &str, side: Side, qty: f64, price: Option<f64>) -> Fill {
+    fn send(
+        &mut self,
+        symbol: &str,
+        side: Side,
+        qty: f64,
+        price: Option<f64>,
+        ref_px: f64,
+    ) -> Fill {
         let local = self.next;
         self.next += 1;
         self.orders.insert(
@@ -127,6 +136,7 @@ impl Live {
             side,
             qty,
             price,
+            ref_px,
         });
         Fill {
             order_id: local,
@@ -163,7 +173,7 @@ impl Live {
             return Err(e);
         }
         self.ledger.note_accepted();
-        Ok(self.send(symbol, side, pr.qty, pr.limit))
+        Ok(self.send(symbol, side, pr.qty, pr.limit, pr.ref_px))
     }
 
     /// Выход рыночной продажей без проверок торговли (стоп, выключение стратегии).
@@ -184,7 +194,13 @@ impl Live {
         qty: f64,
         book: Option<&Book>,
     ) -> Result<Fill, String> {
-        book.filter(|b| b.is_ready()).ok_or("стакан не готов")?;
+        let b = book.filter(|b| b.is_ready()).ok_or("стакан не готов")?;
+        let ref_px = if side == Side::Buy {
+            b.best_ask()
+        } else {
+            b.best_bid()
+        }
+        .map_or(0.0, |x| x.0);
         let qty = qty.min(self.ledger.exit_room(symbol, side));
         let qty = self
             .ledger
@@ -193,7 +209,7 @@ impl Live {
         if qty <= 0.0 {
             return Err(format!("нечего закрывать по {symbol}"));
         }
-        Ok(self.send(symbol, side, qty, None))
+        Ok(self.send(symbol, side, qty, None, ref_px))
     }
 
     /// Снять ордер; false — его уже нет.
@@ -470,6 +486,7 @@ pub enum Venue {
     Bybit(crate::bybit_api::Client),
     Aster(crate::aster_api::Client),
     Okx(crate::okx_api::Client),
+    Gate(crate::gate_api::Client),
 }
 
 impl Venue {
@@ -479,6 +496,7 @@ impl Venue {
             Venue::Bybit(c) => c.sync_time().await,
             Venue::Aster(_) => Ok(()),
             Venue::Okx(c) => c.sync_time().await,
+            Venue::Gate(c) => c.sync_time().await,
         }
     }
     async fn place(
@@ -488,8 +506,10 @@ impl Venue {
         side: Side,
         qty: f64,
         price: Option<f64>,
+        ref_px: f64,
     ) -> Result<OrderState, String> {
         match self {
+            Venue::Gate(c) => c.place(local, symbol, side, qty, price, ref_px).await,
             Venue::Binance(c) => c.place(local, symbol, side, qty, price).await,
             Venue::Bybit(c) => c.place(local, symbol, side, qty, price).await,
             Venue::Aster(c) => c.place(local, symbol, side, qty, price).await,
@@ -502,6 +522,7 @@ impl Venue {
             Venue::Bybit(c) => c.query(symbol, id).await,
             Venue::Aster(c) => c.query(symbol, id).await,
             Venue::Okx(c) => c.query(symbol, id).await,
+            Venue::Gate(c) => c.query(symbol, id).await,
         }
     }
     async fn cancel(&self, symbol: &str, id: &str) -> Result<OrderState, String> {
@@ -510,6 +531,7 @@ impl Venue {
             Venue::Bybit(c) => c.cancel(symbol, id).await,
             Venue::Aster(c) => c.cancel(symbol, id).await,
             Venue::Okx(c) => c.cancel(symbol, id).await,
+            Venue::Gate(c) => c.cancel(symbol, id).await,
         }
     }
     fn perp(&self) -> bool {
@@ -518,6 +540,7 @@ impl Venue {
             Venue::Bybit(c) => c.category == "linear",
             Venue::Aster(c) => c.perp,
             Venue::Okx(c) => c.perp,
+            Venue::Gate(c) => c.perp,
         }
     }
     async fn positions(&self) -> Result<Vec<(String, f64, f64)>, String> {
@@ -526,6 +549,7 @@ impl Venue {
             Venue::Bybit(c) => c.positions().await,
             Venue::Aster(c) => c.positions().await,
             Venue::Okx(c) => c.positions().await,
+            Venue::Gate(c) => c.positions().await,
         }
     }
     async fn set_leverage(&self, symbol: &str, lev: f64) -> Result<(), String> {
@@ -534,24 +558,21 @@ impl Venue {
             Venue::Bybit(c) => c.set_leverage(symbol, lev).await,
             Venue::Aster(c) => c.set_leverage(symbol, lev).await,
             Venue::Okx(c) => c.set_leverage(symbol, lev).await,
+            Venue::Gate(c) => c.set_leverage(symbol, lev).await,
         }
     }
     async fn networks(&self, coin: &str) -> Result<Vec<crate::transfer::Net>, String> {
         match self {
             Venue::Binance(c) => c.networks(coin).await,
             Venue::Bybit(c) => c.networks(coin).await,
-            Venue::Aster(_) | Venue::Okx(_) => {
-                Err("переводы с этой биржи в Rust-бэкенде не поддерживаются".into())
-            }
+            _ => Err("переводы с этой биржи в Rust-бэкенде не поддерживаются".into()),
         }
     }
     async fn deposit_address(&self, coin: &str, net: &str) -> Result<(String, String), String> {
         match self {
             Venue::Binance(c) => c.deposit_address(coin, net).await,
             Venue::Bybit(c) => c.deposit_address(coin, net).await,
-            Venue::Aster(_) | Venue::Okx(_) => {
-                Err("переводы с этой биржи в Rust-бэкенде не поддерживаются".into())
-            }
+            _ => Err("переводы с этой биржи в Rust-бэкенде не поддерживаются".into()),
         }
     }
     async fn withdraw(
@@ -565,9 +586,7 @@ impl Venue {
         match self {
             Venue::Binance(c) => c.withdraw(coin, net, address, tag, amount).await,
             Venue::Bybit(c) => c.withdraw(coin, net, address, tag, amount).await,
-            Venue::Aster(_) | Venue::Okx(_) => {
-                Err("переводы с этой биржи в Rust-бэкенде не поддерживаются".into())
-            }
+            _ => Err("переводы с этой биржи в Rust-бэкенде не поддерживаются".into()),
         }
     }
     async fn balances(&self) -> Result<std::collections::BTreeMap<String, f64>, String> {
@@ -576,6 +595,7 @@ impl Venue {
             Venue::Bybit(c) => c.balances().await,
             Venue::Aster(c) => c.balances().await,
             Venue::Okx(c) => c.balances().await,
+            Venue::Gate(c) => c.balances().await,
         }
     }
 }
@@ -615,8 +635,8 @@ pub async fn worker(
             cmd = rx.recv() => {
                 let Some(cmd) = cmd else { return };
                 match cmd {
-                    Cmd::Place { local, symbol, side, qty, price } => {
-                        let r = client.place(local, &symbol, side, qty, price).await;
+                    Cmd::Place { local, symbol, side, qty, price, ref_px } => {
+                        let r = client.place(local, &symbol, side, qty, price, ref_px).await;
                         let cancel_now = with_live(&acc, &ex, |l| match &r {
                             Ok(st) => { l.on_state(local, st); l.wants_cancel(local) }
                             Err(e) => { tracing::warn!("[{ex}] ордер {symbol} отклонён: {e}"); l.on_error(local, e); false }
@@ -711,6 +731,7 @@ impl Venue {
             Venue::Binance(_) => Ok(crate::signed::ws_api_url(testnet)),
             Venue::Bybit(_) => Ok(crate::bybit_api::private_url(testnet)),
             Venue::Okx(_) => Ok(crate::okx_api::private_url(testnet)),
+            Venue::Gate(c) => c.stream_url().await,
             Venue::Aster(c) => {
                 let k = c
                     .listen_key(reqwest::Method::POST)
@@ -732,6 +753,7 @@ impl Venue {
             }
             Venue::Bybit(c) => vec![c.auth_message()],
             Venue::Okx(c) => vec![c.login()],
+            Venue::Gate(c) => c.subscriptions(),
             _ => Vec::new(),
         }
     }
@@ -741,6 +763,7 @@ impl Venue {
         match self {
             Venue::Bybit(_) => Some(r#"{"op":"ping"}"#.into()),
             Venue::Okx(_) => Some("ping".into()),
+            Venue::Gate(c) => Some(c.ping()),
             _ => None,
         }
     }
@@ -785,6 +808,7 @@ impl Venue {
                     None => StreamMsg::Ignore,
                 },
             },
+            Venue::Gate(c) => c.stream_parse(&v),
             Venue::Okx(c) => match v["event"].as_str() {
                 Some("login") if v["code"] == "0" => StreamMsg::Send(c.subscribe()),
                 Some("login") | Some("error") => {

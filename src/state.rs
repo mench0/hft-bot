@@ -416,9 +416,9 @@ impl Bot {
         if flag("paper") || !(flag("live") || testnet) {
             return None;
         }
-        if !matches!(ex, "binance" | "bybit" | "aster" | "okx") {
+        if !matches!(ex, "binance" | "bybit" | "aster" | "okx" | "gate") {
             tracing::warn!(
-                "[{ex}] реальные ордера в Rust-бэкенде пока только для Binance, Bybit, Aster и OKX (спот и USDT-перпы) — бумажный режим"
+                "[{ex}] реальные ордера в Rust-бэкенде пока только для Binance, Bybit, Aster, OKX и Gate (спот и USDT-перпы) — бумажный режим"
             );
             return None;
         }
@@ -495,6 +495,7 @@ impl Bot {
                                 "bybit" => crate::bybit_api::rest_url(testnet),
                                 "aster" => crate::aster_api::rest_url(perp, testnet),
                                 "okx" => crate::okx_api::REST,
+                                "gate" => crate::gate_api::rest_url(perp, testnet),
                                 _ => crate::rest::default_url(perp, testnet),
                             }
                             .to_owned()
@@ -502,7 +503,11 @@ impl Bot {
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                     let mode = if testnet { "TESTNET" } else { "LIVE" };
                     tracing::warn!("[{ex}] режим {mode}: ордера пойдут на биржу ({base})");
-                    let client = Arc::new(if ex == "okx" {
+                    let client = Arc::new(if ex == "gate" {
+                        crate::live::Venue::Gate(crate::gate_api::Client::new(
+                            &base, keys, perp, testnet, symbols,
+                        ))
+                    } else if ex == "okx" {
                         // passphrase проверен в live_mode
                         let pass = std::env::var(if testnet {
                             "OKX_TESTNET_PASSPHRASE"

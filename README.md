@@ -103,6 +103,11 @@
   заголовках OK-ACCESS-*, ключи `OKX_API_KEY`/`_SECRET` и `OKX_PASSPHRASE` (testnet — `OKX_TESTNET_*`, демо-торговля
   заголовком x-simulated-trading); перпы — tdMode=cross, объём в контрактах (монеты / ctVal, вниз до lotSz). Приватный
   поток: login, каналы orders, account, positions (`OKX_WS_PRIVATE_URL` — свой адрес).
+- **Реальные ордера Gate** (спот и перпы USDT): подпись hex(HMAC-SHA512) заголовками KEY/SIGN/Timestamp, ключи
+  `GATE_API_KEY`/`_SECRET`; рыночный ордер — IOC, рыночная покупка спота задаётся суммой в котируемой валюте (по цене
+  стакана с запасом 0.5%); перпы — size в контрактах со знаком (монеты / quanto_multiplier). Поток: подписки с подписью
+  spot.orders + spot.balances, у перпов — futures.orders + futures.positions по номеру пользователя
+  (`GATE_WS_PRIVATE_URL` — свой адрес).
 - **Перпы (USDT)** — параметр `market=perp`, плечо — `leverage`. Бумага: лонг и шорт, изолированная маржа, комиссии
   перпов из каталога, funding по ставке биржи в момент списания (ставки — Binance `/fapi/v1/premiumIndex`, Bybit
   `/v5/market/tickers`, раз в 30 с; видны в `/market` как `funding_проц`), ликвидация при марже ниже 0.5% объёма.
