@@ -95,6 +95,10 @@
   `BINANCE_API_KEY`/`_SECRET`, `BYBIT_API_KEY`/`_SECRET` (тестовая сеть — `..._TESTNET_API_KEY`/`_SECRET`); без ключей — бумага.
   Bybit: подписанный REST v5 (`/v5/order/create|cancel|realtime`, единый счёт), события `order`/`wallet` из приватного
   потока (`BYBIT_WS_PRIVATE_URL` — свой адрес).
+- **Реальные ордера Aster** (спот и перпы, как в Java): запросы как у Binance (`/api/v3`, `/fapi/v3`), подпись EIP-712
+  кошельком-агентом — `ASTER_API_KEY` = адрес основного кошелька (user), `ASTER_API_SECRET` = приватный ключ агента
+  (signer, без права вывода); nonce в микросекундах, монотонно. События счёта — поток по listenKey
+  (`ASTER_STREAM_URL` — свой адрес). Переводов между биржами с Aster нет.
 - **Перпы (USDT)** — параметр `market=perp`, плечо — `leverage`. Бумага: лонг и шорт, изолированная маржа, комиссии
   перпов из каталога, funding по ставке биржи в момент списания (ставки — Binance `/fapi/v1/premiumIndex`, Bybit
   `/v5/market/tickers`, раз в 30 с; видны в `/market` как `funding_проц`), ликвидация при марже ниже 0.5% объёма.

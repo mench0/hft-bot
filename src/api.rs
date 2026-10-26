@@ -1147,6 +1147,197 @@ mod tests {
         call(&r, "POST", "/control/stop", "").await;
     }
 
+    /// Живой спот Aster против макета: каждая подпись EIP-712 проверяется восстановлением адреса агента (signer),
+    /// рыночная покупка, поток событий по listenKey, исполнение лимитной заявки из события executionReport.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_aster_spot_against_mock() {
+        use axum::extract::RawQuery;
+        use futures_util::SinkExt;
+        use std::sync::Mutex;
+        use tokio_tungstenite::tungstenite::Message;
+        const KEY: &str = "0x0000000000000000000000000000000000000000000000000000000000000003";
+        #[derive(Default)]
+        struct Ex {
+            usdt: f64,
+            x: f64,
+            orders: Vec<(u64, String)>,
+            bad_sig: u32,
+            nonces: Vec<u64>,
+        }
+        let ex = Arc::new(Mutex::new(Ex {
+            usdt: 1000.0,
+            ..Default::default()
+        }));
+        let agent = crate::evm::Wallet::from_hex(KEY).unwrap().address;
+        // подпись — по строке до &signature=; signer — адрес агента, user — основной кошелёк
+        let check = {
+            let agent = agent.clone();
+            move |q: &str| -> bool {
+                let (msg, sig) = q.rsplit_once("&signature=").unwrap_or((q, ""));
+                let p = |k: &str| {
+                    msg.split('&')
+                        .find_map(|kv| kv.strip_prefix(&format!("{k}=")))
+                        .unwrap_or("")
+                        .to_owned()
+                };
+                p("user") == "0xmainwallet"
+                    && p("signer") == agent
+                    && crate::evm::recover(&crate::aster_api::Client::digest(true, msg), sig)
+                        .ok()
+                        .as_deref()
+                        == Some(agent.as_str())
+            }
+        };
+        fn param(q: &str, k: &str) -> Option<String> {
+            q.split('&').find_map(|kv| {
+                kv.split_once('=')
+                    .filter(|(a, _)| *a == k)
+                    .map(|(_, v)| v.to_owned())
+            })
+        }
+        let (c1, c2, c3, c4) = (check.clone(), check.clone(), check.clone(), check.clone());
+        let (e1, e2, e3, e4) = (ex.clone(), ex.clone(), ex.clone(), ex.clone());
+        let rest = Router::new()
+            .route("/api/v3/account", get(move |RawQuery(q): RawQuery| async move {
+                let q = q.unwrap_or_default();
+                let mut x = e1.lock().unwrap();
+                if !c1(&q) { x.bad_sig += 1; }
+                x.nonces.push(param(&q, "nonce").unwrap().parse().unwrap());
+                Json(json!({"balances": [{"asset": "USDT", "free": format!("{}", x.usdt)}, {"asset": "X", "free": format!("{}", x.x)}]}))
+            }))
+            .route("/api/v3/listenKey", axum::routing::post(move |RawQuery(q): RawQuery| async move {
+                if !c2(&q.unwrap_or_default()) { e2.lock().unwrap().bad_sig += 1; }
+                Json(json!({"listenKey": "ak1"}))
+            }))
+            .route("/api/v3/order", axum::routing::post(move |RawQuery(q): RawQuery| async move {
+                let q = q.unwrap_or_default();
+                let mut x = e3.lock().unwrap();
+                if !c3(&q) { x.bad_sig += 1; }
+                let qty: f64 = param(&q, "quantity").unwrap().parse().unwrap();
+                let id = 900 + x.orders.len() as u64;
+                x.orders.push((id, param(&q, "newClientOrderId").unwrap()));
+                if param(&q, "type").as_deref() == Some("MARKET") {
+                    x.usdt -= qty * 10.0;
+                    x.x += qty;
+                    Json(json!({"orderId": id, "status": "FILLED", "executedQty": format!("{qty}"), "cummulativeQuoteQty": format!("{}", qty * 10.0)}))
+                } else {
+                    Json(json!({"orderId": id, "status": "NEW", "executedQty": "0", "cummulativeQuoteQty": "0"}))
+                }
+            }).get(move |RawQuery(q): RawQuery| async move {
+                let q = q.unwrap_or_default();
+                if !c4(&q) { e4.lock().unwrap().bad_sig += 1; }
+                let id: u64 = param(&q, "orderId").unwrap().parse().unwrap();
+                Json(json!({"orderId": id, "status": "NEW", "executedQty": "0", "cummulativeQuoteQty": "0"}))
+            }));
+        let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let raddr = rl.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(rl, rest).await.unwrap() });
+        let wl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let waddr = wl.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = wl.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            for i in 1..500u64 {
+                let m = format!(
+                    r#"{{"stream":"xusdt@depth20@100ms","data":{{"lastUpdateId":{i},"bids":[["9.99","100"]],"asks":[["10","100"]]}}}}"#
+                );
+                if ws.send(Message::text(m)).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let sl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let saddr = sl.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = sl.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            while let Some(e) = ev_rx.recv().await {
+                if ws.send(Message::text(e)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        // SAFETY: эти переменные задаёт только этот тест
+        unsafe {
+            std::env::set_var("ASTER_STREAM_URL", format!("ws://{saddr}"));
+            std::env::set_var("ASTER_TESTNET_API_KEY", "0xmainwallet");
+            std::env::set_var("ASTER_TESTNET_API_SECRET", KEY);
+        }
+        let (_d, r) = app("");
+        let sel = format!(
+            "/control/select?exchange=aster&symbols=XUSDT&market=spot&testnet=true&wsUrl=ws://{waddr}/stream&restUrl=http://{raddr}&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
+        );
+        assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
+        call(&r, "POST", "/control/start", "").await;
+        call(&r, "POST", "/trading/start", "").await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (_, b) = call(&r, "GET", "/balances?exchange=aster", "").await;
+            let (_, s) = call(&r, "GET", "/status", "").await;
+            if b["свободно"]["USDT"] == json!(1000.0)
+                && s["aster"]["поток_событий_счёта"] == json!(true)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "баланс или поток: {b} {s}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let (c, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=aster&symbol=XUSDT&side=BUY&type=MARKET&qty=2",
+            "",
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        let (_, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=aster&symbol=XUSDT&side=BUY&type=LIMIT&qty=1&price=9.5",
+            "",
+        )
+        .await;
+        assert_eq!(v["статус"], json!("NEW"), "{v}");
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        let (oid, client) = loop {
+            if let Some(o) = ex.lock().unwrap().orders.get(1).cloned() {
+                break o;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "лимитная заявка не дошла"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        ev_tx.send(json!({"e": "executionReport", "s": "XUSDT", "c": client, "C": "", "S": "BUY", "X": "FILLED", "i": oid, "z": "1", "Z": "9.5"}).to_string()).unwrap();
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (_, a) = call(&r, "GET", "/status", "").await;
+            let ac = &a["aster"]["тестовый_счёт"];
+            if ac["openOrders"] == json!(0)
+                && a["aster"]["событий_счёта"].as_u64().unwrap_or(0) >= 1
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "событие не учтено: {a}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        {
+            let x = ex.lock().unwrap();
+            assert_eq!(x.bad_sig, 0, "все подписи EIP-712 верны");
+            assert!(x.nonces.windows(2).all(|w| w[1] > w[0]), "nonce растёт");
+        }
+        call(&r, "POST", "/control/stop", "").await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn live_perp_flow_against_mock_binance_futures() {
         use axum::extract::RawQuery;

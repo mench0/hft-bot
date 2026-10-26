@@ -6,9 +6,11 @@
 
 mod account;
 mod api;
+mod aster_api;
 mod book;
 mod bybit_api;
 mod data;
+mod evm;
 mod feed;
 mod leadlag;
 mod live;

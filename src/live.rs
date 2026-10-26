@@ -468,6 +468,7 @@ fn with_live<R>(acc: &Shared, ex: &str, f: impl FnOnce(&mut Live) -> R) -> Optio
 pub enum Venue {
     Binance(crate::signed::Client),
     Bybit(crate::bybit_api::Client),
+    Aster(crate::aster_api::Client),
 }
 
 impl Venue {
@@ -475,6 +476,7 @@ impl Venue {
         match self {
             Venue::Binance(c) => c.sync_time().await,
             Venue::Bybit(c) => c.sync_time().await,
+            Venue::Aster(_) => Ok(()),
         }
     }
     async fn place(
@@ -488,48 +490,56 @@ impl Venue {
         match self {
             Venue::Binance(c) => c.place(local, symbol, side, qty, price).await,
             Venue::Bybit(c) => c.place(local, symbol, side, qty, price).await,
+            Venue::Aster(c) => c.place(local, symbol, side, qty, price).await,
         }
     }
     async fn query(&self, symbol: &str, id: &str) -> Result<OrderState, String> {
         match self {
             Venue::Binance(c) => c.query(symbol, id).await,
             Venue::Bybit(c) => c.query(symbol, id).await,
+            Venue::Aster(c) => c.query(symbol, id).await,
         }
     }
     async fn cancel(&self, symbol: &str, id: &str) -> Result<OrderState, String> {
         match self {
             Venue::Binance(c) => c.cancel(symbol, id).await,
             Venue::Bybit(c) => c.cancel(symbol, id).await,
+            Venue::Aster(c) => c.cancel(symbol, id).await,
         }
     }
     fn perp(&self) -> bool {
         match self {
             Venue::Binance(c) => c.perp,
             Venue::Bybit(c) => c.category == "linear",
+            Venue::Aster(c) => c.perp,
         }
     }
     async fn positions(&self) -> Result<Vec<(String, f64, f64)>, String> {
         match self {
             Venue::Binance(c) => c.positions().await,
             Venue::Bybit(c) => c.positions().await,
+            Venue::Aster(c) => c.positions().await,
         }
     }
     async fn set_leverage(&self, symbol: &str, lev: f64) -> Result<(), String> {
         match self {
             Venue::Binance(c) => c.set_leverage(symbol, lev).await,
             Venue::Bybit(c) => c.set_leverage(symbol, lev).await,
+            Venue::Aster(c) => c.set_leverage(symbol, lev).await,
         }
     }
     async fn networks(&self, coin: &str) -> Result<Vec<crate::transfer::Net>, String> {
         match self {
             Venue::Binance(c) => c.networks(coin).await,
             Venue::Bybit(c) => c.networks(coin).await,
+            Venue::Aster(_) => Err("Aster: переводы в Rust-бэкенде не поддерживаются".into()),
         }
     }
     async fn deposit_address(&self, coin: &str, net: &str) -> Result<(String, String), String> {
         match self {
             Venue::Binance(c) => c.deposit_address(coin, net).await,
             Venue::Bybit(c) => c.deposit_address(coin, net).await,
+            Venue::Aster(_) => Err("Aster: переводы в Rust-бэкенде не поддерживаются".into()),
         }
     }
     async fn withdraw(
@@ -543,12 +553,14 @@ impl Venue {
         match self {
             Venue::Binance(c) => c.withdraw(coin, net, address, tag, amount).await,
             Venue::Bybit(c) => c.withdraw(coin, net, address, tag, amount).await,
+            Venue::Aster(_) => Err("Aster: переводы в Rust-бэкенде не поддерживаются".into()),
         }
     }
     async fn balances(&self) -> Result<std::collections::BTreeMap<String, f64>, String> {
         match self {
             Venue::Binance(c) => c.balances().await,
             Venue::Bybit(c) => c.balances().await,
+            Venue::Aster(c) => c.balances().await,
         }
     }
 }
@@ -665,12 +677,22 @@ async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) 
     use tokio_tungstenite::tungstenite::Message;
     let mut backoff = crate::feed::Backoff::default();
     let mut seq = 0u64;
-    let fstream = matches!(venue.as_ref(), Venue::Binance(c) if c.perp);
+    // поток по listenKey (без подписки): перпы Binance и Aster (спот и перпы)
+    let fstream = matches!(venue.as_ref(), Venue::Binance(c) if c.perp)
+        || matches!(venue.as_ref(), Venue::Aster(_));
     loop {
         // перпы Binance: поток по listenKey (без подписки), ключ продлевается каждые 30 мин
         let url = match venue.as_ref() {
             Venue::Binance(c) if c.perp => match c.listen_key(reqwest::Method::POST).await {
                 Ok(k) => format!("{}/{k}", crate::signed::fstream_url(testnet)),
+                Err(e) => {
+                    with_live(&acc, &ex, |l| l.error = format!("listenKey: {e}"));
+                    tokio::time::sleep(backoff.next()).await;
+                    continue;
+                }
+            },
+            Venue::Aster(c) => match c.listen_key(reqwest::Method::POST).await {
+                Ok(k) => format!("{}/{k}", crate::aster_api::stream_url(c.perp, testnet)),
                 Err(e) => {
                     with_live(&acc, &ex, |l| l.error = format!("listenKey: {e}"));
                     tokio::time::sleep(backoff.next()).await;
@@ -692,6 +714,7 @@ async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) 
                 let sub = format!("sub{seq}");
                 let req = match venue.as_ref() {
                     Venue::Binance(c) if c.perp => None,
+                    Venue::Aster(_) => None,
                     Venue::Binance(c) => {
                         Some(c.ws_request(&sub, "userDataStream.subscribe.signature"))
                     }
@@ -721,6 +744,11 @@ async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) 
                                     err = ws.send(Message::text(r#"{"op":"ping"}"#)).await.err().map(|e| e.to_string()).unwrap_or_default();
                                 }
                                 Venue::Binance(c) if c.perp && pings.is_multiple_of(90) => {
+                                    if let Err(e) = c.listen_key(reqwest::Method::PUT).await {
+                                        tracing::warn!("[{ex}] listenKey не продлён: {e}");
+                                    }
+                                }
+                                Venue::Aster(c) if pings.is_multiple_of(90) => {
                                     if let Err(e) = c.listen_key(reqwest::Method::PUT).await {
                                         tracing::warn!("[{ex}] listenKey не продлён: {e}");
                                     }

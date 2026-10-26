@@ -416,13 +416,20 @@ impl Bot {
         if flag("paper") || !(flag("live") || testnet) {
             return None;
         }
-        if !matches!(ex, "binance" | "bybit") {
+        if !matches!(ex, "binance" | "bybit" | "aster") {
             tracing::warn!(
-                "[{ex}] реальные ордера в Rust-бэкенде пока только для Binance и Bybit (спот и USDT-перпы) — бумажный режим"
+                "[{ex}] реальные ордера в Rust-бэкенде пока только для Binance, Bybit и Aster (спот и USDT-перпы) — бумажный режим"
             );
             return None;
         }
         match crate::signed::Keys::from_env(ex, testnet) {
+            // Aster: ASTER_API_SECRET — приватный ключ кошелька-агента
+            Some(k) if ex == "aster" && crate::evm::Wallet::from_hex(&k.secret).is_err() => {
+                tracing::warn!(
+                    "[aster] ASTER_API_SECRET — не приватный ключ кошелька (hex) — бумажный режим"
+                );
+                None
+            }
             Some(k) => Some((k, testnet)),
             None => {
                 tracing::warn!(
@@ -463,17 +470,23 @@ impl Bot {
                         .filter(|s| !s.is_empty())
                         .map(str::to_owned)
                         .unwrap_or_else(|| {
-                            if ex == "bybit" {
-                                crate::bybit_api::rest_url(testnet)
-                            } else {
-                                crate::rest::default_url(perp, testnet)
+                            match ex {
+                                "bybit" => crate::bybit_api::rest_url(testnet),
+                                "aster" => crate::aster_api::rest_url(perp, testnet),
+                                _ => crate::rest::default_url(perp, testnet),
                             }
                             .to_owned()
                         });
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                     let mode = if testnet { "TESTNET" } else { "LIVE" };
                     tracing::warn!("[{ex}] режим {mode}: ордера пойдут на биржу ({base})");
-                    let client = Arc::new(if ex == "bybit" {
+                    let client = Arc::new(if ex == "aster" {
+                        // ключ агента проверен в live_mode
+                        crate::live::Venue::Aster(
+                            crate::aster_api::Client::new(&base, keys, perp, testnet)
+                                .expect("ключ агента Aster"),
+                        )
+                    } else if ex == "bybit" {
                         let mut c = crate::bybit_api::Client::new(&base, keys);
                         if perp {
                             c.category = "linear";
