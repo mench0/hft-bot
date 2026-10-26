@@ -20,7 +20,7 @@ pub fn rest_url(testnet: bool) -> &'static str {
 
 /// Адрес приватного потока; BYBIT_WS_PRIVATE_URL — свой адрес (проверки, прокси).
 pub fn private_url(testnet: bool) -> String {
-    std::env::var("BYBIT_WS_PRIVATE_URL")
+    crate::util::env("BYBIT_WS_PRIVATE_URL")
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| {

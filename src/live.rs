@@ -75,6 +75,8 @@ pub struct Live {
     pub stream_ok: bool,
     /// Событий счёта получено.
     pub stream_events: u64,
+    /// Последняя ошибка приватного потока (не стирается удачным опросом балансов).
+    pub stream_error: String,
     /// Сети монет (ответы на Cmd::Networks): Err — ошибка запроса.
     pub networks: HashMap<String, Result<Vec<crate::transfer::Net>, String>>,
     /// Адреса депозита по (монета, сеть).
@@ -101,6 +103,7 @@ impl Live {
             error: String::new(),
             stream_ok: false,
             stream_events: 0,
+            stream_error: String::new(),
             networks: HashMap::new(),
             addresses: HashMap::new(),
             withdrawals: HashMap::new(),
@@ -896,13 +899,28 @@ async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) 
         let url = match venue.stream_url(testnet).await {
             Ok(u) => u,
             Err(e) => {
-                with_live(&acc, &ex, |l| l.error = e);
+                with_live(&acc, &ex, |l| {
+                    l.stream_error = e.clone();
+                    l.error = e;
+                });
                 tokio::time::sleep(backoff.next()).await;
                 continue;
             }
         };
         let mut pings = 0u32;
-        let err = match tokio_tungstenite::connect_async(url.as_str()).await {
+        // зависшее рукопожатие не держит поток вечно
+        let conn = match tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio_tungstenite::connect_async(url.as_str()),
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(_) => Err(tokio_tungstenite::tungstenite::Error::Io(
+                std::io::Error::other("подключение не ответило за 10 с"),
+            )),
+        };
+        let err = match conn {
             Ok((mut ws, _)) => {
                 // первый пинг — через 20 с после подключения, не раньше входа и подписки
                 let mut ping = tokio::time::interval_at(
@@ -978,6 +996,7 @@ async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) 
         with_live(&acc, &ex, |l| {
             l.stream_ok = false;
             l.error = format!("поток событий: {err}");
+            l.stream_error = err.clone();
         });
         let pause = backoff.next();
         tracing::warn!(

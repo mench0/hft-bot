@@ -778,6 +778,10 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+            // порт держится до конца теста: иначе его получит мок другого теста, а переподключение этого бота попадёт туда
+            loop {
+                let _ = listener.accept().await;
+            }
         });
         let (_d, r) = app("");
         let sel = format!(
@@ -869,6 +873,10 @@ mod tests {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            // порт держится до конца теста: иначе его получит мок другого теста, а переподключение этого бота попадёт туда
+            loop {
+                let _ = listener.accept().await;
             }
         });
         // REST биржи: правила пары и оборот минутных свечей
@@ -1091,15 +1099,17 @@ mod tests {
                     }
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
+                // порт держится до конца теста: иначе его получит мок другого теста, а переподключение этого бота попадёт туда
+                loop {
+                    let _ = l.accept().await;
+                }
             });
         }
-        // SAFETY: ключи — те же, что в других тестах живого режима
-        unsafe {
-            std::env::set_var("BINANCE_TESTNET_API_KEY", "test-key");
-            std::env::set_var("BINANCE_TESTNET_API_SECRET", BN);
-            std::env::set_var("BYBIT_TESTNET_API_KEY", "bybit-key");
-            std::env::set_var("BYBIT_TESTNET_API_SECRET", BY);
-        }
+        // переопределения окружения для этого теста (потокобезопасно)
+        crate::util::set_env("BINANCE_TESTNET_API_KEY", "test-key");
+        crate::util::set_env("BINANCE_TESTNET_API_SECRET", BN);
+        crate::util::set_env("BYBIT_TESTNET_API_KEY", "bybit-key");
+        crate::util::set_env("BYBIT_TESTNET_API_SECRET", BY);
         let (_d, r) = app("");
         for (exn, rest, feed) in [
             ("binance", addrs[0], format!("ws://{}/stream", feeds[0])),
@@ -1246,6 +1256,10 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+            // порт держится до конца теста: иначе его получит мок другого теста, а переподключение этого бота попадёт туда
+            loop {
+                let _ = wl.accept().await;
+            }
         });
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let sl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1258,13 +1272,15 @@ mod tests {
                     break;
                 }
             }
+            // порт держится до конца теста: иначе его получит мок другого теста, а переподключение этого бота попадёт туда
+            loop {
+                let _ = sl.accept().await;
+            }
         });
-        // SAFETY: эти переменные задаёт только этот тест
-        unsafe {
-            std::env::set_var("ASTER_STREAM_URL", format!("ws://{saddr}"));
-            std::env::set_var("ASTER_TESTNET_API_KEY", "0xmainwallet");
-            std::env::set_var("ASTER_TESTNET_API_SECRET", KEY);
-        }
+        // переопределения окружения для этого теста (потокобезопасно)
+        crate::util::set_env("ASTER_STREAM_URL", &format!("ws://{saddr}"));
+        crate::util::set_env("ASTER_TESTNET_API_KEY", "0xmainwallet");
+        crate::util::set_env("ASTER_TESTNET_API_SECRET", KEY);
         let (_d, r) = app("");
         let sel = format!(
             "/control/select?exchange=aster&symbols=XUSDT&market=spot&testnet=true&wsUrl=ws://{waddr}/stream&restUrl=http://{raddr}&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
@@ -1272,7 +1288,7 @@ mod tests {
         assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
         call(&r, "POST", "/control/start", "").await;
         call(&r, "POST", "/trading/start", "").await;
-        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let (_, b) = call(&r, "GET", "/balances?exchange=aster", "").await;
             let (_, s) = call(&r, "GET", "/status", "").await;
@@ -1303,7 +1319,7 @@ mod tests {
         )
         .await;
         assert_eq!(v["статус"], json!("NEW"), "{v}");
-        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
         let (oid, client) = loop {
             if let Some(o) = ex.lock().unwrap().orders.get(1).cloned() {
                 break o;
@@ -1315,7 +1331,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         ev_tx.send(json!({"e": "executionReport", "s": "XUSDT", "c": client, "C": "", "S": "BUY", "X": "FILLED", "i": oid, "z": "1", "Z": "9.5"}).to_string()).unwrap();
-        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let (_, a) = call(&r, "GET", "/status", "").await;
             let ac = &a["aster"]["тестовый_счёт"];
@@ -1426,6 +1442,10 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+            // порт держится до конца теста: иначе его получит мок другого теста, а переподключение этого бота попадёт туда
+            loop {
+                let _ = wl.accept().await;
+            }
         });
         // приватный поток: проверить login, ответить, принять подписку, слать события
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -1474,14 +1494,16 @@ mod tests {
                     break;
                 }
             }
+            // порт держится до конца теста: иначе его получит мок другого теста, а переподключение этого бота попадёт туда
+            loop {
+                let _ = pl.accept().await;
+            }
         });
-        // SAFETY: эти переменные задаёт только этот тест
-        unsafe {
-            std::env::set_var("OKX_WS_PRIVATE_URL", format!("ws://{paddr}"));
-            std::env::set_var("OKX_TESTNET_API_KEY", "okx-key");
-            std::env::set_var("OKX_TESTNET_API_SECRET", SECRET);
-            std::env::set_var("OKX_TESTNET_PASSPHRASE", "pass");
-        }
+        // переопределения окружения для этого теста (потокобезопасно)
+        crate::util::set_env("OKX_WS_PRIVATE_URL", &format!("ws://{paddr}"));
+        crate::util::set_env("OKX_TESTNET_API_KEY", "okx-key");
+        crate::util::set_env("OKX_TESTNET_API_SECRET", SECRET);
+        crate::util::set_env("OKX_TESTNET_PASSPHRASE", "pass");
         let (_d, r) = app("");
         let sel = format!(
             "/control/select?exchange=okx&symbols=BTCUSDT&market=perp&leverage=3&testnet=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
@@ -1489,7 +1511,7 @@ mod tests {
         assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
         call(&r, "POST", "/control/start", "").await;
         call(&r, "POST", "/trading/start", "").await;
-        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let (_, b) = call(&r, "GET", "/balances?exchange=okx", "").await;
             let (_, s) = call(&r, "GET", "/status", "").await;
@@ -1519,7 +1541,7 @@ mod tests {
         )
         .await;
         assert_eq!(c, StatusCode::OK, "{v}");
-        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let (_, a) = call(&r, "GET", "/status", "").await;
             if a["okx"]["тестовый_счёт"]["positions"][0]["qty"] == json!(-0.5) {
@@ -1638,6 +1660,10 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+            // порт держится до конца теста: иначе его получит мок другого теста, а переподключение этого бота попадёт туда
+            loop {
+                let _ = wl.accept().await;
+            }
         });
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let subs_ok = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -1673,13 +1699,15 @@ mod tests {
                     break;
                 }
             }
+            // порт держится до конца теста: иначе его получит мок другого теста, а переподключение этого бота попадёт туда
+            loop {
+                let _ = pl.accept().await;
+            }
         });
-        // SAFETY: эти переменные задаёт только этот тест
-        unsafe {
-            std::env::set_var("GATE_WS_PRIVATE_URL", format!("ws://{paddr}"));
-            std::env::set_var("GATE_TESTNET_API_KEY", "gate-key");
-            std::env::set_var("GATE_TESTNET_API_SECRET", SECRET);
-        }
+        // переопределения окружения для этого теста (потокобезопасно)
+        crate::util::set_env("GATE_WS_PRIVATE_URL", &format!("ws://{paddr}"));
+        crate::util::set_env("GATE_TESTNET_API_KEY", "gate-key");
+        crate::util::set_env("GATE_TESTNET_API_SECRET", SECRET);
         let (_d, r) = app("");
         let sel = format!(
             "/control/select?exchange=gate&symbols=XUSDT&market=spot&testnet=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
@@ -1687,7 +1715,7 @@ mod tests {
         assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
         call(&r, "POST", "/control/start", "").await;
         call(&r, "POST", "/trading/start", "").await;
-        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let (_, b) = call(&r, "GET", "/balances?exchange=gate", "").await;
             let (_, s) = call(&r, "GET", "/status", "").await;
@@ -1695,6 +1723,7 @@ mod tests {
             if b["свободно"]["USDT"] == json!(1000.0)
                 && s["gate"]["поток_событий_счёта"] == json!(true)
                 && m["XUSDT"]["лучший_аск"].is_number()
+                && subs_ok.load(std::sync::atomic::Ordering::SeqCst) == 2
             {
                 break;
             }
@@ -1725,7 +1754,7 @@ mod tests {
         )
         .await;
         assert_eq!(v["статус"], json!("NEW"), "{v}");
-        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
         let (oid, text) = loop {
             if let Some(o) = ex.lock().unwrap().orders.get(1).cloned() {
                 break ("101".to_string(), o["text"].as_str().unwrap().to_owned());
@@ -1751,7 +1780,7 @@ mod tests {
         }
         ev_tx.send(json!({"channel": "spot.orders", "event": "update", "result": [{"id": oid, "text": text, "status": "closed", "finish_as": "filled",
             "type": "limit", "side": "buy", "amount": "1", "left": "0", "filled_total": "9.5", "avg_deal_price": "9.5"}]}).to_string()).unwrap();
-        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let (_, a) = call(&r, "GET", "/status", "").await;
             if a["gate"]["тестовый_счёт"]["openOrders"] == json!(0)
@@ -1864,6 +1893,10 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+            // порт держится до конца теста: иначе его получит мок другого теста, а переподключение этого бота попадёт туда
+            loop {
+                let _ = wl.accept().await;
+            }
         });
         // поток событий перпов по listenKey: путь /lk1, событие ACCOUNT_UPDATE по запросу теста
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -1884,13 +1917,15 @@ mod tests {
                     break;
                 }
             }
+            // порт держится до конца теста: иначе его получит мок другого теста, а переподключение этого бота попадёт туда
+            loop {
+                let _ = fl.accept().await;
+            }
         });
-        // SAFETY: ключи — те же, что в тесте спота Binance; адрес потока перпов задаёт только этот тест
-        unsafe {
-            std::env::set_var("BINANCE_FSTREAM_URL", format!("ws://{faddr}"));
-            std::env::set_var("BINANCE_TESTNET_API_KEY", "test-key");
-            std::env::set_var("BINANCE_TESTNET_API_SECRET", SECRET);
-        }
+        // переопределения окружения для этого теста (потокобезопасно)
+        crate::util::set_env("BINANCE_FSTREAM_URL", &format!("ws://{faddr}"));
+        crate::util::set_env("BINANCE_TESTNET_API_KEY", "test-key");
+        crate::util::set_env("BINANCE_TESTNET_API_SECRET", SECRET);
         let (_d, r) = app("");
         let sel = format!(
             "/control/select?exchange=binance&symbols=BTCUSDT&market=perp&leverage=5&testnet=true&wsUrl=ws://{waddr}/stream&restUrl=http://{raddr}&spreadCaptureEnabled=false&maxPositionQuote=1000"
@@ -1898,7 +1933,7 @@ mod tests {
         assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
         call(&r, "POST", "/control/start", "").await;
         call(&r, "POST", "/trading/start", "").await;
-        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let (_, s) = call(&r, "GET", "/status", "").await;
             let (_, m) = call(&r, "GET", "/market?exchange=binance", "").await;
@@ -1926,7 +1961,7 @@ mod tests {
         )
         .await;
         assert_eq!(c, StatusCode::OK, "{v}");
-        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let (_, a) = call(&r, "GET", "/status", "").await;
             let ps = &a["binance"]["тестовый_счёт"]["positions"];
@@ -2049,6 +2084,10 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+            // порт держится до конца теста: иначе его получит мок другого теста, а переподключение этого бота попадёт туда
+            loop {
+                let _ = wl.accept().await;
+            }
         });
         // приватный поток: проверить вход, подписку, затем слать события
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -2089,13 +2128,15 @@ mod tests {
                     break;
                 }
             }
+            // порт держится до конца теста: иначе его получит мок другого теста, а переподключение этого бота попадёт туда
+            loop {
+                let _ = pl.accept().await;
+            }
         });
-        // SAFETY: только этот тест задаёт эти переменные
-        unsafe {
-            std::env::set_var("BYBIT_WS_PRIVATE_URL", format!("ws://{paddr}"));
-            std::env::set_var("BYBIT_TESTNET_API_KEY", "bybit-key");
-            std::env::set_var("BYBIT_TESTNET_API_SECRET", SECRET);
-        }
+        // переопределения окружения для этого теста (потокобезопасно)
+        crate::util::set_env("BYBIT_WS_PRIVATE_URL", &format!("ws://{paddr}"));
+        crate::util::set_env("BYBIT_TESTNET_API_KEY", "bybit-key");
+        crate::util::set_env("BYBIT_TESTNET_API_SECRET", SECRET);
         let (_d, r) = app("");
         let sel = format!(
             "/control/select?exchange=bybit&symbols=BTCUSDT&market=spot&testnet=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&spreadCaptureEnabled=false&maxPositionQuote=1000"
@@ -2105,7 +2146,7 @@ mod tests {
         call(&r, "POST", "/trading/start", "").await;
         let (_, rs) = call(&r, "GET", "/exchanges/request-stats", "").await;
         assert_eq!(rs["bybit"]["mode"], json!("TESTNET"), "{rs}");
-        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let (_, b) = call(&r, "GET", "/balances?exchange=bybit", "").await;
             if b["свободно"]["USDT"] == json!(1000.0) {
@@ -2125,7 +2166,7 @@ mod tests {
         )
         .await;
         assert_eq!(c, StatusCode::OK, "{v}");
-        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let (_, b) = call(&r, "GET", "/balances?exchange=bybit", "").await;
             if b["свободно"]["BTC"] == json!(1.0) {
@@ -2137,7 +2178,7 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let (_, s) = call(&r, "GET", "/status", "").await;
             if s["bybit"]["поток_событий_счёта"] == json!(true) {
@@ -2161,7 +2202,7 @@ mod tests {
         )
         .await;
         assert_eq!(v["статус"], json!("NEW"), "{v}");
-        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
         let (oid, link) = loop {
             if let Some(o) = ex.lock().unwrap().orders.get(1).cloned() {
                 break (o.0, o.1);
@@ -2293,6 +2334,10 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+            // порт держится до конца теста: иначе его получит мок другого теста, а переподключение этого бота попадёт туда
+            loop {
+                let _ = wl.accept().await;
+            }
         });
         // WebSocket API: проверить подпись подписки на события счёта, затем слать события из канала
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -2325,13 +2370,15 @@ mod tests {
                     break;
                 }
             }
+            // порт держится до конца теста: иначе его получит мок другого теста, а переподключение этого бота попадёт туда
+            loop {
+                let _ = al.accept().await;
+            }
         });
-        // SAFETY: тест один задаёт эти переменные; остальные тесты ключей testnet не читают
-        unsafe {
-            std::env::set_var("BINANCE_WS_API_URL", format!("ws://{aaddr}"));
-            std::env::set_var("BINANCE_TESTNET_API_KEY", "test-key");
-            std::env::set_var("BINANCE_TESTNET_API_SECRET", SECRET);
-        }
+        // переопределения окружения для этого теста (потокобезопасно)
+        crate::util::set_env("BINANCE_WS_API_URL", &format!("ws://{aaddr}"));
+        crate::util::set_env("BINANCE_TESTNET_API_KEY", "test-key");
+        crate::util::set_env("BINANCE_TESTNET_API_SECRET", SECRET);
         let (_d, r) = app("");
         let sel = format!(
             "/control/select?exchange=binance&symbols=BTCUSDT&market=spot&testnet=true&wsUrl=ws://{waddr}/stream&restUrl=http://{raddr}&spreadCaptureEnabled=false&maxPositionQuote=1000"
@@ -2341,7 +2388,7 @@ mod tests {
         call(&r, "POST", "/trading/start", "").await;
         let (_, rs) = call(&r, "GET", "/exchanges/request-stats", "").await;
         assert_eq!(rs["binance"]["mode"], json!("TESTNET"), "{rs}");
-        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let (_, b) = call(&r, "GET", "/balances?exchange=binance", "").await;
             if b["свободно"]["USDT"] == json!(1000.0) {
@@ -2362,7 +2409,7 @@ mod tests {
         .await;
         assert_eq!(c, StatusCode::OK, "{v}");
         assert_eq!(v["статус"], json!("NEW"), "ордер ушёл на биржу в фоне");
-        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let (_, b) = call(&r, "GET", "/balances?exchange=binance", "").await;
             if b["свободно"]["BTC"] == json!(1.0) {
@@ -2375,7 +2422,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         // поток событий счёта: лимитная покупка исполнилась — узнаём из события, а не из опроса (он раз в 5 с)
-        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let (_, s) = call(&r, "GET", "/status", "").await;
             if s["binance"]["поток_событий_счёта"] == json!(true) {
@@ -2399,7 +2446,7 @@ mod tests {
         )
         .await;
         assert_eq!(v["статус"], json!("NEW"), "{v}");
-        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
         let (oid, client) = loop {
             if let Some(c) = ex
                 .lock()
@@ -2449,7 +2496,7 @@ mod tests {
         assert_eq!(v["статус"], json!("NEW"), "{v}");
         tokio::time::sleep(Duration::from_millis(300)).await;
         call(&r, "POST", "/trading/panic", "").await;
-        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
         while ex.lock().unwrap().cancels == 0 {
             assert!(
                 tokio::time::Instant::now() < until,

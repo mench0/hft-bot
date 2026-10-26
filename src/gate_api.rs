@@ -26,7 +26,7 @@ pub fn rest_url(perp: bool, testnet: bool) -> &'static str {
 
 /// Адрес приватного потока; GATE_WS_PRIVATE_URL — свой.
 pub fn private_url(perp: bool, testnet: bool) -> String {
-    std::env::var("GATE_WS_PRIVATE_URL")
+    crate::util::env("GATE_WS_PRIVATE_URL")
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| {

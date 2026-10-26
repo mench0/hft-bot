@@ -383,7 +383,19 @@ pub async fn run(market: Arc<Market>, ex: String, d: Arc<dyn Dialect>) {
                 continue;
             }
         };
-        let err = match tokio_tungstenite::connect_async(url).await {
+        // зависшее рукопожатие не держит фид вечно
+        let conn = match tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio_tungstenite::connect_async(url),
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(_) => Err(tokio_tungstenite::tungstenite::Error::Io(
+                std::io::Error::other("подключение не ответило за 10 с"),
+            )),
+        };
+        let err = match conn {
             Ok((mut ws, _)) => {
                 tracing::info!("[{ex}] WebSocket подключён");
                 market.with_feed(&ex, |f| {

@@ -432,14 +432,14 @@ impl Bot {
             }
             Some(_)
                 if ex == "okx"
-                    && std::env::var(if testnet {
+                    && crate::util::env(if testnet {
                         "OKX_TESTNET_PASSPHRASE"
                     } else {
                         "OKX_PASSPHRASE"
                     })
                     .is_ok_and(|v| v.trim().is_empty())
                     || ex == "okx"
-                        && std::env::var(if testnet {
+                        && crate::util::env(if testnet {
                             "OKX_TESTNET_PASSPHRASE"
                         } else {
                             "OKX_PASSPHRASE"
@@ -483,6 +483,7 @@ impl Bot {
             }
         };
         if !self.accounts.lock().unwrap().contains_key(ex) {
+            let mut worker = None;
             let account = match self.live_mode(ex) {
                 Some((keys, testnet)) => {
                     let base = p
@@ -509,7 +510,7 @@ impl Bot {
                         ))
                     } else if ex == "okx" {
                         // passphrase проверен в live_mode
-                        let pass = std::env::var(if testnet {
+                        let pass = crate::util::env(if testnet {
                             "OKX_TESTNET_PASSPHRASE"
                         } else {
                             "OKX_PASSPHRASE"
@@ -535,7 +536,8 @@ impl Bot {
                     } else {
                         crate::live::Venue::Binance(crate::signed::Client::new(&base, keys))
                     });
-                    tokio::spawn(crate::live::worker(
+                    // задача счёта запускается после того, как счёт попал в таблицу (иначе её первые ответы теряются)
+                    worker = Some(crate::live::worker(
                         self.accounts.clone(),
                         ex.to_owned(),
                         client,
@@ -563,6 +565,9 @@ impl Bot {
                 account.set_perp(leverage(&p));
             }
             self.accounts.lock().unwrap().insert(ex.to_owned(), account);
+            if let Some(w) = worker.take() {
+                tokio::spawn(w);
+            }
         }
         if let Some(a) = self.accounts.lock().unwrap().get_mut(ex) {
             for s in symbols {

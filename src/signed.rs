@@ -22,7 +22,7 @@ impl Keys {
             if testnet { "_TESTNET" } else { "" }
         );
         let get = |k: &str| {
-            std::env::var(format!("{p}_{k}"))
+            crate::util::env(&format!("{p}_{k}"))
                 .ok()
                 .map(|v| v.trim().to_owned())
                 .filter(|v| !v.is_empty())
@@ -361,7 +361,7 @@ impl Client {
 
 /// Адрес потока событий счёта перпов (к нему добавляется /listenKey); BINANCE_FSTREAM_URL — свой адрес.
 pub fn fstream_url(testnet: bool) -> String {
-    std::env::var("BINANCE_FSTREAM_URL")
+    crate::util::env("BINANCE_FSTREAM_URL")
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| {
@@ -375,7 +375,7 @@ pub fn fstream_url(testnet: bool) -> String {
 
 /// Адрес WebSocket API Binance (события счёта); переменная BINANCE_WS_API_URL — свой адрес (проверки, прокси).
 pub fn ws_api_url(testnet: bool) -> String {
-    std::env::var("BINANCE_WS_API_URL")
+    crate::util::env("BINANCE_WS_API_URL")
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| {

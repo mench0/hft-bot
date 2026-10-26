@@ -51,6 +51,34 @@ pub fn iso_ms(ms: u64) -> String {
     )
 }
 
+/// Переопределения переменных окружения для тестов (тесты идут параллельно, а `set_var` при одновременном чтении
+/// окружения из других потоков небезопасен).
+static ENV_OVERRIDES: std::sync::Mutex<Option<std::collections::HashMap<String, String>>> =
+    std::sync::Mutex::new(None);
+
+/// Переменная окружения (сначала — переопределения тестов).
+pub fn env(key: &str) -> Result<String, std::env::VarError> {
+    if let Some(v) = ENV_OVERRIDES
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(key))
+    {
+        return Ok(v.clone());
+    }
+    std::env::var(key)
+}
+
+/// Задать переменную для тестов (без изменения окружения процесса).
+#[cfg(test)]
+pub fn set_env(key: &str, value: &str) {
+    ENV_OVERRIDES
+        .lock()
+        .unwrap()
+        .get_or_insert_with(Default::default)
+        .insert(key.to_owned(), value.to_owned());
+}
+
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

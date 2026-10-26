@@ -16,7 +16,7 @@ pub const REST: &str = "https://www.okx.com";
 
 /// Адрес приватного потока; OKX_WS_PRIVATE_URL — свой.
 pub fn private_url(testnet: bool) -> String {
-    std::env::var("OKX_WS_PRIVATE_URL")
+    crate::util::env("OKX_WS_PRIVATE_URL")
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| {

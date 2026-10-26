@@ -196,6 +196,9 @@ impl Account {
         if let Account::Live(live) = self {
             v["поток_событий_счёта"] = Value::Bool(live.stream_ok);
             v["событий_счёта"] = Value::from(live.stream_events);
+            if !live.stream_error.is_empty() {
+                v["ошибка_потока_счёта"] = Value::from(live.stream_error.clone());
+            }
         }
         v
     }

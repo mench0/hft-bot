@@ -23,7 +23,7 @@ pub fn rest_url(perp: bool, testnet: bool) -> &'static str {
 
 /// Адрес потока событий счёта (к нему добавляется /listenKey); ASTER_STREAM_URL — свой адрес.
 pub fn stream_url(perp: bool, testnet: bool) -> String {
-    std::env::var("ASTER_STREAM_URL")
+    crate::util::env("ASTER_STREAM_URL")
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| {
