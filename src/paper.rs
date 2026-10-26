@@ -534,6 +534,11 @@ impl Paper {
         self.check_loss(lim);
     }
 
+    /// Баланс одного актива с биржи (событие счёта).
+    pub fn set_balance(&mut self, asset: &str, free: f64) {
+        self.free.insert(asset.to_owned(), free);
+    }
+
     /// Балансы с биржи (живой счёт): заменяют учётные.
     pub fn set_balances(&mut self, b: BTreeMap<String, f64>) {
         self.free = b;

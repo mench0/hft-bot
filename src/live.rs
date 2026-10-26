@@ -51,6 +51,10 @@ pub struct Live {
     pub lim: Limits,
     /// Последняя ошибка связи с биржей.
     pub error: String,
+    /// Поток событий счёта (WebSocket API) подключён и подписан — статусы приходят сами, опрос редкий.
+    pub stream_ok: bool,
+    /// Событий счёта получено.
+    pub stream_events: u64,
 }
 
 impl Live {
@@ -69,6 +73,8 @@ impl Live {
             mode,
             lim: Limits::from_params(&serde_json::Map::new()),
             error: String::new(),
+            stream_ok: false,
+            stream_events: 0,
         }
     }
 
@@ -200,6 +206,9 @@ impl Live {
         let Some(o) = self.orders.get_mut(&local) else {
             return;
         };
+        if st.executed < o.executed - 1e-12 {
+            return; // устаревший ответ (опрос пришёл позже события) — исполнение уже учтено
+        }
         o.exch = Some(st.id);
         let (dq, dquote) = (st.executed - o.executed, st.quote - o.quote);
         o.executed = st.executed;
@@ -224,6 +233,54 @@ impl Live {
         }
         if st.status == "REJECTED" || st.status == "EXPIRED" {
             self.ledger.note_rejected(&format!("биржа: {}", st.status));
+        }
+    }
+
+    /// Событие счёта: executionReport — состояние своего ордера (по clientOrderId hft<номер>), outboundAccountPosition — балансы.
+    pub fn on_event(&mut self, e: &serde_json::Value) {
+        self.stream_events += 1;
+        let n = |k: &str| {
+            e[k].as_str()
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0)
+        };
+        match e["e"].as_str() {
+            Some("executionReport") => {
+                // при снятии c — номер запроса на снятие, исходный — в C
+                let status = e["X"].as_str().unwrap_or("");
+                let client = match e["C"].as_str() {
+                    Some(c) if !c.is_empty() && status == "CANCELED" => c,
+                    _ => e["c"].as_str().unwrap_or(""),
+                };
+                let Some(local) = client
+                    .strip_prefix("hft")
+                    .and_then(|x| x.parse::<u64>().ok())
+                else {
+                    return;
+                };
+                let Some(id) = e["i"].as_u64() else { return };
+                self.on_state(
+                    local,
+                    &OrderState {
+                        id,
+                        status: status.to_owned(),
+                        executed: n("z"),
+                        quote: n("Z"),
+                    },
+                );
+            }
+            Some("outboundAccountPosition") => {
+                for b in e["B"].as_array().into_iter().flatten() {
+                    let f = b["f"]
+                        .as_str()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                    if let Some(a) = b["a"].as_str() {
+                        self.ledger.set_balance(a, f);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -294,6 +351,14 @@ pub async fn worker(
     if let Err(e) = client.sync_time().await {
         tracing::warn!("[{ex}] время сервера не получено: {e}");
     }
+    let ws_url =
+        crate::signed::ws_api_url(with_live(&acc, &ex, |l| l.mode == "TESTNET").unwrap_or(false));
+    let _stream = AbortOnDrop(tokio::spawn(user_stream(
+        acc.clone(),
+        ex.clone(),
+        client.clone(),
+        ws_url,
+    )));
     let mut poll = tokio::time::interval(Duration::from_millis(500));
     let mut n: u64 = 0;
     loop {
@@ -323,7 +388,13 @@ pub async fn worker(
             }
             _ = poll.tick() => {
                 n += 1;
-                let pending = with_live(&acc, &ex, |l| { l.trim(); l.pending() }).unwrap_or_default();
+                // поток событий работает — опрос раз в 5 с для подстраховки, иначе каждые 0.5 с
+                let stream_ok = with_live(&acc, &ex, |l| l.stream_ok).unwrap_or(false);
+                let pending = if stream_ok && !n.is_multiple_of(10) {
+                    Vec::new()
+                } else {
+                    with_live(&acc, &ex, |l| { l.trim(); l.pending() }).unwrap_or_default()
+                };
                 for (local, symbol, id) in pending {
                     match client.signed(reqwest::Method::GET, "/api/v3/order", &[("symbol", symbol), ("orderId", id.to_string())]).await
                         .and_then(|v| OrderState::from(&v)) {
@@ -339,6 +410,81 @@ pub async fn worker(
                 }
             }
         }
+    }
+}
+
+/// Снять задачу, когда фоновая задача счёта закончилась.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Поток событий счёта через WebSocket API: подписка userDataStream.subscribe.signature, события executionReport и
+/// outboundAccountPosition; при обрыве — переподключение с паузой 0.5 → 30 с (пока нет потока — частый опрос).
+async fn user_stream(acc: Shared, ex: String, client: Arc<Client>, url: String) {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let mut backoff = crate::feed::Backoff::default();
+    let mut seq = 0u64;
+    loop {
+        let err = match tokio_tungstenite::connect_async(url.as_str()).await {
+            Ok((mut ws, _)) => {
+                seq += 1;
+                let sub = format!("sub{seq}");
+                let req = client.ws_request(&sub, "userDataStream.subscribe.signature");
+                let mut err = ws
+                    .send(Message::text(req))
+                    .await
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_default();
+                while err.is_empty() {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(t))) => {
+                            let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) else {
+                                continue;
+                            };
+                            if let Some(e) = v.get("event") {
+                                with_live(&acc, &ex, |l| l.on_event(e));
+                            } else if v["id"] == sub.as_str() {
+                                if v["status"] == 200 {
+                                    tracing::info!("[{ex}] поток событий счёта подключён");
+                                    backoff.reset();
+                                    with_live(&acc, &ex, |l| l.stream_ok = true);
+                                } else {
+                                    err = format!(
+                                        "подписка на события счёта отклонена: {}",
+                                        v["error"]
+                                    );
+                                }
+                            }
+                        }
+                        Some(Ok(Message::Ping(p))) => {
+                            let _ = ws.send(Message::Pong(p)).await;
+                        }
+                        Some(Ok(Message::Close(c))) => err = format!("закрыто биржей: {c:?}"),
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => err = e.to_string(),
+                        None => err = "соединение закрыто".into(),
+                    }
+                }
+                err
+            }
+            Err(e) => e.to_string(),
+        };
+        with_live(&acc, &ex, |l| {
+            l.stream_ok = false;
+            l.error = format!("поток событий: {err}");
+        });
+        let pause = backoff.next();
+        tracing::warn!(
+            "[{ex}] поток событий счёта: {err} — переподключение через {} мс",
+            pause.as_millis()
+        );
+        tokio::time::sleep(pause).await;
     }
 }
 

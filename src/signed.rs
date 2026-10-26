@@ -126,6 +126,14 @@ impl Client {
         Ok(v)
     }
 
+    /// Подписанный запрос WebSocket API (ws-api/v3): параметры по алфавиту вместе с apiKey и timestamp, подпись HMAC.
+    pub fn ws_request(&self, id: &str, method: &str) -> String {
+        let ts = now_ms() + self.offset_ms.load(Ordering::Relaxed);
+        let query = format!("apiKey={}&timestamp={ts}", self.keys.key);
+        serde_json::json!({"id": id, "method": method, "params": {
+            "apiKey": self.keys.key, "timestamp": ts, "signature": sign(&self.keys.secret, &query)}}).to_string()
+    }
+
     /// Свободные балансы больше нуля.
     pub async fn balances(&self) -> Result<std::collections::BTreeMap<String, f64>, String> {
         let v = self
@@ -146,6 +154,20 @@ impl Client {
             })
             .collect())
     }
+}
+
+/// Адрес WebSocket API Binance (события счёта); переменная BINANCE_WS_API_URL — свой адрес (проверки, прокси).
+pub fn ws_api_url(testnet: bool) -> String {
+    std::env::var("BINANCE_WS_API_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| {
+            if testnet {
+                "wss://ws-api.testnet.binance.vision/ws-api/v3".into()
+            } else {
+                "wss://ws-api.binance.com:443/ws-api/v3".into()
+            }
+        })
 }
 
 /// Состояние ордера на бирже: статус, исполнено, сумма исполненного в котируемой валюте.

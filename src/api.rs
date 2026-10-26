@@ -929,6 +929,8 @@ mod tests {
             orders: Vec<(u64, String, f64, f64)>,
             bad_sig: u32,
             cancels: u32,
+            /// номер ордера на бирже → clientOrderId
+            clients: Vec<(u64, String)>,
         }
         let ex = Arc::new(Mutex::new(Ex {
             usdt: 1000.0,
@@ -965,6 +967,7 @@ mod tests {
                 if !check(&q, &h) { x.bad_sig += 1; return (StatusCode::UNAUTHORIZED, Json(json!({"code": -1022, "msg": "Signature"}))); }
                 let qty: f64 = param(&q, "quantity").unwrap().parse().unwrap();
                 let id = 1000 + x.orders.len() as u64;
+                x.clients.push((id, param(&q, "newClientOrderId").unwrap_or_default()));
                 if param(&q, "type").as_deref() == Some("MARKET") {
                     x.usdt -= qty * 101.0;
                     x.btc += qty;
@@ -1010,8 +1013,41 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         });
+        // WebSocket API: проверить подпись подписки на события счёта, затем слать события из канала
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let sub_ok = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sub_ok2 = sub_ok.clone();
+        let al = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let aaddr = al.local_addr().unwrap();
+        tokio::spawn(async move {
+            use futures_util::StreamExt;
+            let (tcp, _) = al.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let Some(Ok(Message::Text(t))) = ws.next().await else {
+                return;
+            };
+            let v: Value = serde_json::from_str(&t).unwrap();
+            let p = &v["params"];
+            let q = format!(
+                "apiKey={}&timestamp={}",
+                p["apiKey"].as_str().unwrap(),
+                p["timestamp"]
+            );
+            let ok = v["method"] == "userDataStream.subscribe.signature"
+                && p["apiKey"] == "test-key"
+                && crate::signed::sign(SECRET, &q) == p["signature"].as_str().unwrap();
+            sub_ok2.store(ok, std::sync::atomic::Ordering::SeqCst);
+            let reply = json!({"id": v["id"], "status": if ok { 200 } else { 401 }, "result": {"subscriptionId": 0}});
+            ws.send(Message::text(reply.to_string())).await.unwrap();
+            while let Some(e) = ev_rx.recv().await {
+                if ws.send(Message::text(e)).await.is_err() {
+                    break;
+                }
+            }
+        });
         // SAFETY: тест один задаёт эти переменные; остальные тесты ключей testnet не читают
         unsafe {
+            std::env::set_var("BINANCE_WS_API_URL", format!("ws://{aaddr}"));
             std::env::set_var("BINANCE_TESTNET_API_KEY", "test-key");
             std::env::set_var("BINANCE_TESTNET_API_SECRET", SECRET);
         }
@@ -1046,6 +1082,71 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        // поток событий счёта: лимитная покупка исполнилась — узнаём из события, а не из опроса (он раз в 5 с)
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (_, s) = call(&r, "GET", "/status", "").await;
+            if s["binance"]["поток_событий_счёта"] == json!(true) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "поток событий не подключён: {s}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            sub_ok.load(std::sync::atomic::Ordering::SeqCst),
+            "подпись подписки верна"
+        );
+        let (_, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=binance&symbol=BTCUSDT&side=BUY&type=LIMIT&qty=1&price=99",
+            "",
+        )
+        .await;
+        assert_eq!(v["статус"], json!("NEW"), "{v}");
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        let (oid, client) = loop {
+            if let Some(c) = ex
+                .lock()
+                .unwrap()
+                .clients
+                .last()
+                .filter(|c| c.1.starts_with("hft"))
+                .cloned()
+                .filter(|c| c.0 >= 1001)
+            {
+                break c;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "лимитная заявка не дошла до биржи"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        {
+            let mut x = ex.lock().unwrap();
+            x.btc += 1.0;
+            x.usdt -= 99.0;
+        }
+        ev_tx.send(json!({"subscriptionId": 0, "event": {"e": "executionReport", "s": "BTCUSDT", "c": client, "C": "",
+            "S": "BUY", "X": "FILLED", "i": oid, "z": "1", "Z": "99"}}).to_string()).unwrap();
+        let t0 = tokio::time::Instant::now();
+        loop {
+            let (_, b) = call(&r, "GET", "/balances?exchange=binance", "").await;
+            if b["свободно"]["BTC"] == json!(2.0) {
+                break;
+            }
+            assert!(
+                t0.elapsed() < Duration::from_millis(1500),
+                "исполнение из события не учтено: {b}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (_, s) = call(&r, "GET", "/status", "").await;
+        assert!(s["binance"]["событий_счёта"].as_u64().unwrap() >= 1);
         let (_, v) = call(
             &r,
             "POST",
@@ -1070,7 +1171,7 @@ mod tests {
             json!("TESTNET"),
             "{s}"
         );
-        assert_eq!(s["binance"]["ордеров_принято"], json!(2));
+        assert_eq!(s["binance"]["ордеров_принято"], json!(3));
         assert_eq!(ex.lock().unwrap().bad_sig, 0, "все запросы подписаны верно");
         call(&r, "POST", "/control/stop", "").await;
     }

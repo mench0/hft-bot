@@ -128,8 +128,13 @@ impl Account {
     /// Показатели для /status: kill switch, дневной результат, принято/отклонено, последний отказ.
     pub fn stats(&self) -> Value {
         let l = self.ledger();
-        json!({"kill_switch": l.kill_switch, "дневной_pnl": l.daily_pnl, "ордеров_принято": l.accepted,
-            "ордеров_отклонено": l.rejected, "последний_отказ": l.last_reject})
+        let mut v = json!({"kill_switch": l.kill_switch, "дневной_pnl": l.daily_pnl, "ордеров_принято": l.accepted,
+            "ордеров_отклонено": l.rejected, "последний_отказ": l.last_reject});
+        if let Account::Live(live) = self {
+            v["поток_событий_счёта"] = Value::Bool(live.stream_ok);
+            v["событий_счёта"] = Value::from(live.stream_events);
+        }
+        v
     }
 
     /// Тестовый счёт (бумага и testnet; у реального счёта — None, как в Java).
