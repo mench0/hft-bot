@@ -18,6 +18,7 @@ mod kucoin_api;
 mod leadlag;
 mod live;
 mod market;
+mod mexc_api;
 mod okx_api;
 mod paper;
 mod perparb;

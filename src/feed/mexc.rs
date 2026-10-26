@@ -45,9 +45,9 @@ impl MexcSpot {
 }
 
 /// Читатель protobuf: varint, поля по типу.
-struct Pb<'a> {
-    b: &'a [u8],
-    pos: usize,
+pub struct Pb<'a> {
+    pub b: &'a [u8],
+    pub pos: usize,
 }
 
 impl<'a> Pb<'a> {
@@ -65,7 +65,7 @@ impl<'a> Pb<'a> {
     }
 
     /// Следующее поле: (номер, тип, байты для типа 2, число для типа 0).
-    fn field(&mut self) -> Result<(u64, u64, &'a [u8], u64), String> {
+    pub fn field(&mut self) -> Result<(u64, u64, &'a [u8], u64), String> {
         let tag = self.varint()?;
         let (f, w) = (tag >> 3, tag & 7);
         match w {
@@ -91,7 +91,7 @@ impl<'a> Pb<'a> {
         }
     }
 
-    fn done(&self) -> bool {
+    pub fn done(&self) -> bool {
         self.pos >= self.b.len()
     }
 }

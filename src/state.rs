@@ -418,10 +418,10 @@ impl Bot {
         }
         if !matches!(
             ex,
-            "binance" | "bybit" | "aster" | "okx" | "gate" | "kucoin" | "bingx"
+            "binance" | "bybit" | "aster" | "okx" | "gate" | "kucoin" | "bingx" | "mexc"
         ) {
             tracing::warn!(
-                "[{ex}] реальные ордера в Rust-бэкенде пока только для Binance, Bybit, Aster, OKX, Gate, KuCoin и BingX (спот и USDT-перпы) — бумажный режим"
+                "[{ex}] реальные ордера в Rust-бэкенде пока только для Binance, Bybit, Aster, OKX, Gate, KuCoin, BingX и MEXC (спот и USDT-перпы) — бумажный режим"
             );
             return None;
         }
@@ -510,6 +510,7 @@ impl Bot {
                                 "gate" => crate::gate_api::rest_url(perp, testnet),
                                 "kucoin" => crate::kucoin_api::rest_url(perp),
                                 "bingx" => crate::bingx_api::REST,
+                                "mexc" => crate::mexc_api::rest_url(perp),
                                 _ => crate::rest::default_url(perp, testnet),
                             }
                             .to_owned()
@@ -517,7 +518,9 @@ impl Bot {
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                     let mode = if testnet { "TESTNET" } else { "LIVE" };
                     tracing::warn!("[{ex}] режим {mode}: ордера пойдут на биржу ({base})");
-                    let client = Arc::new(if ex == "bingx" {
+                    let client = Arc::new(if ex == "mexc" {
+                        crate::live::Venue::Mexc(crate::mexc_api::Client::new(&base, keys, perp))
+                    } else if ex == "bingx" {
                         crate::live::Venue::Bingx(crate::bingx_api::Client::new(
                             &base, keys, perp, testnet,
                         ))
