@@ -59,9 +59,9 @@ fn s(b: &[u8]) -> String {
 }
 
 /// Событие спота из protobuf: ордер (свой номер, состояние) и/или баланс (актив, свободно).
-pub fn parse_private_pb(
-    data: &[u8],
-) -> Result<(Option<(u64, OrderState)>, Option<(String, f64)>), String> {
+pub type PrivateEvent = (Option<(u64, OrderState)>, Option<(String, f64)>);
+
+pub fn parse_private_pb(data: &[u8]) -> Result<PrivateEvent, String> {
     let mut w = Pb { b: data, pos: 0 };
     let (mut order, mut account) = (None, None);
     while !w.done() {
