@@ -1,4 +1,4 @@
-//! OKX v5 (спот): канал `books` (снимок, затем изменения по `action`) и `bbo-tbt` (лучшие цены), номер `seqId` общий.
+//! OKX v5 (спот и перпы SWAP — BTC-USDT-SWAP, объёмы в контрактах переводятся в монеты по ctVal): канал `books` (снимок, затем изменения по `action`) и `bbo-tbt` (лучшие цены), номер `seqId` общий.
 //! Инструмент BTC-USDT. Пинг — текст `ping` раз в 20 с (без сообщений 30 с OKX закрывает соединение).
 
 use super::{Dialect, Parsed, Update, levels};
@@ -20,9 +20,14 @@ pub fn inst_id(s: &str) -> String {
     split(s).map_or_else(|| s.to_uppercase(), |(b, q)| format!("{b}-{q}"))
 }
 
+/// Размер контракта по символу (BTCUSDT → монет в контракте); общий для фида и загрузки при старте.
+pub type ContractSizes = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, f64>>>;
+
 pub struct Okx {
     url: String,
     args: Vec<Value>,
+    /// Перпы: размеры контрактов; пока размер символа не получен, его обновления пропускаются.
+    swap: Option<ContractSizes>,
 }
 
 impl Okx {
@@ -34,7 +39,28 @@ impl Okx {
                 args.push(json!({"channel": "bbo-tbt", "instId": inst_id(s)}));
             }
         }
-        Okx { url, args }
+        Okx {
+            url,
+            args,
+            swap: None,
+        }
+    }
+
+    /// Перпы: инструменты BTC-USDT-SWAP, объёмы стакана × ctVal.
+    pub fn new_swap(url: String, symbols: &[String], bbo: bool, sizes: ContractSizes) -> Okx {
+        let mut args = Vec::new();
+        for s in symbols {
+            let id = format!("{}-SWAP", inst_id(s));
+            args.push(json!({"channel": "books", "instId": id}));
+            if bbo {
+                args.push(json!({"channel": "bbo-tbt", "instId": id}));
+            }
+        }
+        Okx {
+            url,
+            args,
+            swap: Some(sizes),
+        }
     }
 }
 
@@ -68,11 +94,23 @@ impl Dialect for Okx {
             };
         }
         let ch = v["arg"]["channel"].as_str().unwrap_or("");
-        let sym = v["arg"]["instId"].as_str().unwrap_or("").replace('-', "");
+        let sym = v["arg"]["instId"]
+            .as_str()
+            .unwrap_or("")
+            .trim_end_matches("-SWAP")
+            .replace('-', "");
+        let k = match &self.swap {
+            None => 1.0,
+            Some(sizes) => match sizes.lock().unwrap().get(&sym) {
+                Some(k) => *k,
+                None => return Ok(vec![]), // размер контракта ещё не получен
+            },
+        };
+        let scale = |l: Vec<(f64, f64)>| l.into_iter().map(|(p, q)| (p, q * k)).collect::<Vec<_>>();
         let mut out = Vec::new();
         for d in v["data"].as_array().into_iter().flatten() {
             let id = d["seqId"].as_u64().unwrap_or(0);
-            let (bids, asks) = (levels(d.get("bids")), levels(d.get("asks")));
+            let (bids, asks) = (scale(levels(d.get("bids"))), scale(levels(d.get("asks"))));
             match ch {
                 "bbo-tbt" => {
                     if let (Some(b), Some(a)) = (bids.first(), asks.first()) {
@@ -135,5 +173,28 @@ mod tests {
         assert!(matches!(&u[0], Update::Delta { id: 6, bids, .. } if bids == &vec![(100.0, 0.0)]));
         let b = d.parse(r#"{"arg":{"channel":"bbo-tbt","instId":"BTC-USDT"},"data":[{"bids":[["100.5","1","0","1"]],"asks":[["100.6","1","0","1"]],"seqId":7}]}"#).unwrap();
         assert!(matches!(b[0], Update::Best { id: 7, .. }));
+    }
+
+    #[test]
+    fn swap_scales_contracts() {
+        let sizes: ContractSizes = Default::default();
+        let d = Okx::new_swap("wss://x".into(), &["BTCUSDT".into()], false, sizes.clone());
+        assert!(d.subscribe()[0].contains("BTC-USDT-SWAP"));
+        let m = r#"{"arg":{"channel":"books","instId":"BTC-USDT-SWAP"},"action":"snapshot","data":[{"bids":[["100","5","0","1"]],"asks":[["101","3","0","1"]],"seqId":7}]}"#;
+        assert_eq!(
+            d.parse(m),
+            Ok(vec![]),
+            "размер контракта не известен — пропуск"
+        );
+        sizes.lock().unwrap().insert("BTCUSDT".into(), 0.01);
+        assert_eq!(
+            d.parse(m),
+            Ok(vec![Update::Snapshot {
+                sym: "BTCUSDT".into(),
+                bids: vec![(100.0, 0.05)],
+                asks: vec![(101.0, 0.03)],
+                id: 7
+            }])
+        );
     }
 }

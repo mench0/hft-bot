@@ -4,6 +4,7 @@
 pub mod binance;
 pub mod bybit;
 pub mod gate;
+pub mod gate_futures;
 pub mod okx;
 
 use crate::market::Market;
@@ -105,6 +106,8 @@ pub fn start(
         .get("wsBookTicker")
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    // перпы OKX и Gate: размеры контрактов (объёмы стакана — в контрактах)
+    let sizes: okx::ContractSizes = Default::default();
     let dialect: Arc<dyn Dialect> = match ex {
         "binance" => {
             let base = ws_url.unwrap_or_else(|| binance::default_url(perp, testnet).to_owned());
@@ -127,11 +130,18 @@ pub fn start(
             &symbols,
             bbo,
         )),
-        "okx" | "gate" => {
-            return Plan::Unsupported(format!(
-                "{ex}: фида перпов в Rust-бэкенде ещё нет — только спот"
-            ));
-        }
+        "okx" => Arc::new(okx::Okx::new_swap(
+            ws_url.unwrap_or_else(|| okx::default_url(testnet).into()),
+            &symbols,
+            bbo,
+            sizes.clone(),
+        )),
+        "gate" => Arc::new(gate_futures::GateFutures::new(
+            ws_url.unwrap_or_else(|| gate_futures::default_url(testnet).into()),
+            &symbols,
+            bbo,
+            sizes.clone(),
+        )),
         _ => {
             return Plan::Unsupported(format!(
                 "{ex}: фида в Rust-бэкенде ещё нет — есть binance, bybit, okx, gate"
@@ -150,10 +160,12 @@ pub fn start(
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| {
-            if ex == "bybit" {
-                crate::bybit_api::rest_url(testnet)
-            } else {
-                crate::rest::default_url(perp, testnet)
+            match ex.as_str() {
+                "bybit" => crate::bybit_api::rest_url(testnet),
+                "okx" => "https://www.okx.com",
+                "gate" if testnet => "https://fx-api-testnet.gateio.ws",
+                "gate" => "https://api.gateio.ws",
+                _ => crate::rest::default_url(perp, testnet),
             }
             .to_owned()
         });
@@ -166,10 +178,17 @@ pub fn start(
             symbols.clone(),
         )
     });
+    let contracts = (perp && matches!(ex.as_str(), "okx" | "gate"))
+        .then(|| contract_sizes_loop(market.clone(), ex.clone(), rest_url.clone(), sizes));
     let funding = perp.then(|| funding_loop(market, ex.clone(), rest_url, symbols));
     Plan::Run(tokio::spawn(async move {
         tokio::join!(
             run(m, ex, dialect),
+            async {
+                if let Some(c) = contracts {
+                    c.await
+                }
+            },
             async {
                 if let Some(r) = rest {
                     r.await
@@ -310,6 +329,29 @@ async fn rest_loop(
         }
         market.with_feed(&ex, |s| s.rest_error = err);
         tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
+/// Размеры контрактов перпов OKX и Gate: при старте (повтор раз в 10 с, пока не получены), затем раз в час.
+async fn contract_sizes_loop(
+    market: Arc<Market>,
+    ex: String,
+    base: String,
+    sizes: okx::ContractSizes,
+) {
+    loop {
+        match crate::rest::contract_sizes(&ex, &base).await {
+            Ok(m) if !m.is_empty() => {
+                tracing::info!("[{ex}] размеры контрактов получены: {}", m.len());
+                sizes.lock().unwrap().extend(m);
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+            Ok(_) => tokio::time::sleep(Duration::from_secs(10)).await,
+            Err(e) => {
+                market.with_feed(&ex, |s| s.rest_error = format!("размеры контрактов: {e}"));
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+        }
     }
 }
 

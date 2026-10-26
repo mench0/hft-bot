@@ -167,10 +167,12 @@ pub async fn minute_volumes(
 /// Ставка funding перпа: Binance — /fapi/v1/premiumIndex, Bybit — /v5/market/tickers (linear).
 pub async fn funding(ex: &str, base: &str, symbol: &str) -> Result<crate::market::Funding, String> {
     let base = base.trim_end_matches('/');
-    let url = if ex == "bybit" {
-        format!("{base}/v5/market/tickers?category=linear&symbol={symbol}")
-    } else {
-        format!("{base}/fapi/v1/premiumIndex?symbol={symbol}")
+    let (b, q) = crate::paper::split(symbol).unwrap_or((symbol.to_owned(), String::new()));
+    let url = match ex {
+        "bybit" => format!("{base}/v5/market/tickers?category=linear&symbol={symbol}"),
+        "okx" => format!("{base}/api/v5/public/funding-rate?instId={b}-{q}-SWAP"),
+        "gate" => format!("{base}/api/v4/futures/usdt/contracts/{b}_{q}"),
+        _ => format!("{base}/fapi/v1/premiumIndex?symbol={symbol}"),
     };
     let v: serde_json::Value = client()
         .get(&url)
@@ -187,9 +189,28 @@ pub async fn funding(ex: &str, base: &str, symbol: &str) -> Result<crate::market
             .or_else(|| x.as_f64())
             .unwrap_or(0.0)
     };
+    if ex == "gate" {
+        // funding_next_apply — в секундах
+        let r = &v["funding_rate"];
+        if r.is_null() {
+            return Err(format!("нет ставки funding: {v}"));
+        }
+        return Ok(crate::market::Funding {
+            rate: n(r),
+            next_ms: (n(&v["funding_next_apply"]) * 1000.0) as u64,
+            mark: n(&v["mark_price"]),
+        });
+    }
     let (rate, next, mark) = if ex == "bybit" {
         let t = &v["result"]["list"][0];
         (&t["fundingRate"], &t["nextFundingTime"], &t["markPrice"])
+    } else if ex == "okx" {
+        let t = &v["data"][0];
+        (
+            &t["fundingRate"],
+            &t["fundingTime"],
+            &serde_json::Value::Null,
+        )
     } else {
         (
             &v["lastFundingRate"],
@@ -205,6 +226,59 @@ pub async fn funding(ex: &str, base: &str, symbol: &str) -> Result<crate::market
         next_ms: n(next) as u64,
         mark: n(mark),
     })
+}
+
+/// Размеры контрактов перпов: OKX — ctVal (/api/v5/public/instruments?instType=SWAP), Gate — quanto_multiplier
+/// (/api/v4/futures/usdt/contracts). Ключ — символ бота (BTCUSDT).
+pub async fn contract_sizes(ex: &str, base: &str) -> Result<HashMap<String, f64>, String> {
+    let base = base.trim_end_matches('/');
+    let url = if ex == "okx" {
+        format!("{base}/api/v5/public/instruments?instType=SWAP")
+    } else {
+        format!("{base}/api/v4/futures/usdt/contracts")
+    };
+    let v: serde_json::Value = client()
+        .get(&url)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(parse_contract_sizes(ex, &v))
+}
+
+pub fn parse_contract_sizes(ex: &str, v: &serde_json::Value) -> HashMap<String, f64> {
+    let n = |x: &serde_json::Value| {
+        x.as_str()
+            .and_then(|s| s.parse::<f64>().ok())
+            .or_else(|| x.as_f64())
+    };
+    let list = if ex == "okx" { &v["data"] } else { v };
+    list.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            if ex == "okx" {
+                // только линейные (USDT/USDC); у инверсных ctVal — в долларах
+                if c["ctType"] != "linear" {
+                    return None;
+                }
+                let id = c["instId"]
+                    .as_str()?
+                    .trim_end_matches("-SWAP")
+                    .replace('-', "");
+                Some((id, n(&c["ctVal"])?))
+            } else {
+                Some((
+                    c["name"].as_str()?.replace('_', ""),
+                    n(&c["quanto_multiplier"])?,
+                ))
+            }
+        })
+        .filter(|(_, k)| *k > 0.0)
+        .collect()
 }
 
 #[cfg(test)]
@@ -269,5 +343,22 @@ mod tests {
             vec![123.5],
             "незакрытая минута не считается"
         );
+    }
+
+    #[test]
+    fn contract_sizes_okx_and_gate() {
+        let o = parse_contract_sizes(
+            "okx",
+            &serde_json::json!({"data": [
+            {"instId": "BTC-USDT-SWAP", "ctType": "linear", "ctVal": "0.01"},
+            {"instId": "BTC-USD-SWAP", "ctType": "inverse", "ctVal": "100"}]}),
+        );
+        assert_eq!(o.len(), 1);
+        assert_eq!(o["BTCUSDT"], 0.01);
+        let g = parse_contract_sizes(
+            "gate",
+            &serde_json::json!([{"name": "ETH_USDT", "quanto_multiplier": "0.01"}]),
+        );
+        assert_eq!(g["ETHUSDT"], 0.01);
     }
 }
