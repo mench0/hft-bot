@@ -1218,6 +1218,115 @@ impl Bot {
         Ok(self.accounts.lock().unwrap()[ex].balances())
     }
 
+    /// Ставки funding выбранных символов биржи (как PerpAccount.stats().funding в Java): интервал — 8 ч,
+    /// у Hyperliquid — 1 ч.
+    fn funding_rates(&self, ex: &str) -> Vec<Value> {
+        let hours = if ex == "hyperliquid" { 1.0 } else { 8.0 };
+        let selected = self
+            .snapshot()
+            .selection
+            .get(ex)
+            .cloned()
+            .unwrap_or_default();
+        selected
+            .iter()
+            .filter_map(|s| {
+                let f = self.market.funding(ex, s)?;
+                Some(json!({"symbol": s, "ratePercent": f.rate * 100.0, "intervalHours": hours,
+                    "per8hPercent": f.rate * 8.0 / hours * 100.0, "aprPercent": f.rate * 24.0 / hours * 365.0 * 100.0,
+                    "nextFundingMs": f.next_ms}))
+            })
+            .collect()
+    }
+
+    /// GET /positions: позиции перпов, плечо и ставки по биржам (exchange — одна или all).
+    pub fn positions_json(&self, target: &str) -> Value {
+        let mut out = serde_json::Map::new();
+        let mut acc = self.accounts.lock().unwrap();
+        for (ex, a) in acc
+            .iter_mut()
+            .filter(|(ex, _)| target == "all" || target == ex.as_str())
+        {
+            if !a.is_perp() {
+                continue;
+            }
+            let ps: Vec<Value> = a
+                .positions()
+                .into_iter()
+                .filter(|(_, q, _)| q.abs() > 1e-12)
+                .map(|(s, q, e)| {
+                    let mark = self.market.book(ex, &s).and_then(|b| b.mid());
+                    json!({"symbol": s, "side": if q > 0.0 { "LONG" } else { "SHORT" }, "qty": q.abs(), "entryPrice": e,
+                        "markPrice": mark, "notional": mark.map(|m| q.abs() * m), "unrealizedPnl": mark.map(|m| q * (m - e))})
+                })
+                .collect();
+            out.insert(
+                ex.clone(),
+                json!({"leverage": leverage(&self.params(ex)), "positions": ps,
+                "funding": self.funding_rates(ex)}),
+            );
+        }
+        Value::Object(out)
+    }
+
+    /// GET /funding: ставки funding по биржам перпов.
+    pub fn funding_json(&self) -> Value {
+        let perps: Vec<String> = self
+            .accounts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, a)| a.is_perp())
+            .map(|(e, _)| e.clone())
+            .collect();
+        let rates: serde_json::Map<String, Value> = perps
+            .into_iter()
+            .map(|ex| {
+                let r = self.funding_rates(&ex);
+                (ex, Value::from(r))
+            })
+            .collect();
+        json!({"rates": rates})
+    }
+
+    /// POST /positions/close: закрыть позицию рыночным выходом (symbol=all — все позиции биржи).
+    pub fn close_positions(&self, ex: &str, symbol: &str) -> ActionResult<Value> {
+        self.running_exchange(ex)?;
+        let mut acc = self.accounts.lock().unwrap();
+        let a = acc.get_mut(ex).expect("счёт запущенной биржи");
+        if !a.is_perp() {
+            return Err(format!("Биржа {ex} торгует спотом — позиций нет"));
+        }
+        let symbols: Vec<String> = if symbol.eq_ignore_ascii_case("all") {
+            a.positions()
+                .into_iter()
+                .filter(|(_, q, _)| q.abs() > 1e-12)
+                .map(|(s, _, _)| s)
+                .collect()
+        } else {
+            vec![symbol.to_uppercase()]
+        };
+        let closed: Vec<Value> = symbols
+            .into_iter()
+            .map(|s| {
+                let q = a.position_qty(&s);
+                if q.abs() <= 1e-12 {
+                    return json!({"symbol": s, "status": "позиции нет"});
+                }
+                let side = if q > 0.0 { crate::paper::Side::Sell } else { crate::paper::Side::Buy };
+                let book = self.market.book(ex, &s);
+                match a.exit_market(&s, side, q.abs(), book.as_ref()) {
+                    Ok(f) => {
+                        tracing::warn!("[{ex}] позиция {s} закрывается через админку: {q}");
+                        json!({"symbol": s, "status": f.status, "executedQty": f.executed, "avgPrice": f.avg_price})
+                    }
+                    Err(e) => json!({"symbol": s, "status": "ошибка", "error": e}),
+                }
+            })
+            .collect();
+        Ok(json!({"биржа": ex, "closed": closed}))
+    }
+
     /// Сбросить тестовый счёт: бумажный — к стартовому балансу, живой — начать учёт результата заново
     /// (балансы на бирже не меняются).
     pub fn reset_account(&self, ex: &str) -> ActionResult<Value> {

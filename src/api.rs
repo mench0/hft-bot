@@ -124,6 +124,13 @@ pub fn router(bot: Arc<Bot>, cfg: AdminConfig) -> Router {
         .route("/order", axum::routing::post(order))
         .route("/cancel-all", axum::routing::post(cancel_all))
         .route("/balances", get(balances))
+        .route("/positions", get(positions))
+        .route("/positions/close", axum::routing::post(positions_close))
+        .route("/funding", get(funding))
+        .route(
+            "/control/exchanges",
+            get(|| async { Json(json!({"поддерживаемые": data::exchange_ids()})) }),
+        )
         .route("/paper/reset", axum::routing::post(reset_account))
         .route("/account/reset", axum::routing::post(reset_account))
         .route("/trading/start", axum::routing::post(trading_start))
@@ -423,6 +430,22 @@ async fn balances(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiE
     Ok(Json(
         json!({"свободно": a.bot.balances(need(&q, "exchange")?).map_err(bad)?}),
     ))
+}
+
+async fn positions(State(a): State<App>, Query(q): Q) -> Json<Value> {
+    Json(a.bot.positions_json(target(&q)))
+}
+
+async fn positions_close(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        a.bot
+            .close_positions(need(&q, "exchange")?, need(&q, "symbol")?)
+            .map_err(bad)?,
+    ))
+}
+
+async fn funding(State(a): State<App>) -> Json<Value> {
+    Json(a.bot.funding_json())
 }
 
 async fn reset_account(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiError> {
@@ -739,7 +762,7 @@ mod tests {
         assert_eq!(v["результат"], json!("ошибка"));
         assert!(v["сообщение"].as_str().unwrap().contains("scJumpTicks"));
         assert_eq!(
-            call(&r, "GET", "/positions", "").await.0,
+            call(&r, "GET", "/no-such-route", "").await.0,
             StatusCode::NOT_FOUND
         );
     }
@@ -3068,6 +3091,38 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        // позиции и ставки — как в Java (PerpAccount.stats)
+        let (_, p) = call(&r, "GET", "/positions?exchange=binance", "").await;
+        let x = &p["binance"]["positions"][0];
+        assert_eq!(
+            (
+                x["symbol"].clone(),
+                x["side"].clone(),
+                x["qty"].clone(),
+                x["entryPrice"].clone()
+            ),
+            (json!("BTCUSDT"), json!("SHORT"), json!(1.0), json!(100.0)),
+            "{p}"
+        );
+        assert_eq!(p["binance"]["leverage"], json!(5.0));
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let (_, f) = call(&r, "GET", "/funding", "").await;
+            if f["rates"]["binance"][0]["symbol"] == "BTCUSDT" {
+                assert_eq!(f["rates"]["binance"][0]["intervalHours"], json!(8.0));
+                break;
+            }
+            assert!(tokio::time::Instant::now() < until, "ставки нет: {f}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let (_, e) = call(&r, "GET", "/control/exchanges", "").await;
+        assert!(
+            e["поддерживаемые"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("binance")),
+            "{e}"
+        );
         up.store(true, Ordering::SeqCst);
         let until = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
@@ -3086,6 +3141,36 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        // новая позиция — закрыть через админку
+        let (c, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=binance&symbol=BTCUSDT&side=BUY&type=MARKET&qty=0.5",
+            "",
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        let (c, v) = call(
+            &r,
+            "POST",
+            "/positions/close?exchange=binance&symbol=all",
+            "",
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        assert_eq!(
+            v["closed"],
+            json!([{"symbol": "BTCUSDT", "status": "FILLED", "executedQty": 0.5, "avgPrice": 102.9}]),
+            "{v}"
+        );
+        let (_, v) = call(
+            &r,
+            "POST",
+            "/positions/close?exchange=binance&symbol=BTCUSDT",
+            "",
+        )
+        .await;
+        assert_eq!(v["closed"][0]["status"], "позиции нет");
         call(&r, "POST", "/control/stop", "").await;
     }
 
