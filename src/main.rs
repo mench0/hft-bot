@@ -10,6 +10,7 @@ mod data;
 mod feed;
 mod market;
 mod paper;
+mod spread;
 mod state;
 
 use std::net::SocketAddr;

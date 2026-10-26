@@ -118,6 +118,7 @@ pub fn router(bot: Arc<Bot>, cfg: AdminConfig) -> Router {
         )
         .route("/discovery", get(discovery))
         .route("/market", get(market))
+        .route("/strategies", get(strategies))
         .route("/order", axum::routing::post(order))
         .route("/cancel-all", axum::routing::post(cancel_all))
         .route("/balances", get(balances))
@@ -412,6 +413,13 @@ async fn trading_stop(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, 
 async fn trading_panic(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiError> {
     a.bot.panic(target(&q)).map_err(bad)?;
     Ok(ok("Все ордера отменены, торговля остановлена"))
+}
+
+async fn strategies(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiError> {
+    let ex = need(&q, "exchange")?;
+    Ok(Json(
+        json!({"биржа": ex, "стратегии": a.bot.strategies_json(ex).map_err(bad)?}),
+    ))
 }
 
 async fn market(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiError> {
@@ -810,6 +818,61 @@ mod tests {
         // сброс счёта
         let (_, a) = call(&r, "POST", "/paper/reset?exchange=binance", "").await;
         assert_eq!(a["closedTrades"], json!(0));
+        call(&r, "POST", "/control/stop", "").await;
+    }
+
+    /// «Сбор спреда» через API: цена ходит 100 → 97 → 103 со спредом 2% — стратегия покупает по биду, продаёт по аску
+    /// дороже средней покупки и выходит в плюс; /strategies показывает сделки, результат и очередь заявок.
+    #[tokio::test]
+    async fn spread_capture_flow() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            for i in 1..2000u64 {
+                let p = [100.0, 97.0, 103.0][((i / 15) % 3) as usize];
+                let msg = format!(
+                    r#"{{"stream":"xyzusdt@depth20@100ms","data":{{"lastUpdateId":{i},"bids":[["{}","100"]],"asks":[["{}","100"]]}}}}"#,
+                    p - 1.0,
+                    p + 1.0
+                );
+                if ws.send(Message::text(msg)).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let (_d, r) = app("");
+        let sel = format!(
+            "/control/select?exchange=binance&symbols=XYZUSDT&market=spot&wsUrl=ws://{addr}/stream&strategy=spread-capture\
+            &scRequoteMs=200&scStopLossPercent=50&scMaxDropPercent=0&scMinBookLevels=0&scMinDepthMultiple=0&scMaxTopChangesPerSec=0&maxOrdersPerMinute=10000"
+        );
+        assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
+        call(&r, "POST", "/control/start", "").await;
+        call(&r, "POST", "/trading/start", "").await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let st = loop {
+            let (_, v) = call(&r, "GET", "/strategies?exchange=binance", "").await;
+            let sc = v["стратегии"]["spreadCapture"].clone();
+            if sc["trades"].as_u64().unwrap_or(0) >= 2 {
+                break sc;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "нет сделок: {v}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert!(st["pnl"].as_f64().unwrap() > 0.0, "{st}");
+        assert_eq!(st["symbols"][0]["symbol"], json!("XYZUSDT"));
+        assert!(!st["symbols"][0]["decision"].as_str().unwrap().is_empty());
+        // выключили торговлю — заявки сняты, купленное продано
+        call(&r, "POST", "/trading/stop", "").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let (_, s) = call(&r, "GET", "/status", "").await;
+        assert_eq!(s["binance"]["тестовый_счёт"]["openOrders"], json!(0), "{s}");
+        let (_, b) = call(&r, "GET", "/balances?exchange=binance", "").await;
+        assert!(b["свободно"].get("XYZ").is_none(), "{b}");
         call(&r, "POST", "/control/stop", "").await;
     }
 }

@@ -1,10 +1,12 @@
 //! Состояние бота: выбранные биржи и монеты, привязка монет к стратегиям, параметры бирж, настройки процесса.
 //! Хранится в JSON-файле (запись через временный файл и rename — файл не бывает наполовину записан).
 
+use crate::book::Book;
 use crate::data;
 use crate::feed;
 use crate::market::Market;
 use crate::paper::{Amount, Fill, Limits, Paper, Side};
+use crate::spread::{self, SpreadCapture};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -46,6 +48,17 @@ pub struct Bot {
     pub accounts: Arc<Mutex<HashMap<String, Paper>>>,
     /// Исполнение стоящих бумажных заявок по стакану (пока соединения подняты).
     matcher: Mutex<Option<JoinHandle<()>>>,
+    /// «Сбор спреда» по биржам.
+    spreads: Mutex<HashMap<String, SpreadCapture>>,
+}
+
+/// Комиссия биржи из каталога, % (makerFeePct / takerFeePct).
+fn fee(ex: &str, key: &str) -> f64 {
+    data::catalog()["exchanges"]
+        .as_array()
+        .and_then(|a| a.iter().find(|e| e["id"] == ex))
+        .and_then(|e| e[key].as_f64())
+        .unwrap_or(0.1)
 }
 
 impl Bot {
@@ -72,6 +85,7 @@ impl Bot {
             feeds: Mutex::default(),
             accounts: Arc::default(),
             matcher: Mutex::default(),
+            spreads: Mutex::default(),
         };
         bot.persist();
         bot
@@ -276,7 +290,7 @@ impl Bot {
     }
 
     /// Поднять соединения: фиды рыночных данных по выбранным биржам (ордеров пока нет).
-    pub fn start(&self) -> ActionResult<()> {
+    pub fn start(self: &Arc<Self>) -> ActionResult<()> {
         if self
             .saved
             .lock()
@@ -305,7 +319,7 @@ impl Bot {
         for ex in &exchanges {
             self.restart_feed(ex);
         }
-        *self.matcher.lock().unwrap() = Some(self.spawn_matcher());
+        *self.matcher.lock().unwrap() = Some(self.spawn_engine());
         tracing::info!("Соединения подняты: {exchanges:?}");
         Ok(())
     }
@@ -321,6 +335,7 @@ impl Bot {
         }
         self.market.clear();
         self.accounts.lock().unwrap().clear();
+        self.spreads.lock().unwrap().clear();
         tracing::info!("Соединения остановлены");
     }
 
@@ -367,13 +382,7 @@ impl Bot {
             .get("paperStartBalance")
             .and_then(Value::as_f64)
             .unwrap_or(1000.0);
-        let fee = |k: &str| {
-            data::catalog()["exchanges"]
-                .as_array()
-                .and_then(|a| a.iter().find(|e| e["id"] == ex))
-                .and_then(|e| e[k].as_f64())
-                .unwrap_or(0.1)
-        };
+        let fee = |k: &str| fee(ex, k);
         let mut acc = self.accounts.lock().unwrap();
         let a = acc
             .entry(ex.to_owned())
@@ -383,36 +392,76 @@ impl Bot {
         }
     }
 
-    /// Раз в 50 мс исполнить стоящие бумажные заявки, через которые прошла цена.
-    fn spawn_matcher(&self) -> JoinHandle<()> {
-        let (accounts, market) = (self.accounts.clone(), self.market.clone());
-        let limits: HashMap<String, Limits> = self
-            .snapshot()
-            .selection
-            .keys()
-            .map(|ex| (ex.clone(), Limits::from_params(&self.params(ex))))
-            .collect();
+    /// Раз в 50 мс: исполнить стоящие бумажные заявки, через которые прошла цена, и сделать шаг стратегий.
+    fn spawn_engine(self: &Arc<Self>) -> JoinHandle<()> {
+        let weak = Arc::downgrade(self);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
             loop {
                 tick.tick().await;
-                let mut acc = accounts.lock().unwrap();
-                for (ex, a) in acc.iter_mut() {
-                    if a.open_orders() == 0 {
-                        continue;
-                    }
-                    let lim = limits
-                        .get(ex)
-                        .cloned()
-                        .unwrap_or_else(|| Limits::from_params(&Map::new()));
-                    for sym in market.feed(ex).map(|f| f.symbols).unwrap_or_default() {
-                        if let Some(b) = market.book(ex, &sym).filter(|b| b.is_ready()) {
-                            a.match_resting(&sym, &b, &lim);
-                        }
-                    }
-                }
+                let Some(bot) = weak.upgrade() else { return };
+                bot.tick();
             }
         })
+    }
+
+    /// Шаг движка по всем подключённым биржам.
+    fn tick(&self) {
+        let saved = self.snapshot();
+        let now = std::time::Instant::now();
+        let exchanges: Vec<String> = self.accounts.lock().unwrap().keys().cloned().collect();
+        for ex in exchanges {
+            let params = self.params(&ex);
+            let lim = Limits::from_params(&params);
+            let sp = spread::Params::from(&params);
+            let selected = saved.selection.get(&ex).cloned().unwrap_or_default();
+            let books: HashMap<String, Book> = selected
+                .iter()
+                .filter_map(|s| self.market.book(&ex, s).map(|b| (s.clone(), b)))
+                .collect();
+            let mut acc = self.accounts.lock().unwrap();
+            let Some(paper) = acc.get_mut(&ex) else {
+                continue;
+            };
+            for (sym, b) in &books {
+                if b.is_ready() {
+                    paper.match_resting(sym, b, &lim);
+                }
+            }
+            let mut all = self.spreads.lock().unwrap();
+            let sc = all
+                .entry(ex.clone())
+                .or_insert_with(|| SpreadCapture::new(fee(&ex, "makerFeePct")));
+            for sym in &selected {
+                let bound = saved.symbol_strategies.get(&ex).and_then(|m| m.get(sym));
+                let mine = bound.is_none_or(|ids| ids.is_empty() || ids.contains(spread::ID));
+                let book = books.get(sym);
+                if sp.enabled && lim.trading_enabled && mine {
+                    sc.step(sym, book, paper, &sp, &lim, now);
+                } else if sc.active() {
+                    sc.stop_symbol(paper, sym, book, "стратегия или торговля выключена");
+                }
+            }
+            for sym in sc.symbols().into_iter().filter(|s| !selected.contains(s)) {
+                sc.stop_symbol(paper, &sym, books.get(&sym), "монета убрана из выбранных");
+            }
+        }
+    }
+
+    /// Состояние стратегий биржи для админки (/strategies).
+    pub fn strategies_json(&self, ex: &str) -> ActionResult<Value> {
+        self.running_exchange(ex)?;
+        let sp = spread::Params::from(&self.params(ex));
+        let sc = self
+            .spreads
+            .lock()
+            .unwrap()
+            .get(ex)
+            .map(|s| s.stats(sp.enabled))
+            .unwrap_or_else(|| SpreadCapture::new(fee(ex, "makerFeePct")).stats(sp.enabled));
+        let mut m = Map::new();
+        m.insert("spreadCapture".into(), sc);
+        Ok(Value::Object(m))
     }
 
     fn running_exchange(&self, ex: &str) -> ActionResult<()> {
@@ -612,6 +661,7 @@ mod tests {
     #[tokio::test]
     async fn start_needs_symbols() {
         let (_d, b) = bot();
+        let b = Arc::new(b);
         assert!(b.start().is_err());
         b.select("bybit", vec!["BTCUSDT".into()], &Map::new(), None)
             .unwrap();

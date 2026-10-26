@@ -122,7 +122,27 @@ pub struct Paper {
     pub rejected: u64,
     pub last_reject: String,
     pub kill_switch: bool,
+    /// Исполнения по порядку (стратегии забирают свои по номеру заявки); хранятся последние EXECS_KEEP.
+    pub execs: VecDeque<Exec>,
+    exec_seq: u64,
 }
+
+/// Исполнение заявки.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Exec {
+    /// Порядковый номер исполнения на счёте (растёт).
+    pub seq: u64,
+    pub order_id: u64,
+    pub symbol: String,
+    pub side: Side,
+    pub qty: f64,
+    pub price: f64,
+    /// Комиссия в котируемой валюте.
+    pub fee: f64,
+}
+
+/// Сколько исполнений хранить.
+const EXECS_KEEP: usize = 10_000;
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -160,6 +180,8 @@ impl Paper {
             rejected: 0,
             last_reject: String::new(),
             kill_switch: false,
+            execs: VecDeque::new(),
+            exec_seq: 0,
         };
         for s in symbols {
             if let Some((_, q)) = split(s) {
@@ -326,6 +348,7 @@ impl Paper {
         self.check_loss(lim);
         let id = self.next_id;
         self.next_id += 1;
+        self.exec(id, symbol, side, filled, avg, filled * avg * self.taker);
         let rest = qty - filled;
         if rest > 1e-12 && limit.is_some() {
             self.lock_for(&base, &quote, side, rest, ref_px)?;
@@ -497,8 +520,16 @@ impl Paper {
             }
             let o = self.orders.remove(i);
             self.unlock(&base, &quote, &o);
-            if let Err(e) = self.settle(&base, &quote, o.side, o.qty, o.price, self.maker) {
-                tracing::warn!("бумажная заявка {} не исполнена: {e}", o.id);
+            match self.settle(&base, &quote, o.side, o.qty, o.price, self.maker) {
+                Ok(()) => self.exec(
+                    o.id,
+                    &o.symbol,
+                    o.side,
+                    o.qty,
+                    o.price,
+                    o.qty * o.price * self.maker,
+                ),
+                Err(e) => tracing::warn!("бумажная заявка {} не исполнена: {e}", o.id),
             }
         }
         self.check_loss(lim);
@@ -511,6 +542,77 @@ impl Paper {
         };
         *self.locked.entry(asset.to_owned()).or_default() -= amt;
         self.add(asset, amt);
+    }
+
+    fn exec(&mut self, order_id: u64, symbol: &str, side: Side, qty: f64, price: f64, fee: f64) {
+        if qty <= 0.0 {
+            return;
+        }
+        if self.execs.len() >= EXECS_KEEP {
+            self.execs.pop_front();
+        }
+        self.exec_seq += 1;
+        let seq = self.exec_seq;
+        self.execs.push_back(Exec {
+            seq,
+            order_id,
+            symbol: symbol.to_uppercase(),
+            side,
+            qty,
+            price,
+            fee,
+        });
+    }
+
+    /// Выход рыночной продажей (стоп, таймаут, выключение стратегии): без проверок «торговля включена»,
+    /// kill switch и частоты — выходы разрешены всегда; нужен только живой стакан.
+    pub fn sell_exit(
+        &mut self,
+        symbol: &str,
+        qty: f64,
+        book: Option<&Book>,
+    ) -> Result<Fill, String> {
+        let b = book.filter(|b| b.is_ready()).ok_or("стакан не готов")?;
+        let (base, quote) = split(symbol).ok_or_else(|| format!("не разобрать символ {symbol}"))?;
+        let qty = qty.min(self.free(&base));
+        if qty <= 0.0 {
+            return Err(format!("нет {base} для продажи"));
+        }
+        let (filled, avg) = walk(b, Side::Sell, qty, None);
+        self.settle(&base, &quote, Side::Sell, filled, avg, self.taker)?;
+        let id = self.next_id;
+        self.next_id += 1;
+        self.exec(
+            id,
+            symbol,
+            Side::Sell,
+            filled,
+            avg,
+            filled * avg * self.taker,
+        );
+        Ok(Fill {
+            order_id: id,
+            status: "FILLED",
+            executed: filled,
+            avg_price: avg,
+        })
+    }
+
+    /// Снять одну заявку; false — её уже нет (исполнилась или снята).
+    pub fn cancel(&mut self, id: u64) -> bool {
+        let Some(i) = self.orders.iter().position(|o| o.id == id) else {
+            return false;
+        };
+        let o = self.orders.remove(i);
+        if let Some((b, q)) = split(&o.symbol) {
+            self.unlock(&b, &q, &o);
+        }
+        true
+    }
+
+    /// Стоит ли заявка.
+    pub fn is_open(&self, id: u64) -> bool {
+        self.orders.iter().any(|o| o.id == id)
     }
 
     /// Снять заявки символа (None — все); сколько снято.
@@ -574,7 +676,7 @@ impl Paper {
             "fees": self.maker_fees + self.taker_fees, "takerFees": self.taker_fees, "makerFees": self.maker_fees,
             "closedTrades": self.closed, "winningTrades": self.wins,
             "winRatePercent": if self.closed > 0 { self.wins as f64 * 100.0 / self.closed as f64 } else { 0.0 },
-            "openOrders": self.orders.len(), "openPositions": self.lots.values().filter(|l| l.qty > 1e-12).count(),
+            "openOrders": self.open_orders(), "openPositions": self.lots.values().filter(|l| l.qty > 1e-12).count(),
         })
     }
 }
