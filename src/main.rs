@@ -14,6 +14,7 @@ mod data;
 mod evm;
 mod feed;
 mod gate_api;
+mod hyperliquid_api;
 mod kucoin_api;
 mod leadlag;
 mod live;

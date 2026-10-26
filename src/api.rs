@@ -2008,6 +2008,172 @@ mod tests {
         call(&r, "POST", "/control/stop", "").await;
     }
 
+    /// Живые перпы Hyperliquid против макета: подпись агента (EIP-712 по msgpack действия), плечо, IOC-ордер с cloid,
+    /// подписка orderUpdates и позиция из события.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_hyperliquid_perp_against_mock() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::Mutex;
+        use tokio_tungstenite::tungstenite::Message;
+        const AGENT: &str = "0x0123456789012345678901234567890123456789012345678901234567890123";
+        const USER: &str = "0x00000000000000000000000000000000000000aa";
+        #[derive(Default)]
+        struct Ex {
+            actions: Vec<Value>,
+            bad: u32,
+            pos: f64,
+        }
+        let ex = Arc::new(Mutex::new(Ex::default()));
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (e1, e2) = (ex.clone(), ex.clone());
+        let rest = Router::new()
+            .route("/info", axum::routing::post(move |Json(b): Json<Value>| async move {
+                let x = e1.lock().unwrap();
+                Json(match b["type"].as_str().unwrap() {
+                    "meta" => json!({"universe": [{"name": "ETH", "szDecimals": 4}, {"name": "BTC", "szDecimals": 5}]}),
+                    "clearinghouseState" => {
+                        assert_eq!(b["user"], USER);
+                        json!({"withdrawable": "1000", "assetPositions": [{"position": {"coin": "BTC", "szi": format!("{}", x.pos), "entryPx": "100"}}]})
+                    }
+                    "orderStatus" => json!({"order": {"status": "filled", "order": {"origSz": "0.5", "sz": "0", "limitPx": "95"}}}),
+                    _ => json!([{"universe": [{"name": "BTC"}]}, [{"funding": "0.00001", "markPx": "100"}]]),
+                })
+            }))
+            .route("/exchange", axum::routing::post(move |Json(b): Json<Value>| async move {
+                let mut x = e2.lock().unwrap();
+                // подпись детерминирована (RFC 6979): та же, что посчитает биржа для этого действия и nonce
+                let w = crate::evm::Wallet::from_hex(AGENT).unwrap();
+                let want = crate::hyperliquid_api::sign_action(&w, &b["action"], b["nonce"].as_u64().unwrap(), false);
+                if want != b["signature"] {
+                    x.bad += 1;
+                }
+                x.actions.push(b["action"].clone());
+                if b["action"]["type"] == "order" {
+                    let o = &b["action"]["orders"][0];
+                    let q: f64 = o["s"].as_str().unwrap().parse().unwrap();
+                    x.pos += if o["b"] == true { q } else { -q };
+                    let _ = ev_tx.send(json!({"channel": "orderUpdates", "data": [{"status": "filled",
+                        "order": {"oid": 9, "coin": "BTC", "cloid": o["c"], "origSz": o["s"], "sz": "0", "limitPx": o["p"]}}]}).to_string());
+                    return Json(json!({"status": "ok", "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 9}}]}}}));
+                }
+                Json(json!({"status": "ok", "response": {"type": "default"}}))
+            }));
+        let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let raddr = rl.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(rl, rest).await.unwrap() });
+        let wl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let waddr = wl.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = wl.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            for _ in 1..500u64 {
+                let m = r#"{"channel":"l2Book","data":{"coin":"BTC","time":1,"levels":[[{"px":"99.9","sz":"100","n":1}],[{"px":"100","sz":"100","n":1}]]}}"#;
+                if ws.send(Message::text(m)).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            loop {
+                let _ = wl.accept().await;
+            }
+        });
+        let subs = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let sb = subs.clone();
+        let sl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let saddr = sl.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = sl.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            for _ in 0..2 {
+                if let Some(Ok(Message::Text(t))) = ws.next().await {
+                    sb.lock()
+                        .unwrap()
+                        .push(serde_json::from_str(t.as_str()).unwrap());
+                }
+            }
+            ws.send(Message::text(
+                r#"{"channel":"subscriptionResponse","data":{}}"#,
+            ))
+            .await
+            .unwrap();
+            while let Some(e) = ev_rx.recv().await {
+                if ws.send(Message::text(e)).await.is_err() {
+                    break;
+                }
+            }
+            loop {
+                let _ = sl.accept().await;
+            }
+        });
+        crate::util::set_env("HYPERLIQUID_STREAM_URL", &format!("ws://{saddr}/"));
+        crate::util::set_env("HYPERLIQUID_TESTNET_API_KEY", USER);
+        crate::util::set_env("HYPERLIQUID_TESTNET_API_SECRET", AGENT);
+        let (_d, r) = app("");
+        let sel = format!(
+            "/control/select?exchange=hyperliquid&symbols=BTCUSDC&market=perp&leverage=3&testnet=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
+        );
+        assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
+        call(&r, "POST", "/control/start", "").await;
+        call(&r, "POST", "/trading/start", "").await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let (_, b) = call(&r, "GET", "/balances?exchange=hyperliquid", "").await;
+            let (_, s) = call(&r, "GET", "/status", "").await;
+            let (_, m) = call(&r, "GET", "/market?exchange=hyperliquid", "").await;
+            if b["свободно"]["USDC"] == json!(1000.0)
+                && s["hyperliquid"]["поток_событий_счёта"] == json!(true)
+                && m["BTCUSDC"]["лучший_аск"].is_number()
+                && !ex.lock().unwrap().actions.is_empty()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "баланс, поток, стакан или плечо: {b} {s} {m}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let (c, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=hyperliquid&symbol=BTCUSDC&side=SELL&type=MARKET&qty=0.5",
+            "",
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let (_, a) = call(&r, "GET", "/status", "").await;
+            if a["hyperliquid"]["тестовый_счёт"]["positions"][0]["qty"] == json!(-0.5) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < until, "шорт не учтён: {a}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let x = ex.lock().unwrap();
+        assert_eq!(x.bad, 0, "подписи не сошлись");
+        assert_eq!(
+            x.actions[0],
+            json!({"type": "updateLeverage", "asset": 1, "isCross": true, "leverage": 3})
+        );
+        let o = &x.actions.iter().find(|a| a["type"] == "order").unwrap()["orders"][0];
+        // рыночная продажа — IOC на 5 % ниже опорной (бид 99.9), у BTC szDecimals 5 → один знак цены
+        assert_eq!(
+            (
+                o["a"].clone(),
+                o["b"].clone(),
+                o["s"].clone(),
+                o["p"].clone()
+            ),
+            (json!(1), json!(false), json!("0.5"), json!("94.9"))
+        );
+        assert_eq!(o["t"]["limit"]["tif"], "Ioc");
+        assert_eq!(
+            subs.lock().unwrap()[0]["subscription"],
+            json!({"type": "orderUpdates", "user": USER})
+        );
+    }
+
     /// Живые перпы BingX против макета: подпись (параметры по алфавиту), positionSide=BOTH, плечо, поток по listenKey
     /// с кадрами gzip (ORDER_TRADE_UPDATE, ACCOUNT_UPDATE), ответ Pong на пинг сервера.
     #[tokio::test(flavor = "multi_thread")]

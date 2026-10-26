@@ -418,15 +418,34 @@ impl Bot {
         }
         if !matches!(
             ex,
-            "binance" | "bybit" | "aster" | "okx" | "gate" | "kucoin" | "bingx" | "mexc"
+            "binance"
+                | "bybit"
+                | "aster"
+                | "okx"
+                | "gate"
+                | "kucoin"
+                | "bingx"
+                | "mexc"
+                | "hyperliquid"
         ) {
             tracing::warn!(
-                "[{ex}] реальные ордера в Rust-бэкенде пока только для Binance, Bybit, Aster, OKX, Gate, KuCoin, BingX и MEXC (спот и USDT-перпы) — бумажный режим"
+                "[{ex}] реальные ордера в Rust-бэкенде пока только для Binance, Bybit, Aster, OKX, Gate, KuCoin, BingX, MEXC и Hyperliquid (спот и USDT-перпы) — бумажный режим"
             );
             return None;
         }
         match crate::signed::Keys::from_env(ex, testnet) {
             // Aster: ASTER_API_SECRET — приватный ключ кошелька-агента
+            Some(k)
+                if ex == "hyperliquid"
+                    && (crate::evm::Wallet::from_hex(&k.secret).is_err()
+                        || !k.key.starts_with("0x")
+                        || k.key.len() != 42) =>
+            {
+                tracing::warn!(
+                    "[hyperliquid] HYPERLIQUID_API_KEY — адрес счёта 0x…, HYPERLIQUID_API_SECRET — приватный ключ агента (hex) — бумажный режим"
+                );
+                None
+            }
             Some(k) if ex == "aster" && crate::evm::Wallet::from_hex(&k.secret).is_err() => {
                 tracing::warn!(
                     "[aster] ASTER_API_SECRET — не приватный ключ кошелька (hex) — бумажный режим"
@@ -511,6 +530,7 @@ impl Bot {
                                 "kucoin" => crate::kucoin_api::rest_url(perp),
                                 "bingx" => crate::bingx_api::REST,
                                 "mexc" => crate::mexc_api::rest_url(perp),
+                                "hyperliquid" => crate::hyperliquid_api::rest_url(testnet),
                                 _ => crate::rest::default_url(perp, testnet),
                             }
                             .to_owned()
@@ -518,7 +538,15 @@ impl Bot {
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                     let mode = if testnet { "TESTNET" } else { "LIVE" };
                     tracing::warn!("[{ex}] режим {mode}: ордера пойдут на биржу ({base})");
-                    let client = Arc::new(if ex == "mexc" {
+                    let client = Arc::new(if ex == "hyperliquid" {
+                        // ключи проверены в live_mode
+                        crate::live::Venue::Hyperliquid(
+                            crate::hyperliquid_api::Client::new(
+                                &base, keys, perp, testnet, symbols,
+                            )
+                            .expect("ключ агента Hyperliquid"),
+                        )
+                    } else if ex == "mexc" {
                         crate::live::Venue::Mexc(crate::mexc_api::Client::new(&base, keys, perp))
                     } else if ex == "bingx" {
                         crate::live::Venue::Bingx(crate::bingx_api::Client::new(

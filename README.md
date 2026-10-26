@@ -119,6 +119,10 @@
 - **Реальные ордера MEXC** (спот и перпы): спот — `/api/v3/order` с ключом X-MEXC-APIKEY, поток по listenKey в protobuf
   (`spot@private.orders/account.v3.api.pb`); перпы — contract.mexc.com, подпись hex(HMAC(apiKey+время+параметры)),
   объём в контрактах, сторона выбирается по ногам хедж-позиции, поток `edge` после `login`. Проверено на заглушках.
+- **Реальные ордера Hyperliquid** (перпы и спот): действие подписывает кошелёк-агент — EIP-712 «фантомного агента»
+  по keccak(msgpack(action) ‖ nonce ‖ 0x00), домен Exchange / 1337; HYPERLIQUID_API_KEY — адрес счёта, HYPERLIQUID_API_SECRET —
+  приватный ключ агента. Рыночный ордер — IOC ±5 % от опорной цены, свой номер в cloid, поток orderUpdates и userFills.
+  Подпись сверена с эталоном hyperliquid-python-sdk; остальное проверено на заглушках.
 - **Перпы (USDT)** — параметр `market=perp`, плечо — `leverage`. Бумага: лонг и шорт, изолированная маржа, комиссии
   перпов из каталога, funding по ставке биржи в момент списания (ставки — Binance `/fapi/v1/premiumIndex`, Bybit
   `/v5/market/tickers`, раз в 30 с; видны в `/market` как `funding_проц`), ликвидация при марже ниже 0.5% объёма.
