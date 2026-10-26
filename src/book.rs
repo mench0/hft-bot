@@ -39,6 +39,45 @@ impl Book {
         true
     }
 
+    /// Изменения уровней (после снимка): объём 0 — уровень убрать, иначе поставить. false — устарели.
+    pub fn apply_delta(
+        &mut self,
+        bids: &[(f64, f64)],
+        asks: &[(f64, f64)],
+        update_id: u64,
+    ) -> bool {
+        if update_id != 0 && update_id < self.update_id {
+            self.stale += 1;
+            return false;
+        }
+        fn upsert(side: &mut Vec<(f64, f64)>, (px, q): (f64, f64), desc: bool) {
+            let pos = side.binary_search_by(|l| {
+                if desc {
+                    px.total_cmp(&l.0)
+                } else {
+                    l.0.total_cmp(&px)
+                }
+            });
+            match (pos, q > 0.0) {
+                (Ok(i), true) => side[i].1 = q,
+                (Ok(i), false) => {
+                    side.remove(i);
+                }
+                (Err(i), true) => side.insert(i, (px, q)),
+                (Err(_), false) => {}
+            }
+        }
+        for l in bids {
+            upsert(&mut self.bids, *l, true);
+        }
+        for l in asks {
+            upsert(&mut self.asks, *l, false);
+        }
+        self.update_id = update_id.max(self.update_id);
+        self.updated = Some(Instant::now());
+        true
+    }
+
     /// Лучшие цены (bookTicker): верх стакана заменяется, уровни лучше новых лучших цен убираются. false — устарели.
     pub fn apply_best(
         &mut self,
@@ -143,5 +182,32 @@ mod tests {
         let mut b = Book::default();
         b.apply_snapshot(vec![(100.0, 3.0)], vec![(101.0, 1.0)], 1);
         assert!((b.imbalance(5) - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn delta_updates_levels() {
+        let mut b = Book::default();
+        b.apply_snapshot(
+            vec![(100.0, 1.0), (99.0, 2.0)],
+            vec![(101.0, 1.0), (102.0, 2.0)],
+            1,
+        );
+        assert!(b.apply_delta(
+            &[(100.5, 3.0), (99.0, 0.0)],
+            &[(101.0, 0.0), (101.5, 4.0)],
+            2
+        ));
+        assert_eq!(
+            b.levels(false).collect::<Vec<_>>(),
+            vec![(100.5, 3.0), (100.0, 1.0)]
+        );
+        assert_eq!(
+            b.levels(true).collect::<Vec<_>>(),
+            vec![(101.5, 4.0), (102.0, 2.0)]
+        );
+        assert!(
+            !b.apply_delta(&[(1.0, 1.0)], &[], 1),
+            "старое изменение не применяется"
+        );
     }
 }
