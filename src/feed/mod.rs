@@ -2,10 +2,15 @@
 //! паузой) и «диалекты» бирж — адрес, сообщения подписки, пинг и разбор сообщений в обновления стакана.
 
 pub mod binance;
+pub mod bingx;
 pub mod bybit;
 pub mod gate;
 pub mod gate_futures;
+pub mod hyperliquid;
+pub mod kucoin;
+pub mod lbank;
 pub mod okx;
+pub mod upbit;
 
 use crate::market::Market;
 use futures_util::{SinkExt, StreamExt};
@@ -58,6 +63,21 @@ pub trait Dialect: Send + Sync + 'static {
     }
     /// Разобрать текстовое сообщение.
     fn parse(&self, text: &str) -> Parsed;
+    /// Ответ на пинг сервера (LBank, BingX); None — это не пинг.
+    fn reply(&self, _text: &str) -> Option<String> {
+        None
+    }
+    /// Бинарный кадр в текст (Upbit — JSON в UTF-8, BingX — gzip); None — пропустить.
+    fn binary(&self, _data: &[u8]) -> Option<String> {
+        None
+    }
+    /// Адрес подключения, если для него нужен запрос (KuCoin — токен bullet-public).
+    fn connect_url(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + '_>>
+    {
+        Box::pin(async move { Ok(self.url()) })
+    }
 }
 
 /// Что запустить для биржи: фид или причина, почему фида нет.
@@ -142,9 +162,58 @@ pub fn start(
             bbo,
             sizes.clone(),
         )),
+        // Aster — сообщения как у Binance
+        "aster" => {
+            let base = ws_url.unwrap_or_else(|| {
+                match (perp, testnet) {
+                    (true, true) => "wss://fstream.asterdex-testnet.com/stream",
+                    (true, false) => "wss://fstream.asterdex.com/stream",
+                    (false, true) => "wss://sstream.asterdex-testnet.com/stream",
+                    (false, false) => "wss://sstream.asterdex.com/stream",
+                }
+                .to_owned()
+            });
+            Arc::new(binance::Binance {
+                url: binance::stream_url(&base, &symbols, bbo),
+            })
+        }
+        "hyperliquid" if perp => Arc::new(hyperliquid::Hyperliquid::new(
+            ws_url.unwrap_or_else(|| hyperliquid::default_url(testnet).into()),
+            &symbols,
+        )),
+        "bingx" => Arc::new(bingx::Bingx::new(
+            ws_url.unwrap_or_else(|| bingx::default_url(perp, testnet).into()),
+            &symbols,
+            perp,
+        )),
+        "kucoin" => Arc::new(kucoin::Kucoin::new(
+            params
+                .get("restUrl")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(kucoin::rest_url(perp))
+                .to_owned(),
+            ws_url,
+            &symbols,
+            perp,
+        )),
+        "lbank" if !perp => Arc::new(lbank::Lbank::new(
+            ws_url.unwrap_or_else(|| lbank::URL.into()),
+            &symbols,
+        )),
+        "upbit" if !perp => Arc::new(upbit::Upbit::new(
+            ws_url.unwrap_or_else(|| upbit::URL.into()),
+            &symbols,
+        )),
+        "hyperliquid" | "lbank" | "upbit" => {
+            return Plan::Unsupported(format!(
+                "{ex}: {} в Rust-бэкенде ещё нет",
+                if perp { "перпов" } else { "спота" }
+            ));
+        }
         _ => {
             return Plan::Unsupported(format!(
-                "{ex}: фида в Rust-бэкенде ещё нет — есть binance, bybit, okx, gate"
+                "{ex}: фида в Rust-бэкенде ещё нет (MEXC — protobuf, Uniswap — нода Ethereum)"
             ));
         }
     };
@@ -165,6 +234,12 @@ pub fn start(
                 "okx" => "https://www.okx.com",
                 "gate" if testnet => "https://fx-api-testnet.gateio.ws",
                 "gate" => "https://api.gateio.ws",
+                "aster" if perp => "https://fapi.asterdex.com",
+                "aster" => "https://sapi.asterdex.com",
+                "bingx" => "https://open-api.bingx.com",
+                "kucoin" => kucoin::rest_url(perp),
+                "hyperliquid" if testnet => "https://api.hyperliquid-testnet.xyz",
+                "hyperliquid" => "https://api.hyperliquid.xyz",
                 _ => crate::rest::default_url(perp, testnet),
             }
             .to_owned()
@@ -241,7 +316,15 @@ pub fn apply(market: &Market, ex: &str, u: Update) {
 pub async fn run(market: Arc<Market>, ex: String, d: Arc<dyn Dialect>) {
     let mut backoff = Backoff::default();
     loop {
-        let err = match tokio_tungstenite::connect_async(d.url()).await {
+        let url = match d.connect_url().await {
+            Ok(u) => u,
+            Err(e) => {
+                market.with_feed(&ex, |f| f.last_error = e.clone());
+                tokio::time::sleep(backoff.next()).await;
+                continue;
+            }
+        };
+        let err = match tokio_tungstenite::connect_async(url).await {
             Ok((mut ws, _)) => {
                 tracing::info!("[{ex}] WebSocket подключён");
                 market.with_feed(&ex, |f| {
@@ -262,11 +345,22 @@ pub async fn run(market: Arc<Market>, ex: String, d: Arc<dyn Dialect>) {
                 while err.is_empty() {
                     tokio::select! {
                         msg = ws.next() => match msg {
-                            Some(Ok(Message::Text(t))) => {
-                                market.with_feed(&ex, |f| f.messages += 1);
-                                match d.parse(&t) {
-                                    Ok(ups) => for u in ups { apply(&market, &ex, u); },
-                                    Err(e) => err = e,
+                            Some(Ok(m @ (Message::Text(_) | Message::Binary(_)))) => {
+                                let t = match m {
+                                    Message::Text(t) => Some(t.to_string()),
+                                    Message::Binary(b) => d.binary(&b),
+                                    _ => None,
+                                };
+                                if let Some(t) = t {
+                                    market.with_feed(&ex, |f| f.messages += 1);
+                                    if let Some(r) = d.reply(&t) {
+                                        if let Err(e) = ws.send(Message::text(r)).await { err = e.to_string(); }
+                                    } else {
+                                        match d.parse(&t) {
+                                            Ok(ups) => for u in ups { apply(&market, &ex, u); },
+                                            Err(e) => err = e,
+                                        }
+                                    }
                                 }
                             }
                             Some(Ok(Message::Ping(p))) => { let _ = ws.send(Message::Pong(p)).await; }

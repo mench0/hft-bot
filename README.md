@@ -20,6 +20,12 @@
   - **OKX** — спот и перпы (BTC-USDT-SWAP): `books` (снимок + изменения) + `bbo-tbt`;
   - **Gate** — спот: `spot.order_book` (снимки 20 уровней) + `spot.book_ticker`; перпы: `futures.order_book` +
     `futures.book_ticker`.
+  - **Aster** — спот и перпы: потоки как у Binance (`depth20@100ms` + `bookTicker`);
+  - **Hyperliquid** — перпы: `l2Book` по монете (снимки);
+  - **BingX** — спот и перпы: `depth20` (кадры gzip, ответ на пинг сервера);
+  - **KuCoin** — спот и перпы: токен `bullet-public`, `level2Depth50` (перпы — объём лота × multiplier);
+  - **LBank**, **Upbit** — спот: снимки `depth` / `orderbook` (у Upbit кадры бинарные);
+  - funding перпов всех этих бирж — их REST (Hyperliquid — `metaAndAssetCtxs`, раз в час);
   - Перпы OKX и Gate: объёмы в контрактах переводятся в монеты по размеру контракта (OKX `ctVal`, Gate
     `quanto_multiplier`, загружается при старте); funding — OKX `/api/v5/public/funding-rate`, Gate `/futures/usdt/contracts`.
 
