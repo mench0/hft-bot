@@ -1,47 +1,20 @@
-//! HFT-бот на Rust. Сейчас — каркас: состояние и админ-API в формате Java-бота (`hft-trader`), чтобы к нему
-//! подключалась та же админка (`hft-admin`). Подключений к биржам и торговли пока нет.
+//! HFT-бот на Rust: стаканы и ордера бирж (WebSocket в первую очередь, REST — запасной путь), бумажный и живой счёт,
+//! стратегии, подбор тикеров; админ-API в формате Java-бота (`hft-trader`) для той же админки (`hft-admin`).
+//! Код по папкам: server, exchange, market, trading, strategy, discovery, infra (см. README).
 //!
 //! Переменные окружения: `ADMIN_PORT` (8080), `ADMIN_BIND` (127.0.0.1), `ADMIN_TOKEN`, `ADMIN_CORS_ORIGINS`
 //! (через запятую), `STATE_DB` (data/state.db, SQLite), `STATE_FILE` (JSON-файл вместо SQLite), `RUST_LOG` (info).
 
-mod account;
-mod api;
-mod aster_api;
-mod bingx_api;
-mod book;
-mod bybit_api;
-mod data;
-mod evm;
-mod feed;
-mod gate_api;
-mod hyperliquid_api;
-mod journal;
-mod kucoin_api;
-mod lbank_api;
-mod leadlag;
-mod live;
+mod discovery;
+mod exchange;
+mod infra;
 mod market;
-mod metrics;
-mod mexc_api;
-mod okx_api;
-mod paper;
-mod perparb;
-mod ratelimit;
-mod rest;
-mod screener;
-mod signals;
-mod signed;
-mod spotarb;
-mod spread;
-mod statarb;
-mod state;
-mod store;
-mod trade_ws;
-mod transfer;
-mod uniswap_api;
-mod upbit_api;
-mod util;
+mod server;
+mod strategy;
+mod trading;
 
+use infra::{metrics, store, util};
+use server::{api, state};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
