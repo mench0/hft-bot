@@ -68,6 +68,10 @@ pub struct Bot {
     /// (замечена, отправлен выход), мс.
     pub orphans: Mutex<HashMap<(String, String), (u64, u64)>>,
     pub orphans_closed: Mutex<HashMap<String, u64>>,
+    /// Перепроверка: монеты «только выход» (биржа → символ → причина) и итог последней перепроверки.
+    pub exit_only: Mutex<HashMap<String, BTreeMap<String, String>>>,
+    pub last_recheck: Mutex<Value>,
+    rechecking: std::sync::atomic::AtomicBool,
 }
 
 /// Комиссия биржи из каталога, % (makerFeePct / takerFeePct).
@@ -131,6 +135,9 @@ impl Bot {
             funding_applied: Mutex::default(),
             orphans: Mutex::default(),
             orphans_closed: Mutex::default(),
+            exit_only: Mutex::default(),
+            last_recheck: Mutex::new(json!({"status": "ещё не выполнялась"})),
+            rechecking: Default::default(),
         };
         bot.persist();
         bot.apply_debug();
@@ -942,11 +949,20 @@ impl Bot {
             let sc = all
                 .entry(ex.clone())
                 .or_insert_with(|| SpreadCapture::new(fee(&ex, "makerFeePct")));
+            // перепроверка: монеты «только выход» — новых входов нет, позиции доводятся до выхода
+            let blocked: std::collections::HashSet<String> = self
+                .exit_only
+                .lock()
+                .unwrap()
+                .get(&ex)
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
             for sym in &selected {
                 let bound = saved.symbol_strategies.get(&ex).and_then(|m| m.get(sym));
                 let mine = bound.is_none_or(|ids| ids.is_empty() || ids.contains(spread::ID))
                     && !sa_held.contains(sym)
-                    && !ll_held.contains(sym);
+                    && !ll_held.contains(sym)
+                    && !blocked.contains(sym);
                 let book = books.get(sym);
                 if sp.enabled && lim.trading_enabled && mine {
                     let minutes =
@@ -964,6 +980,7 @@ impl Bot {
             // статарб: монеты без привязки или привязанные к нему; занятые сбором спреда — не трогает
             let sa_syms: Vec<String> = selected
                 .iter()
+                .filter(|s| !blocked.contains(*s))
                 .filter(|s| {
                     saved
                         .symbol_strategies
@@ -1107,11 +1124,263 @@ impl Bot {
         Ok(())
     }
 
+    /// Профили подбора стратегий, включённых на бирже (как enabledProfiles в Java).
+    fn enabled_profiles(&self, ex: &str) -> Vec<&'static str> {
+        let (p, g) = (self.params(ex), self.settings());
+        let on = |k: &str, d: bool| g.get(k).map_or(d, |v| *v == true || v == "true");
+        let mut ids = Vec::new();
+        if crate::statarb::Params::from(&p).enabled {
+            ids.push(crate::statarb::ID);
+        }
+        if crate::spread::Params::from(&p).enabled {
+            ids.push(crate::spread::ID);
+        }
+        if on("spotArbEnabled", false) {
+            ids.push("cross-exchange-arb");
+        }
+        if on("perpArbEnabled", false) {
+            ids.push("perp-arb");
+        }
+        if on("leadLagEnabled", false) {
+            ids.push("lead-lag");
+        }
+        ids
+    }
+
+    /// Перепроверка выбранных монет по итогу подбора (как TradeRecheck в Java): монета подходит, если её предлагает
+    /// как «подходит» хотя бы одна стратегия, включённая на бирже (привязанная монета — по своим стратегиям). Не подходит —
+    /// входы запрещены; при tradeRecheckRetire (по умолчанию) — вывод из торговли: заявки снимаются, позиция перпа
+    /// закрывается рыночным выходом, монета убирается из выбранных. Сводки биржи нет — монеты не трогаются.
+    fn apply_recheck(
+        &self,
+        statuses: &BTreeMap<String, crate::screener::ExStatus>,
+        strategies: &[Value],
+        t0: std::time::Instant,
+    ) -> Value {
+        let titles: HashMap<&str, &str> = [
+            ("stat-arb", "статарбитраж"),
+            ("perp-arb", "перп – перп на разных биржах"),
+            ("spread-capture", "сбор спреда"),
+            ("cross-exchange-arb", "спот – спот на разных биржах"),
+            ("lead-lag", "lead-lag"),
+        ]
+        .into();
+        let saved = self.snapshot();
+        let retire = self
+            .settings()
+            .get("tradeRecheckRetire")
+            .is_none_or(|v| *v == true || v == "true");
+        let mut rows = Vec::new();
+        for (ex, syms) in saved
+            .selection
+            .iter()
+            .filter(|(ex, _)| statuses.contains_key(*ex))
+        {
+            let enabled = self.enabled_profiles(ex);
+            let data_ok = statuses[ex].ok;
+            for sym in syms {
+                let own: Vec<String> = saved
+                    .symbol_strategies
+                    .get(ex)
+                    .and_then(|m| m.get(sym))
+                    .map(|s| s.iter().cloned().collect())
+                    .unwrap_or_default();
+                let ids: Vec<&str> = if own.is_empty() {
+                    enabled.clone()
+                } else {
+                    enabled
+                        .iter()
+                        .copied()
+                        .filter(|i| own.iter().any(|o| o == i))
+                        .collect()
+                };
+                let (status, reason) = if ids.is_empty() && !own.is_empty() {
+                    (
+                        "UNKNOWN",
+                        format!("стратегия монеты ({}) выключена на бирже", own.join(", ")),
+                    )
+                } else if ids.is_empty() {
+                    (
+                        "UNKNOWN",
+                        "на бирже не включена ни одна стратегия".to_owned(),
+                    )
+                } else if !data_ok {
+                    (
+                        "UNKNOWN",
+                        "нет данных с биржи — оставлено как было".to_owned(),
+                    )
+                } else {
+                    let mut why = Vec::new();
+                    let mut ok_by = None;
+                    for id in &ids {
+                        let cands = strategies
+                            .iter()
+                            .find(|s| s["id"] == *id)
+                            .and_then(|s| s["candidates"].as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        let covers = |c: &Value| {
+                            c["metrics"]["symbols"][ex.as_str()]
+                                .as_array()
+                                .is_some_and(|l| l.iter().any(|x| x == sym.as_str()))
+                                || (c["exchange"] == ex.as_str() && c["symbol"] == sym.as_str())
+                        };
+                        let hits: Vec<&Value> = cands.iter().filter(|c| covers(c)).collect();
+                        let title = titles.get(id).copied().unwrap_or(id);
+                        if hits.iter().any(|c| c["suitable"] == true) {
+                            ok_by = Some(title);
+                            break;
+                        }
+                        why.push(match hits.first() {
+                            None => format!("{title}: нет среди прибыльных кандидатов"),
+                            Some(c) => format!(
+                                "{title}: {}{}",
+                                c["verdict"].as_str().unwrap_or(""),
+                                c["reasons"]
+                                    .as_array()
+                                    .and_then(|r| r.last())
+                                    .and_then(Value::as_str)
+                                    .map_or(String::new(), |r| format!(" ({r})"))
+                            ),
+                        });
+                    }
+                    match ok_by {
+                        Some(t) => ("OK", format!("подходит под {t}")),
+                        None => ("EXIT_ONLY", why.join("; ")),
+                    }
+                };
+                rows.push((ex.clone(), sym.clone(), status, reason));
+            }
+        }
+        let mut out = Vec::new();
+        for (ex, sym, status, reason) in rows {
+            match status {
+                "OK" => {
+                    if let Some(m) = self.exit_only.lock().unwrap().get_mut(&ex) {
+                        m.remove(&sym);
+                    }
+                }
+                "EXIT_ONLY" => {
+                    self.exit_only
+                        .lock()
+                        .unwrap()
+                        .entry(ex.clone())
+                        .or_default()
+                        .insert(sym.clone(), reason.clone());
+                    crate::journal::action(
+                        &ex,
+                        Some(&sym),
+                        &format!("перепроверка: не подходит — {reason}"),
+                    );
+                    if retire && let Err(e) = self.retire_symbol(&ex, &sym, &reason) {
+                        tracing::error!("[{ex}] {sym}: не удалось вывести из торговли — {e}");
+                    }
+                }
+                _ => {}
+            }
+            let title = match status {
+                "OK" => "подходит — входы разрешены",
+                "EXIT_ONLY" => "не подходит — только выход",
+                _ => "не проверялась",
+            };
+            out.push(json!({"exchange": ex, "symbol": sym, "status": status, "statusText": title, "reason": reason}));
+        }
+        let sec = self.discovery_settings().1;
+        let v = json!({"checkedAt": crate::util::now_ms(), "durationMs": t0.elapsed().as_millis() as u64, "everySec": sec, "symbols": out});
+        tracing::info!("Перепроверка монет: {}", v["symbols"]);
+        *self.last_recheck.lock().unwrap() = v.clone();
+        v
+    }
+
+    /// Вывести монету из торговли (как retireOn в Java): входы запрещены, заявки сняты, позиция перпа закрыта рыночным
+    /// выходом, монета убрана из выбранных (стратегии доводят свои позиции до выхода — она больше не их).
+    pub fn retire_symbol(&self, ex: &str, sym: &str, reason: &str) -> ActionResult<Value> {
+        let sym = sym.to_uppercase();
+        tracing::warn!("[{ex}] {sym} выводится из торговли: {reason}");
+        let mut v = json!({"exchange": ex, "symbol": sym, "status": "выведена из торговли"});
+        if let Some(a) = self.accounts.lock().unwrap().get_mut(ex) {
+            v["ordersCancelled"] = json!(a.cancel_all(Some(&sym)));
+            let q = a.position_qty(&sym);
+            if a.is_perp() && q.abs() > 1e-12 {
+                let side = if q > 0.0 {
+                    crate::paper::Side::Sell
+                } else {
+                    crate::paper::Side::Buy
+                };
+                let book = self.market.book(ex, &sym);
+                v["positionClose"] = match a.exit_market(&sym, side, q.abs(), book.as_ref()) {
+                    Ok(f) => json!(format!("{} {} @ {}", f.status, f.executed, f.avg_price)),
+                    Err(e) => json!(format!("ошибка: {e}")),
+                };
+            }
+        }
+        self.remove_symbol(ex, &sym)?;
+        if let Some(m) = self.exit_only.lock().unwrap().get_mut(ex) {
+            m.remove(&sym);
+        }
+        Ok(v)
+    }
+
+    /// POST /trading/recheck: подбор по биржам с выбранными монетами и перепроверка по его итогу.
+    pub async fn recheck_now(self: &Arc<Self>) -> ActionResult<Value> {
+        if !self.running() {
+            return Err("Соединения не подняты — перепроверять нечего".into());
+        }
+        if self
+            .rechecking
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err("Перепроверка уже идёт".into());
+        }
+        let t0 = std::time::Instant::now();
+        let exs: Vec<String> = self
+            .snapshot()
+            .selection
+            .keys()
+            .filter(|e| crate::screener::SUPPORTED.contains(&e.as_str()))
+            .cloned()
+            .collect();
+        let (st, strategies) =
+            crate::screener::run(&self.screener_sources, &exs, &self.settings()).await;
+        self.rechecking
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        Ok(self.apply_recheck(&st, &strategies, t0))
+    }
+
+    /// GET /trading/recheck: итог последней перепроверки (монеты, убранные из выбранных, не показываются).
+    pub fn recheck_json(&self) -> Value {
+        let mut v = self.last_recheck.lock().unwrap().clone();
+        let sel = self.snapshot().selection;
+        if let Some(rows) = v["symbols"].as_array() {
+            let keep: Vec<Value> = rows
+                .iter()
+                .filter(|r| {
+                    sel.get(r["exchange"].as_str().unwrap_or(""))
+                        .is_some_and(|l| l.iter().any(|s| r["symbol"] == s.as_str()))
+                })
+                .cloned()
+                .collect();
+            v["symbols"] = json!(keep);
+        }
+        let (_, sec) = self.discovery_settings();
+        v["everySec"] = json!(sec);
+        v["scheduled"] = json!(sec > 0);
+        v["running"] = json!(
+            self.rechecking.load(std::sync::atomic::Ordering::SeqCst)
+                || (self.screener.lock().unwrap().running && self.running())
+        );
+        if let Some(n) = self.screener.lock().unwrap().next_at {
+            v["nextAt"] = json!(n);
+        }
+        v
+    }
+
     /// Автопересчёт подбора (discoveryRefreshSec): проверка раз в секунду.
     pub fn spawn_screener(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            let mut seen = 0u64;
             loop {
                 tick.tick().await;
                 let Some(bot) = weak.upgrade() else { return };
@@ -1129,6 +1398,18 @@ impl Bot {
                 };
                 if due {
                     let _ = bot.discovery_refresh();
+                }
+                // перепроверка — по каждому новому итогу подбора, пока идёт торговля
+                let fresh = {
+                    let s = bot.screener.lock().unwrap();
+                    (!s.running && s.updated_at > seen)
+                        .then(|| (s.updated_at, s.exchanges.clone(), s.strategies.clone()))
+                };
+                if let Some((at, st, strategies)) = fresh {
+                    seen = at;
+                    if bot.running() && !bot.rechecking.load(std::sync::atomic::Ordering::SeqCst) {
+                        bot.apply_recheck(&st, &strategies, std::time::Instant::now());
+                    }
                 }
             }
         });
@@ -1514,6 +1795,80 @@ mod tests {
         assert!(s.symbol_strategies["binance"]["AAAUSDT"].contains("spread-capture"));
         again.remove_symbol("binance", "AAAUSDT").unwrap();
         assert!(!again.snapshot().symbol_strategies["binance"].contains_key("AAAUSDT"));
+    }
+
+    /// Перепроверка: подошла — входы разрешены; не подошла — вывод из торговли (по умолчанию) или «только выход».
+    #[test]
+    fn recheck_by_discovery_result() {
+        let (_dir, b) = bot();
+        b.select(
+            "binance",
+            vec!["AAAUSDT".into(), "BBBUSDT".into(), "CCCUSDT".into()],
+            &Map::new(),
+            None,
+        )
+        .unwrap();
+        let st = BTreeMap::from([(
+            "binance".to_string(),
+            crate::screener::ExStatus {
+                ok: true,
+                ..Default::default()
+            },
+        )]);
+        let cand = |sym: &str, ok: bool| {
+            json!({"exchange": "binance", "symbol": sym, "suitable": ok, "verdict": if ok { "подходит" } else { "не подходит" },
+            "reasons": ["спред 0.05%"], "metrics": {"symbols": {"binance": [sym]}}})
+        };
+        let strategies = vec![
+            json!({"id": "spread-capture", "candidates": [cand("AAAUSDT", true), cand("BBBUSDT", false)]}),
+        ];
+        // без вывода из торговли — только выход
+        b.update_settings(&serde_json::from_value(json!({"tradeRecheckRetire": "false"})).unwrap())
+            .unwrap();
+        let v = b.apply_recheck(&st, &strategies, std::time::Instant::now());
+        let row = |s: &str| {
+            v["symbols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["symbol"] == s)
+                .unwrap()["status"]
+                .clone()
+        };
+        assert_eq!(
+            (row("AAAUSDT"), row("BBBUSDT"), row("CCCUSDT")),
+            (json!("OK"), json!("EXIT_ONLY"), json!("EXIT_ONLY")),
+            "{v}"
+        );
+        assert!(
+            v["symbols"][1]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("сбор спреда: не подходит (спред 0.05%)"),
+            "{v}"
+        );
+        assert!(
+            v["symbols"][2]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("нет среди прибыльных кандидатов")
+        );
+        assert_eq!(b.exit_only.lock().unwrap()["binance"].len(), 2);
+        // снова подошла — входы разрешены
+        let strategies2 =
+            vec![json!({"id": "spread-capture", "candidates": [cand("BBBUSDT", true)]})];
+        b.apply_recheck(&st, &strategies2, std::time::Instant::now());
+        assert!(!b.exit_only.lock().unwrap()["binance"].contains_key("BBBUSDT"));
+        // по умолчанию — вывод из торговли: монета убрана из выбранных
+        b.update_settings(&serde_json::from_value(json!({"tradeRecheckRetire": "true"})).unwrap())
+            .unwrap();
+        b.apply_recheck(&st, &strategies, std::time::Instant::now());
+        assert_eq!(b.snapshot().selection["binance"], vec!["AAAUSDT"]);
+        // сводки биржи нет — не трогаем
+        let none = BTreeMap::from([("binance".to_string(), crate::screener::ExStatus::default())]);
+        let v = b.apply_recheck(&none, &[], std::time::Instant::now());
+        assert_eq!(v["symbols"][0]["status"], "UNKNOWN");
+        assert_eq!(b.recheck_json()["symbols"].as_array().unwrap().len(), 1);
     }
 
     /// То же на SQLite (как в Java): состояние переживает перезапуск.

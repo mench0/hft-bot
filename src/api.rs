@@ -100,71 +100,82 @@ pub fn router(bot: Arc<Bot>, cfg: AdminConfig) -> Router {
         })
         .max_age(Duration::from_secs(600));
     let app = App { bot, cfg };
-    let api = Router::new()
-        .route("/control/status", get(control_status))
-        .route("/control/select", axum::routing::post(select))
-        .route("/control/symbols", axum::routing::post(symbols))
-        .route("/control/retire", axum::routing::post(retire))
-        .route("/control/deselect", axum::routing::post(deselect))
-        .route("/control/start", axum::routing::post(start))
-        .route("/control/stop", axum::routing::post(stop))
-        .route("/status", get(status))
-        .route(
-            "/exchanges/catalog",
-            get(|| async { Json(data::catalog().clone()) }),
-        )
-        .route("/exchanges/request-stats", get(request_stats))
-        .route(
-            "/requests/live",
-            get(|State(a): State<App>| async move { Json(requests_live(&a.bot)) }),
-        )
-        .route("/requests/stream", get(requests_stream))
-        .route("/env", get(env_get).post(env_post))
-        .route("/env/reveal", get(env_reveal))
-        .route("/discovery", get(discovery))
-        .route("/discovery/refresh", axum::routing::post(discovery_refresh))
-        .route("/market", get(market))
-        .route("/strategies", get(strategies))
-        .route("/arbitrage", get(arbitrage))
-        .route("/order", axum::routing::post(order))
-        .route("/cancel-all", axum::routing::post(cancel_all))
-        .route("/balances", get(balances))
-        .route("/positions", get(positions))
-        .route(
-            "/metrics",
-            get(|State(a): State<App>| async move {
-                (
-                    [(
-                        header::CONTENT_TYPE,
-                        "text/plain; version=0.0.4; charset=utf-8",
-                    )],
-                    crate::metrics::render(&a.bot),
-                )
-            }),
-        )
-        .route("/positions/close", axum::routing::post(positions_close))
-        .route("/funding", get(funding))
-        .route(
-            "/control/exchanges",
-            get(|| async { Json(json!({"поддерживаемые": data::exchange_ids()})) }),
-        )
-        .route("/paper/reset", axum::routing::post(reset_account))
-        .route("/account/reset", axum::routing::post(reset_account))
-        .route("/trading/start", axum::routing::post(trading_start))
-        .route("/trading/stop", axum::routing::post(trading_stop))
-        .route("/trading/panic", axum::routing::post(trading_panic))
-        .route("/settings", get(settings).post(settings_update))
-        .route(
-            "/exchange/params/schema",
-            get(|| async { Json(Value::Object(data::exchange_schema().clone())) }),
-        )
-        .route(
-            "/exchange/params",
-            get(exchange_params).post(exchange_params_update),
-        )
-        .route("/events", get(events))
-        .layer(middleware::from_fn_with_state(app.clone(), auth))
-        .with_state(app);
+    let api =
+        Router::new()
+            .route("/control/status", get(control_status))
+            .route("/control/select", axum::routing::post(select))
+            .route("/control/symbols", axum::routing::post(symbols))
+            .route("/control/retire", axum::routing::post(retire))
+            .route("/control/deselect", axum::routing::post(deselect))
+            .route("/control/start", axum::routing::post(start))
+            .route("/control/stop", axum::routing::post(stop))
+            .route("/status", get(status))
+            .route(
+                "/exchanges/catalog",
+                get(|| async { Json(data::catalog().clone()) }),
+            )
+            .route("/exchanges/request-stats", get(request_stats))
+            .route(
+                "/requests/live",
+                get(|State(a): State<App>| async move { Json(requests_live(&a.bot)) }),
+            )
+            .route("/requests/stream", get(requests_stream))
+            .route("/env", get(env_get).post(env_post))
+            .route("/env/reveal", get(env_reveal))
+            .route("/discovery", get(discovery))
+            .route("/discovery/refresh", axum::routing::post(discovery_refresh))
+            .route("/market", get(market))
+            .route("/strategies", get(strategies))
+            .route("/arbitrage", get(arbitrage))
+            .route("/order", axum::routing::post(order))
+            .route("/cancel-all", axum::routing::post(cancel_all))
+            .route("/balances", get(balances))
+            .route("/positions", get(positions))
+            .route(
+                "/trading/recheck",
+                get(|State(a): State<App>| async move { Json(a.bot.recheck_json()) }).post(
+                    |State(a): State<App>| async move {
+                        a.bot.recheck_now().await.map(Json).map_err(bad)
+                    },
+                ),
+            )
+            .route(
+                "/metrics",
+                get(|State(a): State<App>| async move {
+                    (
+                        [(
+                            header::CONTENT_TYPE,
+                            "text/plain; version=0.0.4; charset=utf-8",
+                        )],
+                        crate::metrics::render(&a.bot),
+                    )
+                }),
+            )
+            .route("/positions/close", axum::routing::post(positions_close))
+            .route("/funding", get(funding))
+            .route(
+                "/control/exchanges",
+                get(|| async {
+                    Json(json!({"поддерживаемые": data::exchange_ids()}))
+                }),
+            )
+            .route("/paper/reset", axum::routing::post(reset_account))
+            .route("/account/reset", axum::routing::post(reset_account))
+            .route("/trading/start", axum::routing::post(trading_start))
+            .route("/trading/stop", axum::routing::post(trading_stop))
+            .route("/trading/panic", axum::routing::post(trading_panic))
+            .route("/settings", get(settings).post(settings_update))
+            .route(
+                "/exchange/params/schema",
+                get(|| async { Json(Value::Object(data::exchange_schema().clone())) }),
+            )
+            .route(
+                "/exchange/params",
+                get(exchange_params).post(exchange_params_update),
+            )
+            .route("/events", get(events))
+            .layer(middleware::from_fn_with_state(app.clone(), auth))
+            .with_state(app);
     Router::new()
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
         .merge(api)
@@ -239,7 +250,8 @@ fn control_status_json(bot: &Bot) -> Value {
         "убрать": removable,
         "стакан": book_feeds(bot),
         "баны": {},
-        "только_выход": {},
+        "только_выход": bot.exit_only.lock().unwrap().iter().filter(|(_, m)| !m.is_empty())
+            .map(|(e, m)| (e.clone(), json!(m))).collect::<Map<String, Value>>(),
     })
 }
 
@@ -786,6 +798,12 @@ async fn symbols(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiEr
 async fn retire(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiError> {
     let ex = need(&q, "exchange")?;
     let sym = need(&q, "symbol")?;
+    // соединения подняты — вывод из торговли (заявки, позиция перпа); нет — просто убрать из выбранных
+    if a.bot.running() {
+        return Ok(Json(
+            a.bot.retire_symbol(ex, sym, "по команде").map_err(bad)?,
+        ));
+    }
     a.bot.remove_symbol(ex, sym).map_err(bad)?;
     Ok(Json(
         json!({"exchange": ex, "symbol": sym.to_uppercase(), "status": "убрана из выбранных"}),
