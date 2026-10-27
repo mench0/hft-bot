@@ -118,10 +118,6 @@ pub struct Tune {
     pub stale: Duration,
     /// Начальная пауза переподключения (wsReconnectBaseMs, 500 мс), дальше — вдвое до 30 с.
     pub reconnect_base: Duration,
-    /// Сколько ждать WebSocket, прежде чем опрашивать стакан по REST (restFallbackGraceMs, 2 с).
-    pub grace: Duration,
-    /// Пауза REST-опроса после «слишком часто» (pollBackoffMs, 60 с; повторы — вдвое дольше).
-    pub poll_backoff: Duration,
     /// Неудач подряд, после которых источник сдаётся (feedMaxFailures, 15).
     pub max_failures: u32,
     /// Ошибок разбора подряд до сброса соединения (wsMaxParseErrors, 5).
@@ -154,117 +150,9 @@ impl Tune {
                 Duration::from_secs(30)
             },
             reconnect_base: ms(n("wsReconnectBaseMs", 500.0).max(50.0)),
-            grace: ms(n("restFallbackGraceMs", 2000.0)),
-            poll_backoff: ms(n("pollBackoffMs", 60_000.0).max(1000.0)),
             max_failures: n("feedMaxFailures", 15.0).max(1.0) as u32,
             max_parse_errors: n("wsMaxParseErrors", 5.0).max(1.0) as u32,
             max_crossed: n("wsMaxCrossedBooks", 200.0).max(1.0) as u32,
-        }
-    }
-}
-
-/// Адрес REST-стакана символа для опроса, пока нет WebSocket; None — у биржи (рынка) опроса нет.
-pub fn rest_book_url(ex: &str, base: &str, symbol: &str, perp: bool) -> Option<String> {
-    let (b, q) = crate::trading::paper::split(symbol)?;
-    let s = symbol.to_uppercase();
-    Some(match (ex, perp) {
-        ("binance", true) => format!("{base}/fapi/v1/depth?symbol={s}&limit=50"),
-        ("bybit", true) => {
-            format!("{base}/v5/market/orderbook?category=linear&symbol={s}&limit=50")
-        }
-        ("binance" | "mexc", false) => format!("{base}/api/v3/depth?symbol={s}&limit=50"),
-        ("bybit", false) => format!("{base}/v5/market/orderbook?category=spot&symbol={s}&limit=50"),
-        ("okx", false) => format!("{base}/api/v5/market/books?instId={b}-{q}&sz=50"),
-        ("gate", false) => format!("{base}/api/v4/spot/order_book?currency_pair={b}_{q}&limit=50"),
-        ("upbit", false) => format!("{base}/v1/orderbook?markets={q}-{b}"),
-        ("lbank", false) => format!(
-            "{base}/v2/depth.do?symbol={}_{}&size=50",
-            b.to_lowercase(),
-            q.to_lowercase()
-        ),
-        _ => return None,
-    })
-}
-
-/// REST-опрос стаканов, пока WebSocket лежит дольше grace: снимок раз в секунду по каждому символу; «слишком часто»
-/// (HTTP 429/418) — пауза pollBackoffMs, повторы вдвое дольше. WebSocket вернулся — опрос выключается.
-async fn rest_fallback(
-    market: Arc<Market>,
-    ex: String,
-    base: String,
-    perp: bool,
-    symbols: Vec<String>,
-    tune: Tune,
-) {
-    let urls: Vec<(String, String)> = symbols
-        .iter()
-        .filter_map(|s| Some((s.clone(), rest_book_url(&ex, &base, s, perp)?)))
-        .collect();
-    if urls.is_empty() {
-        return;
-    }
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("HTTP-клиент");
-    let mut backoff = tune.poll_backoff;
-    loop {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let down = market
-            .feed(&ex)
-            .and_then(|f| f.down_since)
-            .is_some_and(|t| t.elapsed() >= tune.grace);
-        let was = market.with_feed(&ex, |f| std::mem::replace(&mut f.rest_polling, down));
-        if down != was {
-            tracing::warn!(
-                "[{ex}] REST-опрос стакана {}",
-                if down {
-                    "включён: WebSocket не отвечает"
-                } else {
-                    "выключен: WebSocket вернулся"
-                }
-            );
-        }
-        if !down {
-            continue;
-        }
-        for (sym, url) in &urls {
-            let _ = crate::infra::ratelimit::take(&ex, "book_poll").await;
-            let r = match http.get(url).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    market.with_feed(&ex, |f| f.rest_error = format!("стакан {sym}: {e}"));
-                    continue;
-                }
-            };
-            let st = r.status().as_u16();
-            if st == 429 || st == 418 {
-                tracing::warn!(
-                    "[{ex}] REST-опрос: «слишком часто» — пауза {} с",
-                    backoff.as_secs()
-                );
-                market.with_feed(&ex, |f| {
-                    f.rest_error = format!("стакан: HTTP {st}, пауза {} с", backoff.as_secs())
-                });
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(3600));
-                break;
-            }
-            match r
-                .json::<Value>()
-                .await
-                .ok()
-                .and_then(|v| crate::discovery::screener::parse_book(&ex, &v))
-            {
-                Some((bids, asks)) => {
-                    backoff = tune.poll_backoff;
-                    market.with_book(&ex, sym, |b| b.apply_snapshot(bids, asks, 0));
-                    market.with_feed(&ex, |f| f.rest_polls += 1);
-                }
-                None => market.with_feed(&ex, |f| {
-                    f.rest_error = format!("стакан {sym}: HTTP {st}, ответ не разобран")
-                }),
-            }
         }
     }
 }
@@ -462,29 +350,6 @@ pub fn start(
             .to_owned()
         });
     let tune = Tune::from(&ex, params);
-    // REST-опрос стакана, пока нет WebSocket: restUrl или публичный адрес биржи (спот — как у скринера)
-    let book_base = params
-        .get("restUrl")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .or_else(|| {
-            if perp {
-                Some(rest_url.clone())
-            } else {
-                crate::discovery::screener::base_url(&ex).map(str::to_owned)
-            }
-        });
-    let fallback = book_base.map(|b| {
-        rest_fallback(
-            m.clone(),
-            ex.clone(),
-            b,
-            perp,
-            symbols.clone(),
-            tune.clone(),
-        )
-    });
     let rest = (ex == "binance").then(|| {
         rest_loop(
             market.clone(),
@@ -500,11 +365,6 @@ pub fn start(
     Plan::Run(tokio::spawn(async move {
         tokio::join!(
             run(m, ex, dialect, tune),
-            async {
-                if let Some(f) = fallback {
-                    f.await
-                }
-            },
             async {
                 if let Some(c) = contracts {
                     c.await

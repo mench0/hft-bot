@@ -278,9 +278,7 @@ fn book_feeds(bot: &Bot) -> Value {
             let Some(f) = bot.market.feed(ex).filter(|f| f.unsupported.is_empty()) else {
                 continue;
             };
-            let feed = if f.rest_polling {
-                "rest"
-            } else if f.connected {
+            let feed = if f.connected && f.down_since.is_none() {
                 "websocket"
             } else {
                 "нет данных"
@@ -623,8 +621,6 @@ fn status_json(bot: &Bot) -> Value {
                 "ошибок_разбора": f.parse_errors,
                 "сбросов_перекрещённых": f.crossed_resets,
                 "неудач_подряд": f.failures,
-                "rest_опрос": f.rest_polling,
-                "rest_снимков": f.rest_polls,
             });
             if f.gave_up {
                 e["источник_сдался"] = Value::Bool(true);
@@ -4324,16 +4320,10 @@ mod tests {
         call(&r, "POST", "/control/stop", "").await;
     }
 
-    /// WebSocket стакана недоступен → стакан по REST-опросу: в /control/status feed «rest», вход отклонён (бумага).
+    /// WebSocket стакана недоступен: REST-снимков стакана нет, в /control/status — «нет данных», вход отклонён.
     #[tokio::test]
-    async fn rest_book_blocks_entries_end_to_end() {
+    async fn book_socket_down_blocks_entries_end_to_end() {
         let rest = Router::new()
-            .route(
-                "/api/v3/depth",
-                get(|| async {
-                    Json(json!({"lastUpdateId": 1, "bids": [["99", "2"]], "asks": [["100", "3"]]}))
-                }),
-            )
             .route(
                 "/api/v3/exchangeInfo",
                 get(|| async { Json(json!({"symbols": []})) }),
@@ -4350,28 +4340,11 @@ mod tests {
             .unwrap();
         let (_d, r) = app("");
         let sel = format!(
-            "/control/select?exchange=binance&symbols=BTCUSDT&market=spot&wsUrl=ws://{dead}/stream&restUrl=http://{raddr}&restFallbackGraceMs=0&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
+            "/control/select?exchange=binance&symbols=BTCUSDT&market=spot&wsUrl=ws://{dead}/stream&restUrl=http://{raddr}&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
         );
         assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
         call(&r, "POST", "/control/start", "").await;
         call(&r, "POST", "/trading/start", "").await;
-        let until = tokio::time::Instant::now() + Duration::from_secs(15);
-        loop {
-            let (_, s) = call(&r, "GET", "/control/status", "").await;
-            let f = &s["стакан"]["binance"];
-            if f["feed"] == "rest"
-                && f["entries"]
-                    .as_str()
-                    .is_some_and(|e| e.starts_with("запрещены"))
-            {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < until,
-                "стакан не перешёл на REST: {s}"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
         let (c, v) = call(
             &r,
             "POST",
@@ -4380,12 +4353,19 @@ mod tests {
         )
         .await;
         assert_eq!(c, StatusCode::BAD_REQUEST, "{v}");
-        assert!(v.to_string().contains("REST-опрос"), "{v}");
+        assert!(v.to_string().contains("сокет стакана не подключён"), "{v}");
         let (_, s) = call(&r, "GET", "/control/status", "").await;
-        assert_eq!(
-            s["стакан"]["binance"]["restEntriesBlocked"],
-            json!(1),
+        let f = &s["стакан"]["binance"];
+        assert_eq!(f["feed"], json!("нет данных"), "{s}");
+        assert!(
+            f["entries"].as_str().unwrap().contains("сокет стакана"),
             "{s}"
+        );
+        assert_eq!(f["restEntriesBlocked"], json!(1), "{s}");
+        let (_, st) = call(&r, "GET", "/status", "").await;
+        assert!(
+            st["binance"].get("rest_опрос").is_none(),
+            "REST-опроса стакана больше нет: {st}"
         );
         call(&r, "POST", "/control/stop", "").await;
     }

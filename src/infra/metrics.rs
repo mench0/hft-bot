@@ -112,7 +112,6 @@ pub const SOURCES: &[(&str, &str)] = &[
     ("orders", "ордера"),
     ("account", "аккаунт"),
     ("public", "публичные"),
-    ("book_poll", "опрос стакана"),
     ("discovery", "подбор"),
     ("funding", "ставки funding"),
     ("reference", "справочники"),
@@ -404,17 +403,12 @@ pub fn render(bot: &Bot) -> String {
         ),
         (
             "hft_feed_realtime",
-            "1 если стакан идёт по WebSocket, 0 — по REST-опросу или нет данных",
+            "1 если стакан идёт по WebSocket, 0 — сокет стакана не подключён (входы запрещены)",
             false,
         ),
         (
             "hft_feed_gave_up",
             "1 если источник данных сдался (feedMaxFailures) — торговля на бирже на паузе",
-            false,
-        ),
-        (
-            "hft_feed_rest_polling",
-            "1 если стакан опрашивается по REST (WebSocket не отвечает)",
             false,
         ),
         (
@@ -492,9 +486,8 @@ pub fn render(bot: &Bot) -> String {
                 .unwrap_or(Value::Null);
             let v = match name {
                 "hft_connected" => b(fd.connected),
-                "hft_feed_realtime" => b(fd.connected && !fd.rest_polling),
+                "hft_feed_realtime" => b(fd.connected && fd.down_since.is_none()),
                 "hft_feed_gave_up" => b(fd.gave_up),
-                "hft_feed_rest_polling" => b(fd.rest_polling),
                 "hft_trading_enabled" => b(bot
                     .params(ex)
                     .get("tradingEnabled")

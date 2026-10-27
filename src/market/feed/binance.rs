@@ -219,45 +219,4 @@ mod tests {
         }
         task.abort();
     }
-
-    /// WebSocket недоступен дольше grace — стакан приходит REST-опросом; «слишком часто» не роняет опрос.
-    #[tokio::test]
-    async fn rest_fallback_while_ws_down() {
-        use axum::{Json, Router, routing::get};
-        let app = Router::new().route(
-            "/fapi/v1/depth",
-            get(|| async { Json(serde_json::json!({"lastUpdateId": 1, "bids": [["99", "2"]], "asks": [["99.5", "3"]]})) }),
-        );
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", l.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
-        let m = Arc::new(Market::default());
-        m.with_feed("binance", |f| {
-            f.down_since = Some(std::time::Instant::now())
-        });
-        let tune = super::super::Tune {
-            grace: std::time::Duration::from_millis(0),
-            ..Default::default()
-        };
-        let task = tokio::spawn(super::super::rest_fallback(
-            m.clone(),
-            "binance".into(),
-            base,
-            true,
-            vec!["BTCUSDT".into()],
-            tune,
-        ));
-        let b = testkit::wait_ready(&m, "binance", "BTCUSDT").await;
-        assert_eq!(
-            (b.best_bid(), b.best_ask()),
-            (Some((99.0, 2.0)), Some((99.5, 3.0)))
-        );
-        let f = m.feed("binance").unwrap();
-        assert!(f.rest_polling && f.rest_polls >= 1, "{f:?}");
-        // WebSocket вернулся — опрос выключается
-        m.with_feed("binance", |f| f.down_since = None);
-        tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
-        assert!(!m.feed("binance").unwrap().rest_polling);
-        task.abort();
-    }
 }

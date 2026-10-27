@@ -873,6 +873,22 @@ impl Bot {
         })
     }
 
+    /// Стакан — только по WebSocket: сокет стакана не подключён — новые входы запрещены, выход (продажа спота, уменьшение
+    /// позиции перпа) разрешён по последнему стакану; ордер выхода уходит по сокету ордеров или, если его нет, по REST.
+    pub fn sync_entry_gate(&self, ex: &str) {
+        let up = self
+            .market
+            .feed(ex)
+            .is_none_or(|f| f.connected && f.down_since.is_none());
+        if let Some(a) = self.accounts.lock().unwrap().get_mut(ex) {
+            a.block_entries(if up {
+                ""
+            } else {
+                "сокет стакана не подключён: вход запрещён, выход разрешён"
+            });
+        }
+    }
+
     /// Шаг движка по всем подключённым биржам.
     fn tick(&self) {
         let saved = self.snapshot();
@@ -894,16 +910,7 @@ impl Bot {
                     }
                 }
             }
-            // стакан идёт REST-опросом (WebSocket лежит): новые входы запрещены, выходы разрешены (как в Java); без связи
-            // и без REST стакан и так устаревает — входы закрывает maxDataAgeMs
-            let realtime = self.market.feed(&ex).is_none_or(|f| !f.rest_polling);
-            if let Some(a) = self.accounts.lock().unwrap().get_mut(&ex) {
-                a.block_entries(if realtime {
-                    ""
-                } else {
-                    "стакан не по WebSocket (REST-опрос): вход запрещён, выход разрешён"
-                });
-            }
+            self.sync_entry_gate(&ex);
             let sp = spread::Params::from(&params);
             let selected = saved.selection.get(&ex).cloned().unwrap_or_default();
             let books: HashMap<String, Book> = selected
@@ -1543,6 +1550,8 @@ impl Bot {
         price: Option<f64>,
     ) -> ActionResult<Fill> {
         self.running_exchange(ex)?;
+        // запрет входов — по состоянию сокета стакана прямо сейчас, а не на прошлом шаге движка
+        self.sync_entry_gate(ex);
         let p = self.params(ex);
         let sym = symbol.trim().to_uppercase();
         if !self
