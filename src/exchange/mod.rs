@@ -11,6 +11,7 @@ pub mod kucoin;
 pub mod lbank;
 pub mod mexc;
 pub mod okx;
+pub mod regions;
 pub mod rest;
 pub mod transfer;
 pub mod uniswap;

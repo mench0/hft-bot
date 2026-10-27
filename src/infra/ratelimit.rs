@@ -67,6 +67,8 @@ pub fn set_safety(s: f64) {
 
 /// Вёдра биржи по документации (как в Java RateLimits): (имя, официальная ёмкость, окно мс, виды).
 fn limits(ex: &str) -> Vec<(&'static str, f64, u64, &'static [Kind])> {
+    // «биржа#метка» — отдельный бюджет с вёдрами биржи (тесты)
+    let ex = ex.split('#').next().unwrap_or(ex);
     match ex {
         // вес 6000/мин на IP, ордера 50/10 с и 160 000/сутки, сырые 61 000/5 мин; WS 5 сообщений/с, 300 подключений/5 мин
         "binance" => vec![
@@ -348,6 +350,71 @@ pub fn hit(ex: &str, what: &str) -> u64 {
     })
 }
 
+/// Подтянуть счёт к счёту биржи по заголовкам ответа (как Java syncFromHeaders): Binance/Aster — израсходованный
+/// вес и ордера; Bybit, Gate, KuCoin — остаток почти исчерпан (≤ 2) → пауза до сброса из заголовка (не дольше 60 с).
+pub fn sync_headers(ex: &str, h: &reqwest::header::HeaderMap) {
+    let num = |k: &str| {
+        h.get(k)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<i64>().ok())
+    };
+    for (header, bucket) in [
+        ("x-mbx-used-weight-1m", "weight"),
+        ("x-mbx-order-count-10s", "orders10s"),
+        ("x-mbx-order-count-1d", "orders1d"),
+    ] {
+        if let Some(used) = num(header) {
+            sync_used(ex, bucket, used.max(0) as f64);
+        }
+    }
+    for (remain, reset, epoch) in [
+        ("x-bapi-limit-status", "x-bapi-limit-reset-timestamp", true),
+        (
+            "x-gate-ratelimit-requests-remain",
+            "x-gate-ratelimit-reset-timestamp",
+            true,
+        ),
+        ("gw-ratelimit-remaining", "gw-ratelimit-reset", false),
+    ] {
+        let Some(left) = num(remain) else { continue };
+        if left > 2 {
+            continue;
+        }
+        let now = now_ms() as i64;
+        let wait = match num(reset) {
+            None => 1_000,
+            Some(r) if epoch => r - now,
+            Some(r) => r,
+        };
+        if wait > 0 {
+            let until = now as u64 + wait.min(60_000) as u64;
+            with(ex, |b| {
+                if until > b.blocked_until {
+                    b.blocked_until = until;
+                    b.block_reason = format!("{remain}={left}");
+                    b.block_kind = 0;
+                }
+            });
+        }
+    }
+}
+
+/// Биржа сообщила, сколько уже израсходовано: больше нашего счёта — уменьшаем остаток (запас безопасности сохраняется).
+fn sync_used(ex: &str, bucket: &str, used_official: f64) {
+    let s = *SAFETY.lock().unwrap();
+    let now = now_ms();
+    with(ex, |b| {
+        for k in b.buckets.iter_mut().filter(|k| k.name == bucket) {
+            k.refill(now);
+            let official = k.capacity / s;
+            let left = k.capacity - used_official.min(official);
+            if left < k.tokens {
+                k.tokens = left;
+            }
+        }
+    });
+}
+
 /// Биржи с бюджетом.
 pub fn exchanges() -> Vec<String> {
     let mut v: Vec<String> = ALL
@@ -435,6 +502,47 @@ mod tests {
                 s["ban"]["exact"].clone()
             ),
             (json!(2), json!(1), json!(false))
+        );
+    }
+
+    #[test]
+    fn headers_sync_used_weight_and_pause_on_low_remain() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        // вес Binance 6000/мин × запас: биржа насчитала 5900 — остаток не больше ёмкость − 5900 (меньше нуля)
+        let mut h = HeaderMap::new();
+        h.insert("x-mbx-used-weight-1m", HeaderValue::from_static("5900"));
+        sync_headers("binance#hdr", &h);
+        let w = with("binance#hdr", |b| {
+            b.buckets
+                .iter()
+                .find(|k| k.name == "weight")
+                .map(|k| (k.tokens, k.capacity))
+                .unwrap()
+        });
+        assert!((w.0 - (w.1 - 5900.0)).abs() < 1.0, "{w:?}");
+        // израсходован 1 — остаток ёмкость − 1 (запас безопасности сохраняется)
+        h.insert("x-mbx-used-weight-1m", HeaderValue::from_static("1"));
+        sync_headers("binance#hdr2", &h);
+        let w = with("binance#hdr2", |b| {
+            b.buckets
+                .iter()
+                .find(|k| k.name == "weight")
+                .map(|k| (k.tokens, k.capacity))
+                .unwrap()
+        });
+        assert_eq!(w.0, w.1 - 1.0);
+        let mut b = HeaderMap::new();
+        b.insert("x-bapi-limit-status", HeaderValue::from_static("1"));
+        let reset = (now_ms() + 3_000).to_string();
+        b.insert(
+            "x-bapi-limit-reset-timestamp",
+            HeaderValue::from_str(&reset).unwrap(),
+        );
+        sync_headers("bybit#hdr", &b);
+        let until = with("bybit#hdr", |x| x.blocked_until);
+        assert!(
+            until > now_ms() + 2_000 && until <= now_ms() + 3_100,
+            "пауза до сброса"
         );
     }
 

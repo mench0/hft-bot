@@ -147,7 +147,8 @@ impl Client {
         let v: Value = r
             .send()
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())
+            .inspect(|r| crate::infra::ratelimit::sync_headers("kucoin", r.headers()))?
             .json()
             .await
             .map_err(|e| e.to_string())?;

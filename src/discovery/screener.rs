@@ -1982,16 +1982,16 @@ pub async fn run(
         .filter_map(|(k, c)| Some((k, c?)))
         .collect();
     let cross = Params::at(settings, "", "cross-exchange-arb");
-    (
-        status,
-        vec![
-            spread_capture(&all, &books, &candles, &sc),
-            cross_arb(&all, &cross),
-            lead_lag(&all, &|ex| Params::at(settings, ex, "lead-lag")),
-            perp_arb(&all, &|ex| Params::at(settings, ex, "perp-arb")),
-            stat_arb(&pools, &closes, &sa),
-        ],
-    )
+    let mut out = vec![
+        spread_capture(&all, &books, &candles, &sc),
+        cross_arb(&all, &cross),
+        lead_lag(&all, &|ex| Params::at(settings, ex, "lead-lag")),
+        perp_arb(&all, &|ex| Params::at(settings, ex, "perp-arb")),
+        stat_arb(&pools, &closes, &sa),
+    ];
+    // биржа далеко от сервера бота (serverRegion) — стратегии «не подходит», как в Java
+    crate::exchange::regions::mark(&mut out, crate::exchange::regions::Region::server(settings));
+    (status, out)
 }
 
 /// Перп с котировкой из discoveryQuotes.
@@ -2001,7 +2001,12 @@ fn excluded_quote(t: &Ticker, settings: &Map<String, Value>) -> bool {
 
 impl Screener {
     /// Ответ /discovery в формате Java.
-    pub fn json(&self, chosen: &[String], refresh_sec: u64) -> Value {
+    pub fn json(
+        &self,
+        chosen: &[String],
+        refresh_sec: u64,
+        server: Option<crate::exchange::regions::Region>,
+    ) -> Value {
         let exs: Map<String, Value> = self
             .exchanges
             .iter()
@@ -2020,7 +2025,7 @@ impl Screener {
             "running": self.running, "updatedAt": self.updated_at, "durationMs": self.duration_ms,
             "refreshSeconds": refresh_sec, "nextRefreshAt": self.next_at,
             "chosenExchanges": chosen, "availableExchanges": SUPPORTED,
-            "exchanges": exs, "strategies": self.strategies,
+            "exchanges": exs, "strategies": self.strategies, "location": crate::exchange::regions::location(server),
             "note": if unsupported.is_empty() { String::new() } else {
                 format!("Нет сводок в Rust-скринере: {}", unsupported.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")) },
             "status": if chosen.is_empty() { "Выберите биржи для подбора" } else { "" },

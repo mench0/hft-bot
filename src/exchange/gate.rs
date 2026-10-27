@@ -130,6 +130,7 @@ impl Client {
             r = r.body(b);
         }
         let resp = r.send().await.map_err(|e| e.to_string())?;
+        crate::infra::ratelimit::sync_headers("gate", resp.headers());
         let st = resp.status();
         let v: Value = resp.json().await.map_err(|e| format!("HTTP {st}: {e}"))?;
         if !st.is_success() {

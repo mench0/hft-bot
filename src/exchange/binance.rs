@@ -141,6 +141,7 @@ impl Client {
             .send()
             .await
             .map_err(|e| e.to_string())?;
+        crate::infra::ratelimit::sync_headers("binance", r.headers());
         let status = r.status();
         let v: Value = r.json().await.map_err(|e| format!("HTTP {status}: {e}"))?;
         if !status.is_success() {

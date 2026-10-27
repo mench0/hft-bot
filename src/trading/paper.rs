@@ -167,6 +167,12 @@ pub struct Paper {
     pub stops_triggered: u64,
     /// Биржа счёта — для журнала отладки.
     pub venue: String,
+    /// Почему новые входы сейчас запрещены (стакан по REST); пусто — разрешены. Выходы проходят всегда.
+    pub entries_blocked: String,
+    /// Входов отклонено, пока стакан шёл по REST.
+    pub rest_entries_blocked: u64,
+    /// Выходов, прошедших, пока стакан шёл по REST.
+    pub rest_exits: u64,
 }
 
 /// Исполнение заявки.
@@ -232,6 +238,9 @@ impl Paper {
             stops: HashMap::new(),
             stops_triggered: 0,
             venue: String::new(),
+            entries_blocked: String::new(),
+            rest_entries_blocked: 0,
+            rest_exits: 0,
         };
         for s in symbols {
             if let Some((_, q)) = split(s) {

@@ -159,7 +159,8 @@ impl Client {
             .header("X-BAPI-SIGN", sig)
             .send()
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())
+            .inspect(|r| crate::infra::ratelimit::sync_headers("bybit", r.headers()))?
             .json()
             .await
             .map_err(|e| e.to_string())?;

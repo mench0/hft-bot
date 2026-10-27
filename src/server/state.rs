@@ -894,6 +894,16 @@ impl Bot {
                     }
                 }
             }
+            // стакан идёт REST-опросом (WebSocket лежит): новые входы запрещены, выходы разрешены (как в Java); без связи
+            // и без REST стакан и так устаревает — входы закрывает maxDataAgeMs
+            let realtime = self.market.feed(&ex).is_none_or(|f| !f.rest_polling);
+            if let Some(a) = self.accounts.lock().unwrap().get_mut(&ex) {
+                a.block_entries(if realtime {
+                    ""
+                } else {
+                    "стакан не по WebSocket (REST-опрос): вход запрещён, выход разрешён"
+                });
+            }
             let sp = spread::Params::from(&params);
             let selected = saved.selection.get(&ex).cloned().unwrap_or_default();
             let books: HashMap<String, Book> = selected
@@ -1103,7 +1113,11 @@ impl Bot {
     /// Ответ /discovery.
     pub fn discovery_json(&self) -> Value {
         let (chosen, sec) = self.discovery_settings();
-        self.screener.lock().unwrap().json(&chosen, sec)
+        self.screener.lock().unwrap().json(
+            &chosen,
+            sec,
+            crate::exchange::regions::Region::server(&self.settings()),
+        )
     }
 
     /// Запустить пересчёт подбора в фоне; false — уже идёт или биржи не выбраны.
@@ -1440,8 +1454,8 @@ impl Bot {
         });
     }
 
-    /// Межбиржевые стратегии для /arbitrage (как в Java): spotPrice — арбитраж на споте; перп-арбитража и
-    /// lead-lag в Rust ещё нет.
+    /// Межбиржевые стратегии для /arbitrage (как в Java): spotPrice — спот-арбитраж, perpPrice — перп-арбитраж,
+    /// leadLag — lead-lag.
     pub fn arbitrage_json(&self) -> Value {
         let off = json!({"running": false});
         let spot = if self.running() {

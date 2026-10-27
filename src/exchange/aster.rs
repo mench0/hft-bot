@@ -138,6 +138,7 @@ impl Client {
             .send()
             .await
             .map_err(|e| e.to_string())?;
+        crate::infra::ratelimit::sync_headers("aster", r.headers());
         let st = r.status();
         let v: Value = r.json().await.map_err(|e| format!("HTTP {st}: {e}"))?;
         if !st.is_success() || v["code"].as_i64().is_some_and(|c| c < 0) {

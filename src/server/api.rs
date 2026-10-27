@@ -112,7 +112,16 @@ pub fn router(bot: Arc<Bot>, cfg: AdminConfig) -> Router {
             .route("/status", get(status))
             .route(
                 "/exchanges/catalog",
-                get(|| async { Json(data::catalog().clone()) }),
+                get(|State(a): State<App>| async move {
+                    // рекомендации — с учётом сервера бота (serverRegion)
+                    let server = crate::exchange::regions::Region::server(&a.bot.settings());
+                    let mut c = data::catalog().clone();
+                    for e in c["exchanges"].as_array_mut().into_iter().flatten() {
+                        let id = e["id"].as_str().unwrap_or("").to_owned();
+                        e["recommendation"] = crate::exchange::regions::recommendation(&id, server);
+                    }
+                    Json(c)
+                }),
             )
             .route("/exchanges/request-stats", get(request_stats))
             .route(
@@ -269,36 +278,49 @@ fn book_feeds(bot: &Bot) -> Value {
             let Some(f) = bot.market.feed(ex).filter(|f| f.unsupported.is_empty()) else {
                 continue;
             };
-            let feed = if f.connected {
+            let feed = if f.rest_polling {
+                "rest"
+            } else if f.connected {
                 "websocket"
             } else {
                 "нет данных"
             };
-            let link = bot
-                .accounts
-                .lock()
-                .unwrap()
-                .get(ex)
-                .and_then(|a| a.trade_link());
-            let (entries, exits, blocked, rest) = match &link {
+            let (acc, link) = {
+                let a = bot.accounts.lock().unwrap();
+                let a = a.get(ex);
+                (a.map(|a| a.rest_gate()), a.and_then(|a| a.trade_link()))
+            };
+            let (reason, rest_blocked, rest_exits) = acc.unwrap_or_default();
+            let (entries, exits, ws_blocked, ws_rest) = match &link {
                 None => (
-                    "REST (у биржи нет ордеров по сокету или wsOrders=false)",
-                    "REST",
+                    "разрешены (ордера по REST)",
+                    "разрешены (ордера по REST)",
                     0,
                     0,
                 ),
-                Some((l, _)) if l.ready() => ("по сокету ордеров", "по сокету ордеров", 0, 0),
+                Some((l, _)) if l.ready() => (
+                    "разрешены (по сокету ордеров)",
+                    "разрешены (по сокету ордеров)",
+                    0,
+                    0,
+                ),
                 Some((l, b)) => (
                     "запрещены: сокет ордеров не подключён",
-                    "по REST (сокет ордеров не подключён)",
+                    "разрешены по REST (сокет ордеров не подключён)",
                     *b,
                     l.fallbacks.load(std::sync::atomic::Ordering::Relaxed),
                 ),
             };
+            // стакан не по WebSocket — входы запрещены при любом транспорте ордеров
+            let entries = if reason.is_empty() {
+                entries.to_owned()
+            } else {
+                format!("запрещены: {reason}")
+            };
             m.insert(
                 ex.clone(),
                 json!({"feed": feed, "entries": entries, "exits": exits,
-                "restEntriesBlocked": blocked, "restExits": rest}),
+                "restEntriesBlocked": rest_blocked + ws_blocked, "restExits": rest_exits + ws_rest}),
             );
         }
     }
@@ -4229,6 +4251,72 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert_eq!(ex.lock().unwrap().bad_sig, 0, "все подписи REST верны");
+        call(&r, "POST", "/control/stop", "").await;
+    }
+
+    /// WebSocket стакана недоступен → стакан по REST-опросу: в /control/status feed «rest», вход отклонён (бумага).
+    #[tokio::test]
+    async fn rest_book_blocks_entries_end_to_end() {
+        let rest = Router::new()
+            .route(
+                "/api/v3/depth",
+                get(|| async {
+                    Json(json!({"lastUpdateId": 1, "bids": [["99", "2"]], "asks": [["100", "3"]]}))
+                }),
+            )
+            .route(
+                "/api/v3/exchangeInfo",
+                get(|| async { Json(json!({"symbols": []})) }),
+            )
+            .route("/api/v3/klines", get(|| async { Json(json!([])) }));
+        let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let raddr = rl.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(rl, rest).await.unwrap() });
+        // порт без сервера: WebSocket не подключается
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let (_d, r) = app("");
+        let sel = format!(
+            "/control/select?exchange=binance&symbols=BTCUSDT&market=spot&wsUrl=ws://{dead}/stream&restUrl=http://{raddr}&restFallbackGraceMs=0&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
+        );
+        assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
+        call(&r, "POST", "/control/start", "").await;
+        call(&r, "POST", "/trading/start", "").await;
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let (_, s) = call(&r, "GET", "/control/status", "").await;
+            let f = &s["стакан"]["binance"];
+            if f["feed"] == "rest"
+                && f["entries"]
+                    .as_str()
+                    .is_some_and(|e| e.starts_with("запрещены"))
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "стакан не перешёл на REST: {s}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let (c, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=binance&symbol=BTCUSDT&side=BUY&type=MARKET&qty=0.1",
+            "",
+        )
+        .await;
+        assert_eq!(c, StatusCode::BAD_REQUEST, "{v}");
+        assert!(v.to_string().contains("REST-опрос"), "{v}");
+        let (_, s) = call(&r, "GET", "/control/status", "").await;
+        assert_eq!(
+            s["стакан"]["binance"]["restEntriesBlocked"],
+            json!(1),
+            "{s}"
+        );
         call(&r, "POST", "/control/stop", "").await;
     }
 

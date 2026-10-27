@@ -124,6 +124,32 @@ impl Account {
         }
     }
 
+    /// Запретить или разрешить новые входы (reason пусто — разрешены).
+    pub fn block_entries(&mut self, reason: &str) {
+        let led = self.ledger_mut();
+        if led.entries_blocked != reason {
+            if reason.is_empty() {
+                tracing::info!(
+                    "[{}] стакан снова по WebSocket — входы разрешены",
+                    led.venue
+                );
+            } else {
+                tracing::warn!("[{}] {reason}", led.venue);
+            }
+            led.entries_blocked = reason.to_owned();
+        }
+    }
+
+    /// Причина запрета входов, отклонено входов и прошло выходов, пока стакан шёл по REST.
+    pub fn rest_gate(&self) -> (String, u64, u64) {
+        let l = self.ledger();
+        (
+            l.entries_blocked.clone(),
+            l.rest_entries_blocked,
+            l.rest_exits,
+        )
+    }
+
     /// "PAPER", "TESTNET" или "LIVE".
     pub fn mode(&self) -> &'static str {
         match self {
@@ -141,6 +167,22 @@ impl Account {
         book: Option<&Book>,
         lim: &Limits,
     ) -> Result<Fill, String> {
+        // стакан по REST: новые входы запрещены, выход (продажа спота, уменьшение позиции перпа) — можно
+        if !self.ledger().entries_blocked.is_empty() {
+            let room = self.ledger().exit_room(&symbol.to_uppercase(), side);
+            let exit = match amount {
+                Amount::Qty(q) => q <= room + 1e-12,
+                Amount::Portion(_) | Amount::All => room > 0.0,
+            };
+            let led = self.ledger_mut();
+            if !exit {
+                led.rest_entries_blocked += 1;
+                let e = led.entries_blocked.clone();
+                led.note_rejected(&e);
+                return Err(e);
+            }
+            led.rest_exits += 1;
+        }
         let r = match self {
             Account::Paper(p) => p.order(symbol, side, amount, limit, book, lim),
             Account::Live(l) => l.order(symbol, side, amount, limit, book, lim),
@@ -357,6 +399,36 @@ mod tests {
         let mut b = Book::default();
         b.apply_snapshot(vec![(bid, 100.0)], vec![(ask, 100.0)], 0);
         b
+    }
+
+    #[test]
+    fn rest_book_blocks_entries_but_not_exits() {
+        let mut a = Account::Paper(Paper::new(&["XUSDT".into()], 1000.0, 0.0, 0.0));
+        a.set_perp(2.0);
+        let mut lim = Limits::from_params(&serde_json::Map::new());
+        lim.trading_enabled = true;
+        let b = book(99.9, 100.0);
+        a.order("XUSDT", Side::Buy, Amount::Qty(1.0), None, Some(&b), &lim)
+            .unwrap();
+        a.block_entries("стакан по REST");
+        // добавить к лонгу или открыть шорт больше позиции — вход
+        assert_eq!(
+            a.order("XUSDT", Side::Buy, Amount::Qty(0.5), None, Some(&b), &lim)
+                .unwrap_err(),
+            "стакан по REST"
+        );
+        assert!(
+            a.order("XUSDT", Side::Sell, Amount::Qty(2.0), None, Some(&b), &lim)
+                .is_err()
+        );
+        // уменьшить лонг — выход
+        a.order("XUSDT", Side::Sell, Amount::Qty(1.0), None, Some(&b), &lim)
+            .unwrap();
+        assert!(a.position_qty("XUSDT").abs() < 1e-9);
+        assert_eq!(a.rest_gate(), ("стакан по REST".into(), 2, 1));
+        a.block_entries("");
+        a.order("XUSDT", Side::Buy, Amount::Qty(0.5), None, Some(&b), &lim)
+            .unwrap();
     }
 
     #[test]
