@@ -131,6 +131,8 @@ pub fn router(bot: Arc<Bot>, cfg: AdminConfig) -> Router {
             .route("/cancel-all", axum::routing::post(cancel_all))
             .route("/balances", get(balances))
             .route("/positions", get(positions))
+        .route("/signals", get(|State(a): State<App>| async move { Json(a.bot.signals.json(&a.bot.settings())) }))
+        .route("/alerts/test", get(alert_test).post(alert_test))
             .route(
                 "/trading/recheck",
                 get(|State(a): State<App>| async move { Json(a.bot.recheck_json()) }).post(
@@ -688,6 +690,33 @@ async fn balances(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiE
     Ok(Json(
         json!({"свободно": a.bot.balances(need(&q, "exchange")?).map_err(bad)?}),
     ))
+}
+
+/// GET /alerts/test — состояние Discord; POST ?channel=listing — проверочный алерт в вебхук листингов.
+async fn alert_test(
+    State(a): State<App>,
+    method: Method,
+    Query(q): Q,
+) -> Result<Json<Value>, ApiError> {
+    let url = a
+        .bot
+        .settings()
+        .get("listingDiscordUrl")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    if method == Method::POST {
+        if q.get("channel").map(String::as_str) != Some("listing") {
+            return Err(bad("channel: listing"));
+        }
+        crate::signals::send_now(
+            &url,
+            "✅ Проверка алертов HFT-бота (листинги): вебхук работает",
+        )
+        .await
+        .map_err(bad)?;
+    }
+    Ok(Json(crate::signals::discord_stats(&url)))
 }
 
 async fn positions(State(a): State<App>, Query(q): Q) -> Json<Value> {

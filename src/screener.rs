@@ -931,6 +931,62 @@ impl Sources {
         })
     }
 
+    /// Список пар спота биржи для листингов (без лучших цен): у Upbit — рынки KRW, BTC и USDT.
+    pub async fn listing_tickers(&self, ex: &str) -> Result<Vec<Ticker>, String> {
+        match (ex, self.urls.get(ex)) {
+            ("upbit", Some(base)) => {
+                let _ = crate::ratelimit::take(ex, "discovery").await;
+                Ok(parse(
+                    ex,
+                    &self
+                        .get(&format!(
+                            "{base}/v1/ticker/all?quote_currencies=KRW,BTC,USDT"
+                        ))
+                        .await?,
+                ))
+            }
+            ("lbank", Some(base)) => {
+                let _ = crate::ratelimit::take(ex, "discovery").await;
+                Ok(parse(
+                    ex,
+                    &self
+                        .get(&format!("{base}/v2/ticker/24hr.do?symbol=all"))
+                        .await?,
+                ))
+            }
+            _ => self.tickers(ex).await,
+        }
+    }
+
+    /// Адрес списка пар биржи по рынку (для админки: «откуда узнали о листинге»).
+    pub fn listing_source(&self, ex: &str, perp: bool) -> Option<String> {
+        let (b, p) = (self.urls.get(ex), self.perp_urls.get(ex));
+        Some(match (ex, perp) {
+            ("binance" | "mexc", false) => format!("{}/api/v3/ticker/24hr", b?),
+            ("binance", true) => format!("{}/fapi/v1/ticker/24hr", p?),
+            ("mexc", true) => format!("{}/api/v1/contract/ticker", p?),
+            ("bybit", false) => format!("{}/v5/market/tickers?category=spot", b?),
+            ("bybit", true) => format!("{}/v5/market/tickers?category=linear", p?),
+            ("okx", false) => format!("{}/api/v5/market/tickers?instType=SPOT", b?),
+            ("okx", true) => format!("{}/api/v5/market/tickers?instType=SWAP", p?),
+            ("gate", false) => format!("{}/api/v4/spot/tickers", b?),
+            ("gate", true) => format!("{}/api/v4/futures/usdt/tickers", p?),
+            ("upbit", false) => format!("{}/v1/ticker/all", b?),
+            ("lbank", false) => format!("{}/v2/ticker/24hr.do", b?),
+            ("kucoin", false) => format!("{}/api/v1/market/allTickers", b?),
+            ("kucoin", true) => format!("{}/api/v1/contracts/active", p?),
+            ("bingx", false) => format!("{}/openApi/spot/v1/ticker/24hr", b?),
+            ("bingx", true) => format!("{}/openApi/swap/v2/quote/ticker", p?),
+            ("hyperliquid", true) => format!("{}/info (metaAndAssetCtxs)", p?),
+            _ => return None,
+        })
+    }
+
+    /// GET JSON (для анонсов).
+    pub async fn get_json(&self, url: &str) -> Result<Value, String> {
+        self.get(url).await
+    }
+
     /// Сводки биржи с лучшими ценами.
     pub async fn tickers(&self, ex: &str) -> Result<Vec<Ticker>, String> {
         let base = self

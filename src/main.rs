@@ -29,6 +29,7 @@ mod perparb;
 mod ratelimit;
 mod rest;
 mod screener;
+mod signals;
 mod signed;
 mod spotarb;
 mod spread;
@@ -91,6 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let bot = Arc::new(state::Bot::load(state_path));
     bot.spawn_screener();
+    bot.spawn_signals();
     let addr: SocketAddr = format!("{bind}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("Админка: http://{addr}/control/status (заголовок X-Admin-Token)");

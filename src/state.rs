@@ -62,6 +62,8 @@ pub struct Bot {
     /// Скринер (подбор тикеров).
     pub screener: Arc<Mutex<crate::screener::Screener>>,
     pub screener_sources: crate::screener::Sources,
+    /// Сигналы: листинги и анонсы (алерты в Discord).
+    pub signals: crate::signals::Signals,
     /// Последнее учтённое время funding по (биржа, символ).
     funding_applied: Mutex<HashMap<(String, String), u64>>,
     /// Сторож перпов: позиции без стратегии — с какого момента замечены (биржа, символ) → мс; закрыто по биржам.
@@ -132,6 +134,7 @@ impl Bot {
             perparb: Mutex::default(),
             screener: Arc::default(),
             screener_sources: crate::screener::Sources::default(),
+            signals: crate::signals::Signals::default(),
             funding_applied: Mutex::default(),
             orphans: Mutex::default(),
             orphans_closed: Mutex::default(),
@@ -1376,6 +1379,13 @@ impl Bot {
     }
 
     /// Автопересчёт подбора (discoveryRefreshSec): проверка раз в секунду.
+    /// Сигналы (листинги, анонсы) в фоне — с настройками процесса, пока бот жив.
+    pub fn spawn_signals(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        self.signals
+            .spawn(move || weak.upgrade().map(|b| b.settings()));
+    }
+
     pub fn spawn_screener(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
