@@ -1087,7 +1087,7 @@ impl Bot {
         let (scr, src, p) = (
             self.screener.clone(),
             self.screener_sources.clone(),
-            crate::screener::Params::from(&self.settings()),
+            self.settings(),
         );
         tokio::spawn(async move {
             let t0 = std::time::Instant::now();
