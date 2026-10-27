@@ -41,7 +41,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 fn env(key: &str, def: &str) -> String {
-    std::env::var(key)
+    util::env(key)
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| def.to_owned())
@@ -78,11 +78,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr: SocketAddr = format!("{bind}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("Админка: http://{addr}/control/status (заголовок X-Admin-Token)");
-    axum::serve(listener, api::router(bot, cfg))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("Остановка");
-        })
-        .await?;
+    axum::serve(
+        listener,
+        api::router(bot, cfg).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("Остановка");
+    })
+    .await?;
     Ok(())
 }

@@ -58,6 +58,140 @@ const LAT_KEEP: usize = 1000;
 static CALLS: std::sync::Mutex<std::collections::BTreeMap<(String, &'static str), Calls>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// Запросы в секунду по источникам и входящие WS по каналам — для вкладки «Запросы» (как Java RequestRates):
+/// всего и по секундам за последние 60 с.
+const WINDOW: usize = 60;
+
+#[derive(Default, Clone)]
+struct Rate {
+    total: u64,
+    /// Счёт по секундам: (секунда, число), не старше WINDOW.
+    secs: std::collections::VecDeque<(u64, u64)>,
+}
+
+impl Rate {
+    fn inc(&mut self, now: u64) {
+        self.total += 1;
+        match self.secs.back_mut() {
+            Some((t, n)) if *t == now => *n += 1,
+            _ => self.secs.push_back((now, 1)),
+        }
+        while self
+            .secs
+            .front()
+            .is_some_and(|(t, _)| now.saturating_sub(*t) >= WINDOW as u64)
+        {
+            self.secs.pop_front();
+        }
+    }
+    /// Число по секундам за WINDOW (старые — первыми).
+    fn history(&self, now: u64) -> Vec<u64> {
+        let mut h = vec![0; WINDOW];
+        for (t, n) in &self.secs {
+            let age = now.saturating_sub(*t) as usize;
+            if age < WINDOW {
+                h[WINDOW - 1 - age] = *n;
+            }
+        }
+        h
+    }
+    /// Среднее в секунду за последние 5 полных секунд.
+    fn per_sec(&self, now: u64) -> f64 {
+        let n: u64 = self
+            .secs
+            .iter()
+            .filter(|(t, _)| *t < now && now - *t <= 5)
+            .map(|x| x.1)
+            .sum();
+        n as f64 / 5.0
+    }
+}
+
+/// Источники запросов (метки и названия, как в Java).
+pub const SOURCES: &[(&str, &str)] = &[
+    ("orders", "ордера"),
+    ("account", "аккаунт"),
+    ("public", "публичные"),
+    ("book_poll", "опрос стакана"),
+    ("discovery", "подбор"),
+    ("funding", "ставки funding"),
+    ("reference", "справочники"),
+    ("ws_connect", "подключения WS"),
+    ("ws_send", "сообщения WS"),
+];
+const CHANNELS: &[(&str, &str)] = &[("market", "рыночные данные"), ("private", "торговый сокет")];
+
+static RATES: std::sync::Mutex<std::collections::BTreeMap<(String, &'static str, bool), Rate>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn now_s() -> u64 {
+    crate::util::now_ms() / 1000
+}
+
+/// Запрос к бирже по источнику (метка из SOURCES).
+pub fn out(ex: &str, source: &'static str) {
+    RATES
+        .lock()
+        .unwrap()
+        .entry((ex.to_owned(), source, false))
+        .or_default()
+        .inc(now_s());
+}
+
+/// Входящее сообщение WebSocket по каналу (market, private).
+pub fn inbound(ex: &str, channel: &'static str) {
+    RATES
+        .lock()
+        .unwrap()
+        .entry((ex.to_owned(), channel, true))
+        .or_default()
+        .inc(now_s());
+}
+
+/// Вид запроса торгового клиента → источник.
+fn source_of(kind: &str) -> &'static str {
+    match kind {
+        "order" | "cancel" | "stop" | "stop_cancel" => "orders",
+        "time" => "public",
+        _ => "account",
+    }
+}
+
+/// Биржи, по которым были запросы или входящие сообщения.
+pub fn rate_exchanges() -> Vec<String> {
+    let mut v: Vec<String> = RATES.lock().unwrap().keys().map(|k| k.0.clone()).collect();
+    v.dedup();
+    v
+}
+
+/// Снимок биржи для /requests/live: perSec, total, history, sources, wsIn, wsInPerSec, wsInHistory.
+pub fn rates_snapshot(ex: &str) -> Value {
+    let now = now_s();
+    let m = RATES.lock().unwrap();
+    let part = |inbound: bool, names: &[(&str, &str)]| {
+        let (mut map, mut sum, mut ps, mut total) =
+            (serde_json::Map::new(), vec![0u64; WINDOW], 0.0, 0u64);
+        for (k, title) in names {
+            let Some(r) = m.get(&(ex.to_owned(), *k, inbound)) else {
+                continue;
+            };
+            let h = r.history(now);
+            for (a, b) in sum.iter_mut().zip(&h) {
+                *a += b;
+            }
+            let p = r.per_sec(now);
+            ps += p;
+            total += r.total;
+            map.insert(k.to_string(), serde_json::json!({"title": title, "total": r.total, "perSec": (p * 100.0).round() / 100.0, "history": h}));
+        }
+        (map, sum, (ps * 100.0).round() / 100.0, total)
+    };
+    let (sources, hist, ps, total) = part(false, SOURCES);
+    let (ws, ws_hist, ws_ps, _) = part(true, CHANNELS);
+    serde_json::json!({"perSec": ps, "total": total, "history": hist, "sources": sources,
+        "wsInPerSec": ws_ps, "wsInHistory": ws_hist, "wsIn": ws})
+}
+
 /// Время старта процесса (для hft_process_uptime_seconds).
 static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
@@ -72,6 +206,7 @@ pub async fn timed<T>(
     f: impl std::future::Future<Output = Result<T, String>>,
 ) -> Result<T, String> {
     let t = std::time::Instant::now();
+    out(ex, source_of(kind));
     let r = f.await;
     record(ex, kind, t.elapsed().as_micros() as u64, r.is_ok());
     r
@@ -660,6 +795,19 @@ mod tests {
             o.0
         );
         assert!(o.0.contains("hft_order_latency_p99_micros{exchange=\"testex\"} 99"));
+    }
+
+    #[test]
+    fn rates_by_second() {
+        let mut r = Rate::default();
+        for t in [100, 100, 101, 103, 103, 103] {
+            r.inc(t);
+        }
+        let h = r.history(104);
+        assert_eq!((r.total, &h[WINDOW - 5..]), (6, &[2, 1, 0, 3, 0][..]));
+        assert_eq!(r.per_sec(104), 1.2);
+        r.inc(200); // старше минуты — забыто
+        assert_eq!(r.history(200).iter().sum::<u64>(), 1);
     }
 
     #[test]

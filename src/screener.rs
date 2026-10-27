@@ -361,6 +361,7 @@ impl Sources {
             "lbank" => format!("{base}/v2/ticker/24hr.do?symbol=all"),
             _ => return Err(format!("{ex}: сводок в Rust-скринере нет")),
         };
+        crate::metrics::out(ex, "discovery");
         let mut ts = parse(ex, &self.get(&url).await?);
         match ex {
             "upbit" => {
@@ -411,10 +412,10 @@ impl Sources {
 
     pub async fn book(&self, t: &Ticker) -> Result<Levels, String> {
         let base = self.urls.get(&t.exchange).ok_or("нет источника")?;
-        parse_book(
-            &t.exchange,
-            &self.get(&book_url(&t.exchange, base, t)).await?,
-        )
+        parse_book(&t.exchange, &{
+            crate::metrics::out(&t.exchange, "discovery");
+            self.get(&book_url(&t.exchange, base, t)).await?
+        })
         .ok_or_else(|| "пустой стакан".into())
     }
 }

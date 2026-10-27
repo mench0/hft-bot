@@ -116,8 +116,11 @@ pub fn router(bot: Arc<Bot>, cfg: AdminConfig) -> Router {
         .route("/exchanges/request-stats", get(request_stats))
         .route(
             "/requests/live",
-            get(|| async { Json(json!({"ts": now_ms(), "exchanges": {}})) }),
+            get(|State(a): State<App>| async move { Json(requests_live(&a.bot)) }),
         )
+        .route("/requests/stream", get(requests_stream))
+        .route("/env", get(env_get).post(env_post))
+        .route("/env/reveal", get(env_reveal))
         .route("/discovery", get(discovery))
         .route("/discovery/refresh", axum::routing::post(discovery_refresh))
         .route("/market", get(market))
@@ -294,6 +297,216 @@ fn request_stats_json(bot: &Bot) -> Value {
         }
     }
     Value::Object(m)
+}
+
+/// Снимок запросов к биржам (как в Java): по бирже — в секунду, всего, история за 60 с, источники, входящие WS,
+/// режим; лимитов частоты в Rust-боте пока нет — buckets пустые.
+fn requests_live(bot: &Bot) -> Value {
+    let mut ids: std::collections::BTreeSet<String> =
+        crate::metrics::rate_exchanges().into_iter().collect();
+    let active: Vec<String> = if bot.running() {
+        bot.snapshot().selection.keys().cloned().collect()
+    } else {
+        Vec::new()
+    };
+    ids.extend(active.iter().cloned());
+    let modes = request_stats_json(bot);
+    let mut exs = Map::new();
+    let mut total = 0.0;
+    for id in ids {
+        let mut n = crate::metrics::rates_snapshot(&id);
+        n["active"] = Value::Bool(active.contains(&id));
+        n["buckets"] = json!([]);
+        if let Some(m) = modes.get(&id) {
+            for k in ["mode", "modeTitle", "network"] {
+                n[k] = m[k].clone();
+            }
+        }
+        total += n["perSec"].as_f64().unwrap_or(0.0);
+        exs.insert(id, n);
+    }
+    json!({"ts": now_ms(), "exchanges": exs, "perSec": (total * 100.0).round() / 100.0, "maxUsedRatio": 0.0})
+}
+
+/// Переменные, которые читает бот (как в Java, плюс STATE_FILE Rust-бота): админка, ключи бирж, фразы OKX и KuCoin.
+fn known_env_keys() -> Vec<String> {
+    let mut k: Vec<String> = [
+        "ADMIN_TOKEN",
+        "ADMIN_PORT",
+        "ADMIN_ENABLED",
+        "ADMIN_BIND",
+        "ADMIN_CORS_ORIGINS",
+        "METRICS_AUTH",
+        "STATE_DB",
+        "STATE_FILE",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    for id in data::exchange_ids() {
+        let p = id.to_uppercase();
+        for s in [
+            "_API_KEY",
+            "_API_SECRET",
+            "_TESTNET_API_KEY",
+            "_TESTNET_API_SECRET",
+            "_TESTNET",
+            "_LIVE",
+            "_PAPER",
+        ] {
+            k.push(format!("{p}{s}"));
+        }
+    }
+    k.extend(
+        [
+            "OKX_PASSPHRASE",
+            "OKX_TESTNET_PASSPHRASE",
+            "KUCOIN_PASSPHRASE",
+            "KUCOIN_UTA",
+        ]
+        .map(str::to_owned),
+    );
+    k
+}
+
+/// В списке секреты не показываются: у ключа — первые 4 символа, порт, адреса и флаги — как есть; целиком — /env/reveal.
+fn mask_env(key: &str, v: &str) -> String {
+    let plain = [
+        "ADMIN_PORT",
+        "ADMIN_ENABLED",
+        "ADMIN_BIND",
+        "ADMIN_CORS_ORIGINS",
+        "METRICS_AUTH",
+        "STATE_DB",
+        "STATE_FILE",
+    ]
+    .contains(&key)
+        || key.ends_with("_TESTNET")
+        || key.ends_with("_LIVE")
+        || key.ends_with("_PAPER");
+    if plain {
+        v.to_owned()
+    } else if key.ends_with("_API_KEY") {
+        format!("{}…", v.chars().take(4).collect::<String>())
+    } else {
+        "••••••".into()
+    }
+}
+
+fn env_json() -> Value {
+    let file = crate::util::dotenv::vars();
+    let vars: Map<String, Value> = known_env_keys()
+        .into_iter()
+        .map(|k| {
+            let v = crate::util::env(&k).ok().map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+            let src = match &v {
+                None => "",
+                Some(_) if file.get(&k).is_some_and(|x| !x.trim().is_empty()) => ".env",
+                Some(_) => "окружение",
+            };
+            let n = json!({"задана": v.is_some(), "источник": src, "значение": v.as_deref().map_or(String::new(), |x| mask_env(&k, x))});
+            (k, n)
+        })
+        .collect();
+    json!({"файл": crate::util::dotenv::path().display().to_string(), "файл_есть": crate::util::dotenv::exists(), "переменные": vars})
+}
+
+/// GET /env — переменные, которые читает бот: задана ли, откуда (.env или окружение), значение со скрытыми секретами.
+async fn env_get() -> Json<Value> {
+    Json(env_json())
+}
+
+/// POST /env?ИМЯ=значение — записать в .env (пустое значение удаляет строку); только известные переменные.
+async fn env_post(Query(q): Q) -> Result<Json<Value>, ApiError> {
+    if q.is_empty() {
+        return Err(bad("Не указаны переменные: POST /env?ИМЯ=значение"));
+    }
+    let known = known_env_keys();
+    if let Some(k) = q.keys().find(|k| !known.contains(k)) {
+        return Err(bad(format!("Неизвестная переменная: {k}")));
+    }
+    let updates: std::collections::BTreeMap<String, String> = q.into_iter().collect();
+    crate::util::dotenv::set(&updates).map_err(bad)?;
+    let restart = updates.keys().any(|k| {
+        k.starts_with("ADMIN_") || k == "STATE_FILE" || k == "STATE_DB" || k == "METRICS_AUTH"
+    });
+    let names: Vec<&String> = updates.keys().collect();
+    let mut v = env_json();
+    v["сообщение"] = Value::from(format!(
+        "Записано в .env: {names:?}{}",
+        if restart {
+            ". ADMIN_*, METRICS_AUTH и STATE_FILE применятся после перезапуска процесса; ключи — при следующем запуске соединений"
+        } else {
+            ". Ключи применятся при следующем запуске соединений (Остановить → Поднять)"
+        }
+    ));
+    Ok(Json(v))
+}
+
+/// GET /env/reveal?key=… — значение одной переменной целиком (кнопка «показать»); каждый просмотр — в лог, без значения.
+async fn env_reveal(Query(q): Q, req: Request) -> Result<Response, ApiError> {
+    let addr = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .copied();
+    let key = need(&q, "key")?;
+    if !known_env_keys().iter().any(|k| k == key) {
+        return Err(bad(format!("Неизвестная переменная: {key}")));
+    }
+    tracing::info!(
+        "Админка: показано значение {key} (с {})",
+        addr.map_or_else(|| "?".to_owned(), |a| a.0.ip().to_string())
+    );
+    let v = crate::util::env(key)
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty());
+    let body = json!({"переменная": key, "задана": v.is_some(), "значение": v.unwrap_or_default()});
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(body)).into_response())
+}
+
+/// Открытых потоков /requests/stream; больше MAX_STREAMS — 503, админка переходит на опрос /requests/live.
+static STREAMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const MAX_STREAMS: usize = 8;
+const STREAM_TTL: Duration = Duration::from_secs(600);
+
+/// GET /requests/stream — снимок /requests/live потоком Server-Sent Events раз в секунду; поток живёт 10 мин.
+async fn requests_stream(State(a): State<App>) -> Response {
+    use std::sync::atomic::Ordering;
+    if STREAMS.fetch_add(1, Ordering::SeqCst) >= MAX_STREAMS {
+        STREAMS.fetch_sub(1, Ordering::SeqCst);
+        return ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Слишком много открытых потоков — используйте /requests/live".into(),
+        )
+        .into_response();
+    }
+    struct Slot;
+    impl Drop for Slot {
+        fn drop(&mut self) {
+            STREAMS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let until = tokio::time::Instant::now() + STREAM_TTL;
+    let s =
+        futures_util::stream::unfold((a.bot, Slot, true), move |(bot, slot, first)| async move {
+            if !first {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            if tokio::time::Instant::now() >= until {
+                return None;
+            }
+            let frame = format!("data: {}\n\n", requests_live(&bot));
+            Some((Ok::<_, std::convert::Infallible>(frame), (bot, slot, false)))
+        });
+    (
+        [
+            (header::CONTENT_TYPE, "text/event-stream; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        axum::body::Body::from_stream(s),
+    )
+        .into_response()
 }
 
 async fn request_stats(State(a): State<App>) -> Json<Value> {
@@ -723,6 +936,65 @@ mod tests {
             .await
             .unwrap();
         (st, String::from_utf8(b.to_vec()).unwrap())
+    }
+
+    /// /env: запись в .env, маски секретов, источник значения, показ целиком, удаление пустым значением.
+    #[tokio::test]
+    async fn env_file_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("bot.env");
+        std::fs::write(&file, "# комментарий\nexport KUCOIN_UTA=\"true\"\n").unwrap();
+        crate::util::set_env("ENV_FILE", file.to_str().unwrap());
+        let (_d, r) = app("");
+        let (_, v) = call(&r, "GET", "/env", "").await;
+        assert_eq!(v["файл_есть"], json!(true));
+        assert_eq!(
+            v["переменные"]["KUCOIN_UTA"],
+            json!({"задана": true, "источник": ".env", "значение": "••••••"}),
+            "{v}"
+        );
+        assert_eq!(v["переменные"]["MEXC_API_KEY"]["задана"], json!(false));
+        let (c, v) = call(
+            &r,
+            "POST",
+            "/env?MEXC_API_KEY=abcdef123&MEXC_API_SECRET=s3cr3t",
+            "",
+        )
+        .await;
+        assert_eq!(c, StatusCode::OK, "{v}");
+        assert!(v["сообщение"].as_str().unwrap().contains("MEXC_API_KEY"));
+        assert_eq!(v["переменные"]["MEXC_API_KEY"]["значение"], json!("abcd…"));
+        assert_eq!(
+            v["переменные"]["MEXC_API_SECRET"]["значение"],
+            json!("••••••")
+        );
+        assert_eq!(
+            crate::util::env("MEXC_API_SECRET").unwrap(),
+            "s3cr3t",
+            "бот читает .env"
+        );
+        let (_, v) = call(&r, "GET", "/env/reveal?key=MEXC_API_SECRET", "").await;
+        assert_eq!(v["значение"], json!("s3cr3t"));
+        assert_eq!(
+            call(&r, "GET", "/env/reveal?key=PATH", "").await.0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            call(&r, "POST", "/env?PATH=x", "").await.0,
+            StatusCode::BAD_REQUEST
+        );
+        // пустое значение удаляет строку; остальное в файле не тронуто
+        call(&r, "POST", "/env?MEXC_API_KEY=&MEXC_API_SECRET=", "").await;
+        let t = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(t, "# комментарий\nexport KUCOIN_UTA=\"true\"\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     /// /metrics открыт для Prometheus без токена (METRICS_AUTH не задан), остальное — под токеном.
@@ -3183,6 +3455,43 @@ mod tests {
         ] {
             assert!(m.contains(want), "нет «{want}» в\n{m}");
         }
+        // вкладка «Запросы»: входящие WS стакана, запросы справочников и funding
+        let (_, q) = call(&r, "GET", "/requests/live", "").await;
+        let b = &q["exchanges"]["binance"];
+        assert_eq!(b["active"], json!(true), "{q}");
+        assert!(
+            b["wsIn"]["market"]["total"].as_u64().unwrap_or(0) > 0,
+            "{q}"
+        );
+        assert_eq!(b["wsInHistory"].as_array().map(Vec::len), Some(60));
+        for k in ["reference", "funding", "ws_connect"] {
+            assert!(
+                b["sources"][k]["total"].as_u64().unwrap_or(0) >= 1,
+                "{k}: {q}"
+            );
+        }
+        assert_eq!(b["sources"]["funding"]["title"], "ставки funding");
+        // тот же снимок потоком SSE
+        let req = axum::http::Request::builder()
+            .uri("/requests/stream")
+            .body(Body::empty())
+            .unwrap();
+        let res = r.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            res.headers()[header::CONTENT_TYPE],
+            "text/event-stream; charset=utf-8"
+        );
+        let mut body = res.into_body();
+        let frame = body.frame().await.unwrap().unwrap();
+        let t = String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap();
+        let v: Value = serde_json::from_str(t.strip_prefix("data: ").unwrap().trim_end()).unwrap();
+        assert!(
+            v["exchanges"]["binance"]["wsIn"]["market"]["total"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        drop(body);
         let (_, e) = call(&r, "GET", "/control/exchanges", "").await;
         assert!(
             e["поддерживаемые"]

@@ -1222,6 +1222,7 @@ async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) 
         };
         let mut pings = 0u32;
         // зависшее рукопожатие не держит поток вечно
+        crate::metrics::out(&ex, "ws_connect");
         let conn = match tokio::time::timeout(Duration::from_secs(10), async {
             match venue.stream_request(&url) {
                 Ok(r) => tokio_tungstenite::connect_async(r).await,
@@ -1257,6 +1258,7 @@ async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) 
                     ready(&acc);
                 }
                 for m in hello.unwrap_or_default() {
+                    crate::metrics::out(&ex, "ws_send");
                     if let Err(e) = ws.send(Message::text(m)).await {
                         err = e.to_string();
                     }
@@ -1267,6 +1269,7 @@ async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) 
                         _ = ping.tick() => {
                             pings += 1;
                             if let Some(p) = venue.stream_ping() {
+                                crate::metrics::out(&ex, "ws_send");
                                 err = ws.send(Message::text(p)).await.err().map(|e| e.to_string()).unwrap_or_default();
                             }
                             if pings.is_multiple_of(90)
@@ -1277,6 +1280,9 @@ async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) 
                             continue;
                         }
                     };
+                    if matches!(msg, Some(Ok(Message::Text(_) | Message::Binary(_)))) {
+                        crate::metrics::inbound(&ex, "private");
+                    }
                     // бинарные кадры (BingX — gzip) — в текст
                     let msg = match msg {
                         // MEXC спот — protobuf
@@ -1308,12 +1314,14 @@ async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) 
                             }
                             StreamMsg::SendMany(ms) => {
                                 for m in ms {
+                                    crate::metrics::out(&ex, "ws_send");
                                     if let Err(e) = ws.send(Message::text(m)).await {
                                         err = e.to_string();
                                     }
                                 }
                             }
                             StreamMsg::Send(m) => {
+                                crate::metrics::out(&ex, "ws_send");
                                 err = ws
                                     .send(Message::text(m))
                                     .await
