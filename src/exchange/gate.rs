@@ -79,6 +79,15 @@ pub struct Client {
 }
 
 impl Client {
+    /// Адрес лучших цен спота (свежая цена для выхода, когда сокет стакана лежит).
+    pub fn top_url(&self, symbol: &str) -> String {
+        format!(
+            "{}/api/v4/spot/order_book?currency_pair={}&limit=1",
+            self.base,
+            pair(symbol)
+        )
+    }
+
     pub fn new(base: &str, keys: Keys, perp: bool, testnet: bool, symbols: &[String]) -> Client {
         Client {
             base: base.trim_end_matches('/').to_owned(),

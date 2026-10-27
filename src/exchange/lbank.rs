@@ -114,6 +114,11 @@ pub struct Client {
 }
 
 impl Client {
+    /// Адрес лучших цен (свежая цена для выхода, когда сокет стакана лежит).
+    pub fn top_url(&self, symbol: &str) -> String {
+        format!("{}/v2/depth.do?symbol={}&size=1", self.base, pair(symbol))
+    }
+
     pub fn new(base: &str, keys: Keys) -> Client {
         Client {
             base: base.trim_end_matches('/').to_owned(),

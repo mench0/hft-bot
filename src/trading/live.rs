@@ -21,6 +21,8 @@ pub enum Cmd {
         price: Option<f64>,
         /// Ориентир цены (рыночная покупка Gate задаётся суммой в котируемой валюте).
         ref_px: f64,
+        /// Выход по старому стакану (сокет стакана лежит): перед отправкой взять свежую цену по REST.
+        refresh: bool,
     },
     Cancel {
         local: u64,
@@ -122,6 +124,8 @@ struct Stop {
 }
 
 const STOP_RETRY: Duration = Duration::from_secs(30);
+/// Стакан старше — перед рыночным выходом берётся свежая цена по REST.
+const STALE_MS: u64 = 2_000;
 
 fn near(a: f64, b: f64) -> bool {
     (a - b).abs() <= (b.abs() * 1e-9).max(1e-12)
@@ -164,6 +168,7 @@ impl Live {
         qty: f64,
         price: Option<f64>,
         ref_px: f64,
+        refresh: bool,
     ) -> Fill {
         let local = self.next;
         self.next += 1;
@@ -187,6 +192,7 @@ impl Live {
             qty,
             price,
             ref_px,
+            refresh,
         });
         Fill {
             order_id: local,
@@ -232,7 +238,7 @@ impl Live {
             return Err(e);
         }
         self.ledger.note_accepted();
-        Ok(self.send(symbol, side, pr.qty, pr.limit, pr.ref_px))
+        Ok(self.send(symbol, side, pr.qty, pr.limit, pr.ref_px, false))
     }
 
     /// Выход рыночной продажей без проверок торговли (стоп, выключение стратегии).
@@ -253,13 +259,18 @@ impl Live {
         qty: f64,
         book: Option<&Book>,
     ) -> Result<Fill, String> {
-        let b = book.filter(|b| b.is_ready()).ok_or("стакан не готов")?;
-        let ref_px = if side == Side::Buy {
-            b.best_ask()
-        } else {
-            b.best_bid()
-        }
-        .map_or(0.0, |x| x.0);
+        // стакан старый (сокет стакана лежит) или его нет — выход всё равно идёт, а свежую цену возьмёт фоновая задача
+        let b = book.filter(|b| b.is_ready());
+        let ref_px = b
+            .and_then(|b| {
+                if side == Side::Buy {
+                    b.best_ask()
+                } else {
+                    b.best_bid()
+                }
+            })
+            .map_or(0.0, |x| x.0);
+        let refresh = b.and_then(Book::age_ms).is_none_or(|a| a > STALE_MS);
         let qty = qty.min(self.ledger.exit_room(symbol, side));
         let qty = self
             .ledger
@@ -268,7 +279,7 @@ impl Live {
         if qty <= 0.0 {
             return Err(format!("нечего закрывать по {symbol}"));
         }
-        Ok(self.send(symbol, side, qty, None, ref_px))
+        Ok(self.send(symbol, side, qty, None, ref_px, refresh))
     }
 
     /// Снять ордер; false — его уже нет.
@@ -699,6 +710,35 @@ impl Venue {
             Venue::Okx(c) => c.place(local, symbol, side, qty, price).await,
         }
     }
+    /// Свежие лучшие бид и аск по REST — только у бирж, где рыночный ордер строится от опорной цены (Gate спот —
+    /// покупка суммой; Hyperliquid — IOC ±5 %; Upbit, LBank — покупка суммой); у остальных опорная цена не нужна (None).
+    async fn fresh_top(&self, symbol: &str) -> Option<Result<(f64, f64), String>> {
+        let (ex, url) = match self {
+            Venue::Hyperliquid(c) => return Some(c.top(symbol).await),
+            Venue::Gate(c) if !c.perp => ("gate", c.top_url(symbol)),
+            Venue::Upbit(c) => ("upbit", c.top_url(symbol)),
+            Venue::Lbank(c) => ("lbank", c.top_url(symbol)),
+            _ => return None,
+        };
+        let r = async {
+            let v: serde_json::Value = reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .map_err(|e| e.to_string())?
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?
+                .json()
+                .await
+                .map_err(|e| e.to_string())?;
+            let (b, a) = crate::discovery::screener::parse_book(ex, &v)
+                .ok_or_else(|| format!("пустой стакан {symbol}"))?;
+            Ok((b[0].0, a[0].0))
+        };
+        Some(r.await)
+    }
+
     async fn query(&self, symbol: &str, id: &str) -> Result<OrderState, String> {
         match self {
             Venue::Binance(c) => c.query(symbol, id).await,
@@ -1109,7 +1149,7 @@ async fn place_order(
 ) -> Result<OrderState, String> {
     if let Some(link) = link {
         if link.ready() {
-            let _ = crate::infra::ratelimit::take(ex, "order").await;
+            let _ = crate::infra::ratelimit::take(ex, "orders").await;
         }
         let t = std::time::Instant::now();
         match client
@@ -1223,7 +1263,20 @@ pub async fn worker(
             cmd = rx.recv() => {
                 let Some(cmd) = cmd else { return };
                 match cmd {
-                    Cmd::Place { local, symbol, side, qty, price, ref_px } => {
+                    Cmd::Place { local, symbol, side, qty, price, mut ref_px, refresh } => {
+                        // выход по старому стакану: свежая цена по REST (одним запросом, только для этого ордера)
+                        if refresh && price.is_none() {
+                            let _ = crate::infra::ratelimit::take(&ex, "market").await;
+                            match crate::infra::metrics::timed(&ex, "exit_price", async { client.fresh_top(&symbol).await.unwrap_or(Err(String::new())) }).await {
+                                Ok((bid, ask)) => {
+                                    let px = if side == Side::Buy { ask } else { bid };
+                                    tracing::warn!("[{ex}] выход {symbol}: стакан старый — свежая цена по REST {px} (было {ref_px})");
+                                    ref_px = px;
+                                }
+                                Err(e) if !e.is_empty() => tracing::warn!("[{ex}] выход {symbol}: свежая цена по REST не получена ({e}) — по последнему стакану {ref_px}"),
+                                Err(_) => {}
+                            }
+                        }
                         let r = place_order(&ex, &client, link.as_deref(), local, &symbol, side, qty, price, ref_px).await;
                         crate::infra::journal::action(&ex, Some(&symbol), &match &r {
                             Ok(st) => format!("биржа приняла ордер #{local} {side:?} {qty}{}: номер {}, {} {}", price.map_or(String::new(), |p| format!(" @ {p}")), st.id, st.status, st.executed),
@@ -1879,7 +1932,7 @@ async fn cancel(
     };
     if let Some(link) = link {
         if link.ready() {
-            let _ = crate::infra::ratelimit::take(ex, "cancel").await;
+            let _ = crate::infra::ratelimit::take(ex, "orders").await;
         }
         let t = std::time::Instant::now();
         match client.cancel_ws(link, &symbol, &id).await {
@@ -2398,6 +2451,50 @@ mod tests {
             ),
             (Some("TRX"), Some("20"), Some("Tokx"))
         );
+    }
+
+    /// Выход по старому стакану (или без стакана): ордер всё равно уходит, фоновая задача берёт свежую цену по REST.
+    #[tokio::test]
+    async fn exit_with_stale_book_refreshes_price_over_rest() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut l = Live::new(&["XUSDT".into()], 0.1, 0.1, "TESTNET", tx);
+        l.ledger.set_balance("X", 5.0);
+        // стакана нет — выход всё равно отправлен, цена — свежая по REST
+        l.exit_market("XUSDT", Side::Sell, 2.0, None).unwrap();
+        assert!(
+            matches!(rx.recv().await.unwrap(), Cmd::Place { refresh: true, ref_px, .. } if ref_px == 0.0)
+        );
+        // свежий стакан — без запроса
+        let mut b = Book::default();
+        b.apply_snapshot(vec![(9.9, 1.0)], vec![(10.0, 1.0)], 1);
+        l.exit_market("XUSDT", Side::Sell, 1.0, Some(&b)).unwrap();
+        assert!(
+            matches!(rx.recv().await.unwrap(), Cmd::Place { refresh: false, ref_px, .. } if ref_px == 9.9)
+        );
+
+        use axum::{Json, Router, routing::get};
+        let app = Router::new()
+            .route("/api/v4/spot/order_book", get(|| async { Json(json!({"bids": [["9.5", "1"]], "asks": [["9.6", "1"]]})) }))
+            .route("/v1/orderbook", get(|| async { Json(json!([{"market": "USDT-X", "orderbook_units": [{"bid_price": 8.1, "ask_price": 8.2, "bid_size": 1, "ask_size": 1}]}])) }))
+            .route("/v2/depth.do", get(|| async { Json(json!({"result": "true", "data": {"bids": [["7.1", "1"]], "asks": [["7.2", "1"]]}})) }));
+        let ln = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", ln.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(ln, app).await.unwrap() });
+        let g = Venue::Gate(crate::exchange::gate::Client::new(
+            &base,
+            keys(),
+            false,
+            true,
+            &[],
+        ));
+        assert_eq!(g.fresh_top("XUSDT").await.unwrap().unwrap(), (9.5, 9.6));
+        let u = Venue::Upbit(crate::exchange::upbit::Client::new(&base, keys(), &[]));
+        assert_eq!(u.fresh_top("XUSDT").await.unwrap().unwrap(), (8.1, 8.2));
+        let lb = Venue::Lbank(crate::exchange::lbank::Client::new(&base, keys()));
+        assert_eq!(lb.fresh_top("XUSDT").await.unwrap().unwrap(), (7.1, 7.2));
+        // Binance: рыночному ордеру опорная цена не нужна — запроса нет
+        let bn = Venue::Binance(crate::exchange::binance::Client::new(&base, keys()));
+        assert!(bn.fresh_top("XUSDT").await.is_none());
     }
 
     #[test]

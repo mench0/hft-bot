@@ -204,6 +204,21 @@ impl Client {
         })
     }
 
+    /// Лучшие бид и аск по REST (/info l2Book) — свежая цена для выхода, когда сокет стакана лежит.
+    pub async fn top(&self, symbol: &str) -> Result<(f64, f64), String> {
+        let a = self.asset(symbol)?;
+        let v = self.info(json!({"type": "l2Book", "coin": a.coin})).await?;
+        let px = |side: usize| {
+            v["levels"][side][0]["px"]
+                .as_str()
+                .and_then(|p| p.parse::<f64>().ok())
+        };
+        match (px(0), px(1)) {
+            (Some(b), Some(a)) => Ok((b, a)),
+            _ => Err(format!("Hyperliquid: пустой стакан {symbol}")),
+        }
+    }
+
     async fn info(&self, body: Value) -> Result<Value, String> {
         let r = self
             .http
