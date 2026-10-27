@@ -226,14 +226,14 @@ impl Client {
         }
     }
 
-    pub async fn place(
+    fn order_body(
         &self,
         local: u64,
         symbol: &str,
         side: Side,
         qty: f64,
         price: Option<f64>,
-    ) -> Result<OrderState, String> {
+    ) -> Result<Value, String> {
         let inst = self.instrument(symbol);
         let size = if self.perp {
             let lots = ((qty / self.lot(&inst)) + 1e-9).floor();
@@ -253,6 +253,18 @@ impl Client {
             b["leverage"] = json!((*self.leverage.lock().unwrap()).max(1.0).round() as u64);
             b["marginMode"] = json!("CROSS");
         }
+        Ok(b)
+    }
+
+    pub async fn place(
+        &self,
+        local: u64,
+        symbol: &str,
+        side: Side,
+        qty: f64,
+        price: Option<f64>,
+    ) -> Result<OrderState, String> {
+        let b = self.order_body(local, symbol, side, qty, price)?;
         let d = self
             .call(reqwest::Method::POST, "/api/v1/orders", Some(b))
             .await?;
@@ -262,6 +274,84 @@ impl Client {
             executed: 0.0,
             quote: 0.0,
         })
+    }
+
+    /// Ордер по торговому сокету (Pro WS API): spot.order / futures.order.
+    pub fn ws_place(
+        &self,
+        id: &str,
+        local: u64,
+        symbol: &str,
+        side: Side,
+        qty: f64,
+        price: Option<f64>,
+    ) -> Result<String, String> {
+        let op = if self.perp {
+            "futures.order"
+        } else {
+            "spot.order"
+        };
+        Ok(
+            json!({"id": id, "op": op, "args": self.order_body(local, symbol, side, qty, price)?})
+                .to_string(),
+        )
+    }
+
+    pub fn ws_cancel(&self, id: &str, symbol: &str, order_id: &str) -> String {
+        let op = if self.perp {
+            "futures.cancel"
+        } else {
+            "spot.cancel"
+        };
+        json!({"id": id, "op": op, "args": {"orderId": order_id, "symbol": self.instrument(symbol)}}).to_string()
+    }
+
+    /// Адрес торгового сокета с подписью в параметрах; KUCOIN_WS_TRADE_URL — свой адрес.
+    pub fn trade_url(&self) -> String {
+        let base = crate::util::env("KUCOIN_WS_TRADE_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "wss://wsapi.kucoin.com/v1/private".into());
+        let ts = now_ms().to_string();
+        let enc = |x: &str| {
+            x.bytes()
+                .map(|c| match c {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                        (c as char).to_string()
+                    }
+                    _ => format!("%{c:02X}"),
+                })
+                .collect::<String>()
+        };
+        format!(
+            "{base}{}apikey={}&timestamp={ts}&sign={}&passphrase={}",
+            if base.contains('?') { '&' } else { '?' },
+            enc(&self.keys.key),
+            enc(&hmac_b64(
+                &self.keys.secret,
+                &format!("{}{ts}", self.keys.key)
+            )),
+            enc(&hmac_b64(&self.keys.secret, &self.passphrase))
+        )
+    }
+
+    /// Ответ на приветствие торгового сокета: base64(HMAC(secret, приветствие)).
+    pub fn welcome_answer(&self, text: &str) -> String {
+        hmac_b64(&self.keys.secret, text)
+    }
+
+    /// Ордер по своему номеру (исход запроса по сокету неизвестен).
+    pub async fn query_client(&self, _symbol: &str, local: u64) -> Result<OrderState, String> {
+        let path = if self.perp {
+            format!("/api/v1/orders/byClientOid?clientOid=hft{local}")
+        } else {
+            format!("/api/v1/order/client-order/hft{local}")
+        };
+        let d = self.call(reqwest::Method::GET, &path, None).await?;
+        if d.is_null() {
+            return Err("KuCoin: ордер не найден".into());
+        }
+        Ok(self.order_state(&d))
     }
 
     pub async fn query(&self, _symbol: &str, id: &str) -> Result<OrderState, String> {
@@ -527,6 +617,26 @@ impl Client {
         .await
         .map(|_| ())
     }
+}
+
+/// Ответ торгового сокета: (id, data или ошибка «KuCoin код: текст»); пинги и служебные — None.
+pub fn ws_reply(v: &Value) -> Option<(String, Result<Value, String>)> {
+    let id = v["id"]
+        .as_str()
+        .filter(|i| !i.is_empty() && !i.starts_with("ping"))?
+        .to_owned();
+    let code = v["code"].as_str().unwrap_or("");
+    Some((
+        id,
+        if code == "200000" || code == "0" {
+            Ok(v["data"].clone())
+        } else {
+            Err(format!(
+                "KuCoin {code}: {}",
+                v["msg"].as_str().unwrap_or("")
+            ))
+        },
+    ))
 }
 
 #[cfg(test)]

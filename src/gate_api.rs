@@ -256,7 +256,7 @@ impl Client {
         }
     }
 
-    pub async fn place(
+    fn order_body(
         &self,
         local: u64,
         symbol: &str,
@@ -264,9 +264,9 @@ impl Client {
         qty: f64,
         price: Option<f64>,
         ref_px: f64,
-    ) -> Result<OrderState, String> {
+    ) -> Result<Value, String> {
         let text = format!("t-hft{local}");
-        let r = if self.perp {
+        let b = if self.perp {
             let c = pair(symbol);
             let contracts = ((qty / self.m(&c)) + 1e-9).floor() as i64;
             if contracts <= 0 {
@@ -288,8 +288,7 @@ impl Client {
                     b["tif"] = json!("ioc");
                 }
             }
-            self.call(reqwest::Method::POST, "/futures/usdt/orders", "", Some(b))
-                .await?
+            b
         } else {
             let mut b = json!({"currency_pair": pair(symbol), "side": if side == Side::Buy { "buy" } else { "sell" }, "text": text, "account": "spot"});
             match price {
@@ -314,9 +313,27 @@ impl Client {
                     b["amount"] = json!(dec(amount));
                 }
             }
-            self.call(reqwest::Method::POST, "/spot/orders", "", Some(b))
-                .await?
+            b
         };
+        Ok(b)
+    }
+
+    pub async fn place(
+        &self,
+        local: u64,
+        symbol: &str,
+        side: Side,
+        qty: f64,
+        price: Option<f64>,
+        ref_px: f64,
+    ) -> Result<OrderState, String> {
+        let b = self.order_body(local, symbol, side, qty, price, ref_px)?;
+        let path = if self.perp {
+            "/futures/usdt/orders"
+        } else {
+            "/spot/orders"
+        };
+        let r = self.call(reqwest::Method::POST, path, "", Some(b)).await?;
         Ok(self.order_state(&r))
     }
 
@@ -446,11 +463,91 @@ impl Client {
         }
     }
 
+    fn prefix(&self) -> &'static str {
+        if self.perp { "futures" } else { "spot" }
+    }
+
+    /// Вход в WS API (spot.login / futures.login) — ордера по тому же сокету, что события счёта.
+    pub fn login(&self) -> String {
+        let ts = now_ms() / 1000;
+        let ch = format!("{}.login", self.prefix());
+        json!({"time": ts, "channel": ch, "event": "api", "payload": {"api_key": self.keys.key,
+            "signature": hmac512(&self.keys.secret, &format!("api\n{ch}\n\n{ts}")), "timestamp": ts.to_string(), "req_id": "login"}})
+        .to_string()
+    }
+
+    fn api(&self, id: &str, op: &str, param: Value) -> String {
+        json!({"time": now_ms() / 1000, "channel": format!("{}.{op}", self.prefix()), "event": "api",
+            "payload": {"req_id": id, "req_param": param}}).to_string()
+    }
+
+    /// Ордер по сокету (spot.order_place / futures.order_place).
+    #[allow(clippy::too_many_arguments)]
+    pub fn ws_place(
+        &self,
+        id: &str,
+        local: u64,
+        symbol: &str,
+        side: Side,
+        qty: f64,
+        price: Option<f64>,
+        ref_px: f64,
+    ) -> Result<String, String> {
+        Ok(self.api(
+            id,
+            "order_place",
+            self.order_body(local, symbol, side, qty, price, ref_px)?,
+        ))
+    }
+
+    pub fn ws_cancel(&self, id: &str, symbol: &str, order_id: &str) -> String {
+        let p = if self.perp {
+            json!({"order_id": order_id})
+        } else {
+            json!({"order_id": order_id, "currency_pair": pair(symbol)})
+        };
+        self.api(id, "order_cancel", p)
+    }
+
+    /// Ордер по своему номеру text (исход запроса по сокету неизвестен).
+    pub async fn query_client(&self, symbol: &str, local: u64) -> Result<OrderState, String> {
+        let r = if self.perp {
+            self.call(
+                reqwest::Method::GET,
+                &format!("/futures/usdt/orders/t-hft{local}"),
+                "",
+                None,
+            )
+            .await?
+        } else {
+            self.call(
+                reqwest::Method::GET,
+                &format!("/spot/orders/t-hft{local}"),
+                &format!("currency_pair={}", pair(symbol)),
+                None,
+            )
+            .await?
+        };
+        Ok(self.order_state(&r))
+    }
+
     pub fn ping(&self) -> String {
         json!({"time": now_ms() / 1000, "channel": if self.perp { "futures.ping" } else { "spot.ping" }}).to_string()
     }
 
     pub fn stream_parse(&self, v: &Value) -> StreamMsg {
+        // ответы WS API (вход, подтверждения): ордера разбирает ws_reply
+        if v.get("header").is_some() {
+            let h = &v["header"];
+            if h["channel"].as_str().is_some_and(|c| c.ends_with(".login")) && h["status"] != "200"
+            {
+                return StreamMsg::Fail(format!(
+                    "Gate: вход в WS API отклонён: {}",
+                    v["data"]["errs"]
+                ));
+            }
+            return StreamMsg::Ignore;
+        }
         if !v["error"].is_null() {
             return StreamMsg::Fail(format!(
                 "Gate {}: {}",
@@ -547,6 +644,28 @@ impl Client {
         .await
         .map(|_| ())
     }
+}
+
+/// Ответ WS API на ордер или отмену: (req_id, result или ошибка «Gate метка: текст»); подтверждения ack — None.
+pub fn ws_reply(v: &Value) -> Option<(String, Result<Value, String>)> {
+    if v.get("header").is_none() || v["ack"] == true {
+        return None;
+    }
+    let id = v["request_id"].as_str()?.to_owned();
+    let st = v["header"]["status"].as_str().unwrap_or("200");
+    Some((
+        id,
+        if st == "200" {
+            Ok(v["data"]["result"].clone())
+        } else {
+            let e = &v["data"]["errs"];
+            Err(format!(
+                "Gate {}: {}",
+                e["label"].as_str().unwrap_or(st),
+                e["message"].as_str().unwrap_or("")
+            ))
+        },
+    ))
 }
 
 #[cfg(test)]

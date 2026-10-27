@@ -2059,6 +2059,21 @@ mod tests {
             orders: Vec<Value>,
             bad: u32,
             x: f64,
+            rest_orders: u32,
+            ws_orders: u32,
+        }
+        // ордер на бирже (общий для REST и WS API)
+        fn place(x: &mut Ex, b: &Value) -> Value {
+            let id = format!("{}", 100 + x.orders.len());
+            x.orders.push(b.clone());
+            if b["type"] == "market" {
+                let quote: f64 = b["amount"].as_str().unwrap().parse().unwrap();
+                x.x += quote / 10.0;
+                json!({"id": id, "text": b["text"], "status": "closed", "finish_as": "filled", "type": "market", "side": "buy",
+                    "amount": b["amount"], "left": "0", "filled_total": format!("{quote}"), "avg_deal_price": "10"})
+            } else {
+                json!({"id": id, "text": b["text"], "status": "open", "type": "limit", "side": b["side"], "amount": b["amount"], "left": b["amount"], "filled_total": "0"})
+            }
         }
         let ex = Arc::new(Mutex::new(Ex::default()));
         fn ok(h: &HeaderMap, method: &str, path: &str, query: &str, body: &str) -> bool {
@@ -2086,16 +2101,8 @@ mod tests {
                 let mut x = e2.lock().unwrap();
                 if !ok(&h, "POST", "/api/v4/spot/orders", "", &body) { x.bad += 1; }
                 let b: Value = serde_json::from_str(&body).unwrap();
-                let id = format!("{}", 100 + x.orders.len());
-                x.orders.push(b.clone());
-                if b["type"] == "market" {
-                    let quote: f64 = b["amount"].as_str().unwrap().parse().unwrap();
-                    x.x += quote / 10.0;
-                    Json(json!({"id": id, "text": b["text"], "status": "closed", "finish_as": "filled", "type": "market", "side": "buy",
-                        "amount": b["amount"], "left": "0", "filled_total": format!("{quote}"), "avg_deal_price": "10"}))
-                } else {
-                    Json(json!({"id": id, "text": b["text"], "status": "open", "type": "limit", "side": b["side"], "amount": b["amount"], "left": b["amount"], "filled_total": "0"}))
-                }
+                x.rest_orders += 1;
+                Json(place(&mut x, &b))
             }))
             .route("/api/v4/spot/orders/{id}", get(move |h: HeaderMap, u: OriginalUri, RawQuery(q): RawQuery| async move {
                 let q = q.unwrap_or_default();
@@ -2130,18 +2137,33 @@ mod tests {
         });
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let subs_ok = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let so = subs_ok.clone();
+        let (so, e5) = (subs_ok.clone(), ex.clone());
+        let login_ok = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lo = login_ok.clone();
         let pl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let paddr = pl.local_addr().unwrap();
         tokio::spawn(async move {
             let (tcp, _) = pl.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let Some(Ok(Message::Text(t))) = ws.next().await else {
                     return;
                 };
                 let v: Value = serde_json::from_str(&t).unwrap();
                 let ch = v["channel"].as_str().unwrap().to_owned();
+                // вход в WS API: подпись «api\nspot.login\n\n<время>»
+                if ch == "spot.login" {
+                    let p = &v["payload"];
+                    let good = p["api_key"] == "gate-key"
+                        && crate::gate_api::hmac512(
+                            SECRET,
+                            &format!("api\nspot.login\n\n{}", p["timestamp"].as_str().unwrap()),
+                        ) == p["signature"].as_str().unwrap();
+                    lo.store(good, std::sync::atomic::Ordering::SeqCst);
+                    ws.send(Message::text(json!({"header": {"channel": "spot.login", "status": if good { "200" } else { "401" }},
+                        "request_id": "login", "data": {"result": {}}}).to_string())).await.unwrap();
+                    continue;
+                }
                 let good = v["auth"]["KEY"] == "gate-key"
                     && crate::gate_api::hmac512(
                         SECRET,
@@ -2157,9 +2179,32 @@ mod tests {
                 .await
                 .unwrap();
             }
-            while let Some(e) = ev_rx.recv().await {
-                if ws.send(Message::text(e)).await.is_err() {
-                    break;
+            // события из канала; ордера WS API: сначала ack, затем ответ с результатом
+            loop {
+                tokio::select! {
+                    e = ev_rx.recv() => {
+                        let Some(e) = e else { break };
+                        if ws.send(Message::text(e)).await.is_err() {
+                            break;
+                        }
+                    }
+                    m = ws.next() => {
+                        let Some(Ok(Message::Text(t))) = m else { break };
+                        let v: Value = serde_json::from_str(&t).unwrap();
+                        if v["channel"] != "spot.order_place" {
+                            continue;
+                        }
+                        let id = v["payload"]["req_id"].clone();
+                        let r = {
+                            let mut x = e5.lock().unwrap();
+                            x.ws_orders += 1;
+                            place(&mut x, &v["payload"]["req_param"])
+                        };
+                        let ack = json!({"header": {"channel": "spot.order_place", "status": "200"}, "request_id": id, "ack": true, "data": {}});
+                        let res = json!({"header": {"channel": "spot.order_place", "status": "200"}, "request_id": id, "data": {"result": r}});
+                        let _ = ws.send(Message::text(ack.to_string())).await;
+                        let _ = ws.send(Message::text(res.to_string())).await;
+                    }
                 }
             }
             // порт держится до конца теста: иначе его получит мок другого теста, а переподключение этого бота попадёт туда
@@ -2258,6 +2303,13 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert_eq!(ex.lock().unwrap().bad, 0, "все подписи REST верны");
+        assert!(
+            login_ok.load(std::sync::atomic::Ordering::SeqCst),
+            "подпись spot.login верна"
+        );
+        let x = ex.lock().unwrap();
+        assert_eq!((x.ws_orders, x.rest_orders), (2, 0), "ордера — по WS API");
+        drop(x);
         call(&r, "POST", "/control/stop", "").await;
     }
 
@@ -2382,7 +2434,7 @@ mod tests {
         crate::util::set_env("KUCOIN_PASSPHRASE", "kc-pass");
         let (_d, r) = app("");
         let sel = format!(
-            "/control/select?exchange=kucoin&symbols=XUSDT&market=spot&live=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
+            "/control/select?exchange=kucoin&symbols=XUSDT&market=spot&live=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&wsOrders=false&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
         );
         assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
         call(&r, "POST", "/control/start", "").await;

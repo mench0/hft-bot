@@ -871,8 +871,10 @@ impl Venue {
     pub fn trade_socket(&self) -> TradeSocket {
         match self {
             Venue::Binance(c) if c.perp => TradeSocket::Own,
-            Venue::Binance(_) | Venue::Okx(_) | Venue::Hyperliquid(_) => TradeSocket::Shared,
-            Venue::Bybit(_) => TradeSocket::Own,
+            Venue::Binance(_) | Venue::Okx(_) | Venue::Hyperliquid(_) | Venue::Gate(_) => {
+                TradeSocket::Shared
+            }
+            Venue::Bybit(_) | Venue::Kucoin(_) => TradeSocket::Own,
             _ => TradeSocket::None,
         }
     }
@@ -885,6 +887,8 @@ impl Venue {
             Venue::Okx(_) => crate::okx_api::ws_reply(&v),
             Venue::Bybit(_) => crate::bybit_api::ws_reply(&v),
             Venue::Hyperliquid(_) => crate::hyperliquid_api::ws_reply(&v),
+            Venue::Gate(_) => crate::gate_api::ws_reply(&v),
+            Venue::Kucoin(_) => crate::kucoin_api::ws_reply(&v),
             _ => None,
         }
     }
@@ -926,6 +930,20 @@ impl Venue {
                 let m = c.ws_place(&id, local, symbol, side, qty, price);
                 (id, m)
             }
+            Venue::Gate(c) => {
+                let id = link.next_id("g");
+                match c.ws_place(&id, local, symbol, side, qty, price, ref_px) {
+                    Ok(m) => (id, m),
+                    Err(e) => return WsOut::Done(Err(e)),
+                }
+            }
+            Venue::Kucoin(c) => {
+                let id = link.next_id("k");
+                match c.ws_place(&id, local, symbol, side, qty, price) {
+                    Ok(m) => (id, m),
+                    Err(e) => return WsOut::Done(Err(e)),
+                }
+            }
             Venue::Hyperliquid(c) => {
                 let r = match c.place_req(local, symbol, side, qty, price, ref_px) {
                     Ok(r) => r,
@@ -950,7 +968,8 @@ impl Venue {
                     executed: 0.0,
                     quote: 0.0,
                 }),
-                Venue::Bybit(_) => Ok(OrderState {
+                Venue::Gate(c) => Ok(c.order_state(&v)),
+                Venue::Bybit(_) | Venue::Kucoin(_) => Ok(OrderState {
                     id: v["orderId"].as_str().unwrap_or("").to_owned(),
                     status: "NEW".into(),
                     executed: 0.0,
@@ -990,6 +1009,16 @@ impl Venue {
                 let m = c.ws_cancel(&id, symbol, oid);
                 (id, m)
             }
+            Venue::Gate(c) => {
+                let id = link.next_id("gc");
+                let m = c.ws_cancel(&id, symbol, oid);
+                (id, m)
+            }
+            Venue::Kucoin(c) => {
+                let id = link.next_id("kc");
+                let m = c.ws_cancel(&id, symbol, oid);
+                (id, m)
+            }
             Venue::Hyperliquid(c) => {
                 let id = link.next_id("");
                 match c.ws_cancel(id.parse().unwrap_or(0), symbol, oid) {
@@ -1005,6 +1034,7 @@ impl Venue {
             Call::Reply(Err(e)) => WsOut::Done(Err(e)),
             Call::Reply(Ok(v)) => match self {
                 Venue::Binance(_) => WsOut::Done(OrderState::from(&v).map(Some)),
+                Venue::Gate(c) => WsOut::Done(Ok(Some(c.order_state(&v)))),
                 // ответ Hyperliquid «ok» бывает и с ошибкой внутри
                 Venue::Hyperliquid(_) => match v["response"]["data"]["statuses"][0].get("error") {
                     Some(e) => WsOut::Done(Err(format!("Hyperliquid: {e}"))),
@@ -1022,6 +1052,8 @@ impl Venue {
             Venue::Okx(c) => c.query_client(symbol, local).await,
             Venue::Bybit(c) => c.query_client(symbol, local).await,
             Venue::Hyperliquid(c) => c.query_client(symbol, local).await,
+            Venue::Gate(c) => c.query_client(symbol, local).await,
+            Venue::Kucoin(c) => c.query_client(symbol, local).await,
             _ => Err("поиск по своему номеру не поддерживается".into()),
         }
     }
@@ -1030,6 +1062,7 @@ impl Venue {
     fn trade_url(&self, testnet: bool) -> String {
         match self {
             Venue::Bybit(_) => crate::bybit_api::trade_url(testnet),
+            Venue::Kucoin(c) => c.trade_url(),
             _ => crate::signed::ws_fapi_url(testnet),
         }
     }
@@ -1309,7 +1342,7 @@ impl Venue {
             ]),
             Venue::Bybit(c) => Some(vec![c.auth_message()]),
             Venue::Okx(c) => Some(vec![c.login()]),
-            Venue::Gate(c) => Some(c.subscriptions()),
+            Venue::Gate(c) => Some([vec![c.login()], c.subscriptions()].concat()),
             Venue::Kucoin(_) => Some(Vec::new()),
             Venue::Bingx(c) if !c.perp => Some(vec![c.subscription()]),
             Venue::Mexc(c) => Some(c.hello()),
@@ -1706,6 +1739,8 @@ async fn trade_socket(
                             .map(|e| e.to_string())
                             .unwrap_or_default()
                     }
+                    // KuCoin: ключ в адресе, вход по приветствию сервера
+                    Venue::Kucoin(_) => {}
                     _ => {
                         backoff.reset();
                         link.attach(otx.clone());
@@ -1724,8 +1759,13 @@ async fn trade_socket(
                             continue;
                         }
                         _ = ping.tick() => {
-                            if matches!(venue.as_ref(), Venue::Bybit(_)) {
-                                err = ws.send(Message::text(r#"{"op":"ping"}"#)).await.err().map(|e| e.to_string()).unwrap_or_default();
+                            let p = match venue.as_ref() {
+                                Venue::Bybit(_) => Some(r#"{"op":"ping"}"#.to_owned()),
+                                Venue::Kucoin(_) => Some(format!(r#"{{"id":"ping-{0}","op":"ping","timestamp":"{0}"}}"#, crate::util::now_ms())),
+                                _ => None,
+                            };
+                            if let Some(p) = p {
+                                err = ws.send(Message::text(p)).await.err().map(|e| e.to_string()).unwrap_or_default();
                             }
                             continue;
                         }
@@ -1733,7 +1773,23 @@ async fn trade_socket(
                     match msg {
                         Some(Ok(Message::Text(t))) => {
                             let v: serde_json::Value = serde_json::from_str(&t).unwrap_or_default();
-                            if v["op"] == "auth" {
+                            // KuCoin: приветствие → подписанный ответ, второе сообщение с sessionId — сессия готова
+                            if let (Venue::Kucoin(c), true) =
+                                (venue.as_ref(), v.get("sessionId").is_some())
+                            {
+                                if v["data"] == "welcome" {
+                                    err = ws
+                                        .send(Message::text(c.welcome_answer(&t)))
+                                        .await
+                                        .err()
+                                        .map(|e| e.to_string())
+                                        .unwrap_or_default();
+                                } else {
+                                    backoff.reset();
+                                    link.attach(otx.clone());
+                                    tracing::info!("[{ex}] сокет ордеров подключён");
+                                }
+                            } else if v["op"] == "auth" {
                                 if v["retCode"] == 0 {
                                     backoff.reset();
                                     link.attach(otx.clone());
@@ -1992,6 +2048,117 @@ mod tests {
             p["signature"].as_str().unwrap(),
             crate::signed::sign("s", &q.join("&"))
         );
+    }
+
+    /// KuCoin: подпись в адресе, приветствие → ответ HMAC, сессия, ордер; обрыв → REST, затем переподключение.
+    #[tokio::test]
+    async fn kucoin_trade_socket_handshake_order_and_reconnect() {
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let kill = Arc::new(tokio::sync::Notify::new());
+        let urls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (k2, u2) = (kill.clone(), urls.clone());
+        tokio::spawn(async move {
+            for session in 0..2 {
+                let (tcp, _) = l.accept().await.unwrap();
+                let u3 = u2.clone();
+                let mut ws =
+                    tokio_tungstenite::accept_hdr_async(tcp, move |r: &Request, resp: Response| {
+                        u3.lock().unwrap().push(r.uri().to_string());
+                        Ok(resp)
+                    })
+                    .await
+                    .unwrap();
+                let welcome =
+                    json!({"sessionId": "s1", "data": "welcome", "timestamp": 1}).to_string();
+                ws.send(Message::text(welcome.clone())).await.unwrap();
+                let Some(Ok(Message::Text(a))) = ws.next().await else {
+                    return;
+                };
+                assert_eq!(
+                    a.as_str(),
+                    crate::util::hmac_b64("s", &welcome),
+                    "ответ на приветствие"
+                );
+                ws.send(Message::text(
+                    json!({"sessionId": "s1", "pingInterval": 18000}).to_string(),
+                ))
+                .await
+                .unwrap();
+                loop {
+                    tokio::select! {
+                        m = ws.next() => {
+                            let Some(Ok(Message::Text(t))) = m else { break };
+                            let v: Value = serde_json::from_str(&t).unwrap();
+                            if v["op"] == "spot.order" {
+                                assert_eq!(v["args"]["clientOid"], format!("hft{}", 10 + session));
+                                ws.send(Message::text(json!({"id": v["id"], "op": "spot.order", "code": "200000",
+                                    "data": {"orderId": format!("K{session}")}}).to_string())).await.unwrap();
+                            }
+                        }
+                        _ = k2.notified() => break,
+                    }
+                }
+            }
+            loop {
+                let _ = l.accept().await;
+            }
+        });
+        crate::util::set_env("KUCOIN_WS_TRADE_URL", &format!("ws://{addr}/v1/private"));
+        let venue = Arc::new(Venue::Kucoin(crate::kucoin_api::Client::new(
+            "http://127.0.0.1:9",
+            keys(),
+            "pp".into(),
+            false,
+        )));
+        assert_eq!(venue.trade_socket(), TradeSocket::Own);
+        let link = Arc::new(TradeLink::default());
+        let _t = AbortOnDrop(tokio::spawn(trade_socket(
+            "kucoin".into(),
+            venue.clone(),
+            false,
+            link.clone(),
+        )));
+        wait(|| link.ready()).await;
+        let st = place_order(
+            "kucoin",
+            &venue,
+            Some(&link),
+            10,
+            "BTCUSDT",
+            Side::Buy,
+            0.1,
+            Some(100.0),
+            100.0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(st.id, "K0");
+        let u = urls.lock().unwrap()[0].clone();
+        assert!(
+            u.contains("apikey=k&timestamp=") && u.contains("&sign=") && u.contains("&passphrase="),
+            "{u}"
+        );
+        // обрыв: сокет не готов (ордера — по REST), затем переподключение с новым входом
+        kill.notify_one();
+        wait(|| !link.ready()).await;
+        wait(|| link.ready()).await;
+        let st = place_order(
+            "kucoin",
+            &venue,
+            Some(&link),
+            11,
+            "BTCUSDT",
+            Side::Buy,
+            0.1,
+            Some(100.0),
+            100.0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(st.id, "K1");
+        assert_eq!(urls.lock().unwrap().len(), 2, "второе подключение");
     }
 
     #[test]
