@@ -1,4 +1,7 @@
+.env
+/data/
+/logs/
 /target
 state.json
+state.json*
 state.tmp
-.env

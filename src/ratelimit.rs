@@ -251,6 +251,7 @@ pub async fn take(ex: &str, source: &'static str) -> Result<(), String> {
         tokio::time::sleep(Duration::from_millis(wait)).await;
     }
     crate::metrics::out(ex, source);
+    crate::journal::request(ex, source);
     Ok(())
 }
 

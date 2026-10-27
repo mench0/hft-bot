@@ -179,6 +179,10 @@ pub fn router(bot: Arc<Bot>, cfg: AdminConfig) -> Router {
 
 /// Проверка X-Admin-Token (сравнение без утечки длины по времени не нужно: токен проверяется целиком).
 async fn auth(State(app): State<App>, req: Request, next: Next) -> Response {
+    // журнал отладки: действия в админке (POST), секреты скрыты
+    if req.method() == Method::POST {
+        crate::journal::admin("POST", req.uri().path(), req.uri().query().unwrap_or(""));
+    }
     if req.method() == Method::OPTIONS
         || app.cfg.token.is_empty()
         || (req.uri().path() == "/metrics" && !app.cfg.metrics_auth)

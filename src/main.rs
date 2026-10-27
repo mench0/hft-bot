@@ -2,7 +2,7 @@
 //! подключалась та же админка (`hft-admin`). Подключений к биржам и торговли пока нет.
 //!
 //! Переменные окружения: `ADMIN_PORT` (8080), `ADMIN_BIND` (127.0.0.1), `ADMIN_TOKEN`, `ADMIN_CORS_ORIGINS`
-//! (через запятую), `STATE_FILE` (state.json), `RUST_LOG` (info).
+//! (через запятую), `STATE_DB` (data/state.db, SQLite), `STATE_FILE` (JSON-файл вместо SQLite), `RUST_LOG` (info).
 
 mod account;
 mod api;
@@ -15,6 +15,7 @@ mod evm;
 mod feed;
 mod gate_api;
 mod hyperliquid_api;
+mod journal;
 mod kucoin_api;
 mod lbank_api;
 mod leadlag;
@@ -33,6 +34,7 @@ mod spotarb;
 mod spread;
 mod statarb;
 mod state;
+mod store;
 mod transfer;
 mod uniswap_api;
 mod upbit_api;
@@ -74,7 +76,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "ADMIN_TOKEN не задан — админка без токена; открывайте порт только через SSH-туннель"
         );
     }
-    let bot = Arc::new(state::Bot::load(env("STATE_FILE", "state.json").into()));
+    // состояние: STATE_DB (SQLite, по умолчанию data/state.db, как в Java); STATE_FILE без STATE_DB — прежний JSON-файл
+    let state_path: std::path::PathBuf = match (
+        util::env("STATE_DB").ok().filter(|v| !v.trim().is_empty()),
+        util::env("STATE_FILE").ok(),
+    ) {
+        (Some(db), _) => db.into(),
+        (None, Some(f)) if !f.trim().is_empty() => f.into(),
+        _ => {
+            let db = std::path::PathBuf::from("data/state.db");
+            store::migrate_json(&db, std::path::Path::new("state.json"));
+            db
+        }
+    };
+    let bot = Arc::new(state::Bot::load(state_path));
     bot.spawn_screener();
     let addr: SocketAddr = format!("{bind}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;

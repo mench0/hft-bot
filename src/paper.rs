@@ -165,6 +165,8 @@ pub struct Paper {
     /// у живого счёта стоят на бирже.
     pub stops: HashMap<String, (Side, f64)>,
     pub stops_triggered: u64,
+    /// Биржа счёта — для журнала отладки.
+    pub venue: String,
 }
 
 /// Исполнение заявки.
@@ -229,6 +231,7 @@ impl Paper {
             liquidations: 0,
             stops: HashMap::new(),
             stops_triggered: 0,
+            venue: String::new(),
         };
         for s in symbols {
             if let Some((_, q)) = split(s) {

@@ -133,10 +133,31 @@ impl Account {
         book: Option<&Book>,
         lim: &Limits,
     ) -> Result<Fill, String> {
-        match self {
+        let r = match self {
             Account::Paper(p) => p.order(symbol, side, amount, limit, book, lim),
             Account::Live(l) => l.order(symbol, side, amount, limit, book, lim),
+        };
+        if crate::journal::on() {
+            let what = format!(
+                "ордер {side:?} {amount:?}{}",
+                limit.map_or(" по рынку".into(), |p| format!(" лимит {p}"))
+            );
+            let res = match &r {
+                Ok(f) => format!("{}: исполнено {} по {}", f.status, f.executed, f.avg_price),
+                Err(e) => format!("отказ: {e}"),
+            };
+            crate::journal::action(
+                &self.ledger().venue,
+                Some(symbol),
+                &format!("{what} → {res}"),
+            );
         }
+        r
+    }
+
+    /// Задать биржу счёта (для журнала).
+    pub fn set_venue(&mut self, ex: &str) {
+        self.ledger_mut().venue = ex.to_owned();
     }
 
     pub fn sell_exit(
@@ -215,10 +236,14 @@ impl Account {
     }
 
     pub fn cancel_all(&mut self, symbol: Option<&str>) -> usize {
-        match self {
+        let n = match self {
             Account::Paper(p) => p.cancel_all(symbol),
             Account::Live(l) => l.cancel_all(symbol),
+        };
+        if n > 0 {
+            crate::journal::action(&self.ledger().venue, symbol, &format!("снято заявок: {n}"));
         }
+        n
     }
 
     pub fn open_orders(&self) -> usize {

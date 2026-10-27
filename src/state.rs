@@ -91,21 +91,28 @@ fn leverage(p: &Map<String, Value>) -> f64 {
 }
 
 impl Bot {
-    /// Загрузить состояние из файла (нет файла или он повреждён — пустое состояние, файл создаётся).
+    /// Загрузить состояние: файл .db — SQLite (как в Java, таблица app_state, ключ state), иначе JSON-файл.
+    /// Нет записи или она не читается — пустое состояние (непрочитанная запись SQLite сохраняется под state_backup_<время>).
     pub fn load(path: PathBuf) -> Self {
-        let saved = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| match serde_json::from_str::<Saved>(&s) {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    tracing::warn!(
-                        "Файл состояния {} не прочитан ({e}) — начинаю с пустого",
-                        path.display()
-                    );
-                    None
+        let saved = if crate::store::is_sqlite(&path) {
+            crate::store::load(&path)
+        } else {
+            std::fs::read_to_string(&path).ok()
+        }
+        .and_then(|s| match serde_json::from_str::<Saved>(&s) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(
+                    "Состояние {} не прочитано ({e}) — начинаю с пустого",
+                    path.display()
+                );
+                if crate::store::is_sqlite(&path) {
+                    crate::store::backup(&path);
                 }
-            })
-            .unwrap_or_default();
+                None
+            }
+        })
+        .unwrap_or_default();
         let bot = Bot {
             saved: Mutex::new(saved),
             running: Mutex::new(false),
@@ -126,6 +133,7 @@ impl Bot {
             orphans_closed: Mutex::default(),
         };
         bot.persist();
+        bot.apply_debug();
         bot
     }
 
@@ -141,6 +149,13 @@ impl Bot {
 
     fn persist(&self) {
         let s = self.saved.lock().unwrap().clone();
+        if crate::store::is_sqlite(&self.path) {
+            match serde_json::to_string(&s) {
+                Ok(j) => crate::store::save(&self.path, &j),
+                Err(e) => tracing::error!("Состояние не сериализовано: {e}"),
+            }
+            return;
+        }
         let tmp = self.path.with_extension("tmp");
         let res = serde_json::to_vec_pretty(&s)
             .map_err(|e| e.to_string())
@@ -310,6 +325,16 @@ impl Bot {
     }
 
     /// Изменить настройки процесса (ошибка в любой — не меняется ничего).
+    /// Режим отладки из настроек (debugRequests, строка или флаг).
+    fn apply_debug(&self) {
+        let v = self
+            .settings()
+            .get("debugRequests")
+            .cloned()
+            .unwrap_or_default();
+        crate::journal::set_on(v == true || v == "true");
+    }
+
     pub fn update_settings(&self, upd: &Map<String, Value>) -> ActionResult<()> {
         let specs = data::settings_specs();
         let checked: Map<String, Value> = upd
@@ -324,6 +349,7 @@ impl Bot {
             .collect::<ActionResult<_>>()?;
         self.saved.lock().unwrap().settings.extend(checked);
         self.persist();
+        self.apply_debug();
         Ok(())
     }
 
@@ -797,6 +823,8 @@ impl Bot {
             if p.get("market").and_then(Value::as_str) == Some("perp") {
                 account.set_perp(leverage(&p));
             }
+            let mut account = account;
+            account.set_venue(ex);
             self.accounts.lock().unwrap().insert(ex.to_owned(), account);
             if let Some(w) = worker.take() {
                 tokio::spawn(w);
@@ -1486,6 +1514,32 @@ mod tests {
         assert!(s.symbol_strategies["binance"]["AAAUSDT"].contains("spread-capture"));
         again.remove_symbol("binance", "AAAUSDT").unwrap();
         assert!(!again.snapshot().symbol_strategies["binance"].contains_key("AAAUSDT"));
+    }
+
+    /// То же на SQLite (как в Java): состояние переживает перезапуск.
+    #[test]
+    fn select_persist_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("data/state.db");
+        let b = Bot::load(db.clone());
+        b.select("okx", vec!["XUSDT".into()], &Map::new(), None)
+            .unwrap();
+        drop(b);
+        let again = Bot::load(db.clone());
+        assert_eq!(again.snapshot().selection["okx"], vec!["XUSDT"]);
+        // испорченная запись — пустое состояние, прежняя сохранена резервной копией
+        crate::store::save(&db, "{не json");
+        let fresh = Bot::load(db.clone());
+        assert!(fresh.snapshot().selection.is_empty());
+        let c = rusqlite::Connection::open(&db).unwrap();
+        let n: i64 = c
+            .query_row(
+                "SELECT count(*) FROM app_state WHERE key LIKE 'state_backup_%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]

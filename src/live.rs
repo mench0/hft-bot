@@ -876,6 +876,10 @@ pub async fn worker(
                 match cmd {
                     Cmd::Place { local, symbol, side, qty, price, ref_px } => {
                         let r = crate::metrics::timed(&ex, "order", client.place(local, &symbol, side, qty, price, ref_px)).await;
+                        crate::journal::action(&ex, Some(&symbol), &match &r {
+                            Ok(st) => format!("биржа приняла ордер #{local} {side:?} {qty}{}: номер {}, {} {}", price.map_or(String::new(), |p| format!(" @ {p}")), st.id, st.status, st.executed),
+                            Err(e) => format!("биржа отклонила ордер #{local} {side:?} {qty}: {e}"),
+                        });
                         let cancel_now = with_live(&acc, &ex, |l| match &r {
                             Ok(st) => { l.on_state(local, st); l.wants_cancel(local) }
                             Err(e) => { tracing::warn!("[{ex}] ордер {symbol} отклонён: {e}"); l.on_error(local, e); false }
@@ -1368,8 +1372,16 @@ async fn cancel(acc: &Shared, ex: &str, client: &Venue, local: u64) {
     };
     match crate::metrics::timed(ex, "cancel", client.cancel(&symbol, &id)).await {
         Ok(st) => {
+            crate::journal::action(
+                ex,
+                Some(&symbol),
+                &format!("ордер {id} снят: {} {}", st.status, st.executed),
+            );
             with_live(acc, ex, |l| l.on_state(local, &st));
         }
-        Err(e) => tracing::warn!("[{ex}] не снят ордер {symbol} {id}: {e}"),
+        Err(e) => {
+            crate::journal::action(ex, Some(&symbol), &format!("ордер {id} не снят: {e}"));
+            tracing::warn!("[{ex}] не снят ордер {symbol} {id}: {e}")
+        }
     }
 }
