@@ -248,6 +248,10 @@ pub struct StatArb {
 }
 
 impl StatArb {
+    pub fn position_count(&self) -> usize {
+        self.positions.len()
+    }
+
     /// Символы, занятые позициями пар (другим стратегиям их не трогать).
     pub fn held(&self) -> HashSet<String> {
         self.positions

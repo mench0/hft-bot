@@ -26,6 +26,8 @@ pub struct AdminConfig {
     pub token: String,
     /// С каких страниц можно обращаться (CORS); пусто — с любых.
     pub cors_origins: Vec<String>,
+    /// /metrics тоже под токеном (METRICS_AUTH=true); иначе — открыт для Prometheus, как в Java.
+    pub metrics_auth: bool,
 }
 
 #[derive(Clone)]
@@ -125,6 +127,18 @@ pub fn router(bot: Arc<Bot>, cfg: AdminConfig) -> Router {
         .route("/cancel-all", axum::routing::post(cancel_all))
         .route("/balances", get(balances))
         .route("/positions", get(positions))
+        .route(
+            "/metrics",
+            get(|State(a): State<App>| async move {
+                (
+                    [(
+                        header::CONTENT_TYPE,
+                        "text/plain; version=0.0.4; charset=utf-8",
+                    )],
+                    crate::metrics::render(&a.bot),
+                )
+            }),
+        )
         .route("/positions/close", axum::routing::post(positions_close))
         .route("/funding", get(funding))
         .route(
@@ -162,7 +176,10 @@ pub fn router(bot: Arc<Bot>, cfg: AdminConfig) -> Router {
 
 /// Проверка X-Admin-Token (сравнение без утечки длины по времени не нужно: токен проверяется целиком).
 async fn auth(State(app): State<App>, req: Request, next: Next) -> Response {
-    if req.method() == Method::OPTIONS || app.cfg.token.is_empty() {
+    if req.method() == Method::OPTIONS
+        || app.cfg.token.is_empty()
+        || (req.uri().path() == "/metrics" && !app.cfg.metrics_auth)
+    {
         return next.run(req).await;
     }
     let got = req
@@ -684,9 +701,35 @@ mod tests {
                 AdminConfig {
                     token: token.into(),
                     cors_origins: vec![],
+                    metrics_auth: false,
                 },
             ),
         )
+    }
+
+    /// GET текстом (для /metrics).
+    async fn text(r: &Router, uri: &str, token: &str) -> (StatusCode, String) {
+        let req = axum::http::Request::builder()
+            .uri(uri)
+            .header("x-admin-token", token)
+            .body(Body::empty())
+            .unwrap();
+        let res = r.clone().oneshot(req).await.unwrap();
+        let st = res.status();
+        let b = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (st, String::from_utf8(b.to_vec()).unwrap())
+    }
+
+    /// /metrics открыт для Prometheus без токена (METRICS_AUTH не задан), остальное — под токеном.
+    #[tokio::test]
+    async fn metrics_without_token() {
+        let (_d, r) = app("secret");
+        let (c, t) = text(&r, "/metrics", "").await;
+        assert_eq!(c, StatusCode::OK);
+        assert!(t.contains("# TYPE hft_connected gauge"), "{t}");
+        assert_eq!(text(&r, "/status", "").await.0, StatusCode::UNAUTHORIZED);
     }
 
     async fn call(r: &Router, method: &str, uri: &str, token: &str) -> (StatusCode, Value) {
@@ -3114,6 +3157,18 @@ mod tests {
             }
             assert!(tokio::time::Instant::now() < until, "ставки нет: {f}");
             tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // метрики Prometheus: фид, счёт по котировке, стакан, сирота
+        let (_, m) = text(&r, "/metrics", "").await;
+        for want in [
+            "hft_connected{exchange=\"binance\"} 1",
+            "hft_trading_enabled{exchange=\"binance\"} 1",
+            "hft_open_positions{exchange=\"binance\"} 1",
+            "hft_account_equity_quote{exchange=\"binance\",quote=\"USDT\",mode=\"PAPER\"} ",
+            "hft_best_bid{exchange=\"binance\",symbol=\"BTCUSDT\"} 100",
+            "hft_orphan_positions{exchange=\"binance\"} 1",
+        ] {
+            assert!(m.contains(want), "нет «{want}» в\n{m}");
         }
         let (_, e) = call(&r, "GET", "/control/exchanges", "").await;
         assert!(

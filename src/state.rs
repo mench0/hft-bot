@@ -620,6 +620,18 @@ impl Bot {
         }
     }
 
+    /// Статарб по биржам: (позиций, сделок, результат).
+    pub fn statarb_numbers(&self, exchanges: &[String]) -> Vec<(String, (usize, u64, f64))> {
+        let sas = self.statarbs.lock().unwrap();
+        exchanges
+            .iter()
+            .filter_map(|ex| {
+                let s = sas.get(ex)?;
+                Some((ex.clone(), (s.position_count(), s.trades, s.total_pnl)))
+            })
+            .collect()
+    }
+
     /// Сироты биржи для /status.
     pub fn orphans_json(&self, ex: &str) -> Value {
         let o: Vec<String> = self

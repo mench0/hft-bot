@@ -20,6 +20,7 @@ mod lbank_api;
 mod leadlag;
 mod live;
 mod market;
+mod metrics;
 mod mexc_api;
 mod okx_api;
 mod paper;
@@ -58,6 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port: u16 = env("ADMIN_PORT", "8080").parse()?;
     let cfg = api::AdminConfig {
         token: env("ADMIN_TOKEN", ""),
+        metrics_auth: env("METRICS_AUTH", "").eq_ignore_ascii_case("true"),
         cors_origins: env("ADMIN_CORS_ORIGINS", "")
             .split(',')
             .map(str::trim)
