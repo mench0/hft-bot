@@ -36,6 +36,7 @@ mod spread;
 mod statarb;
 mod state;
 mod store;
+mod trade_ws;
 mod transfer;
 mod uniswap_api;
 mod upbit_api;

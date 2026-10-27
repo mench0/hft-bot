@@ -813,6 +813,8 @@ impl Bot {
                         rx,
                         symbols.to_vec(),
                         perp.then(|| leverage(&p)),
+                        // ордера по WebSocket, где биржа умеет (по умолчанию); false — только REST
+                        p.get("wsOrders").and_then(Value::as_bool) != Some(false),
                     ));
                     Account::Live(crate::live::Live::new(
                         symbols,

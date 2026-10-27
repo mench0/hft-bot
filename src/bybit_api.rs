@@ -174,14 +174,14 @@ impl Client {
     }
 
     /// Новый ордер; ответ — только номер, состояние — по запросу или из потока.
-    pub async fn place(
+    fn order_body(
         &self,
         local: u64,
         symbol: &str,
         side: Side,
         qty: f64,
         price: Option<f64>,
-    ) -> Result<OrderState, String> {
+    ) -> Value {
         let mut b = json!({"category": self.category, "symbol": symbol, "side": if side == Side::Buy { "Buy" } else { "Sell" },
             "orderType": if price.is_some() { "Limit" } else { "Market" }, "qty": dec(qty), "orderLinkId": format!("hft{local}")});
         match price {
@@ -193,6 +193,18 @@ impl Client {
             None if self.category == "spot" => b["marketUnit"] = Value::from("baseCoin"),
             None => {}
         }
+        b
+    }
+
+    pub async fn place(
+        &self,
+        local: u64,
+        symbol: &str,
+        side: Side,
+        qty: f64,
+        price: Option<f64>,
+    ) -> Result<OrderState, String> {
+        let b = self.order_body(local, symbol, side, qty, price);
         let r = self.call(true, "/v5/order/create", b.to_string()).await?;
         Ok(OrderState {
             id: r["orderId"].as_str().unwrap_or("").to_owned(),
@@ -339,6 +351,53 @@ impl Client {
     }
 
     /// Вход в приватный поток.
+    /// Ордер по торговому сокету /v5/trade.
+    pub fn ws_place(
+        &self,
+        id: &str,
+        local: u64,
+        symbol: &str,
+        side: Side,
+        qty: f64,
+        price: Option<f64>,
+    ) -> String {
+        self.ws_op(
+            id,
+            "order.create",
+            self.order_body(local, symbol, side, qty, price),
+        )
+    }
+
+    pub fn ws_cancel(&self, id: &str, symbol: &str, order_id: &str) -> String {
+        self.ws_op(
+            id,
+            "order.cancel",
+            json!({"category": self.category, "symbol": symbol, "orderId": order_id}),
+        )
+    }
+
+    fn ws_op(&self, id: &str, op: &str, arg: Value) -> String {
+        let ts = now_ms() + self.offset_ms.load(Ordering::Relaxed);
+        json!({"reqId": id, "header": {"X-BAPI-TIMESTAMP": ts.to_string(), "X-BAPI-RECV-WINDOW": "5000"}, "op": op, "args": [arg]}).to_string()
+    }
+
+    /// Ордер по своему номеру (исход запроса по сокету неизвестен).
+    pub async fn query_client(&self, symbol: &str, local: u64) -> Result<OrderState, String> {
+        let q = format!(
+            "category={}&orderLinkId=hft{local}&symbol={symbol}",
+            self.category
+        );
+        let r = self.call(false, "/v5/order/realtime", q.clone()).await?;
+        let o = match r["list"].get(0) {
+            Some(o) => o.clone(),
+            None => self.call(false, "/v5/order/history", q).await?["list"]
+                .get(0)
+                .cloned()
+                .ok_or("ордер не найден")?,
+        };
+        order_state(&o)
+    }
+
     pub fn auth_message(&self) -> String {
         let expires = now_ms() + self.offset_ms.load(Ordering::Relaxed) + 10_000;
         json!({"op": "auth", "args": [self.keys.key, expires, sign(&self.keys.secret, &format!("GET/realtime{expires}"))]}).to_string()
@@ -385,6 +444,37 @@ impl Client {
         json!({"category": "linear", "symbol": symbol.to_uppercase(), "tpslMode": "Full", "positionIdx": 0, "stopLoss": sl,
             "slTriggerBy": "MarkPrice", "slOrderType": "Market"}).to_string()
     }
+}
+
+/// Адрес торгового сокета; BYBIT_WS_TRADE_URL — свой адрес.
+pub fn trade_url(testnet: bool) -> String {
+    crate::util::env("BYBIT_WS_TRADE_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| {
+            if testnet {
+                "wss://stream-testnet.bybit.com/v5/trade".into()
+            } else {
+                "wss://stream.bybit.com/v5/trade".into()
+            }
+        })
+}
+
+/// Ответ торгового сокета: (reqId, data или ошибка «Bybit код: текст»).
+pub fn ws_reply(v: &Value) -> Option<(String, Result<Value, String>)> {
+    let id = v["reqId"].as_str()?.to_owned();
+    Some((
+        id,
+        if v["retCode"] == 0 {
+            Ok(v["data"].clone())
+        } else {
+            Err(format!(
+                "Bybit {}: {}",
+                v["retCode"],
+                v["retMsg"].as_str().unwrap_or("")
+            ))
+        },
+    ))
 }
 
 #[cfg(test)]

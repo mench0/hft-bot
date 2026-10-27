@@ -188,14 +188,14 @@ impl Client {
         }
     }
 
-    pub async fn place(
+    fn order_body(
         &self,
         local: u64,
         symbol: &str,
         side: Side,
         qty: f64,
         price: Option<f64>,
-    ) -> Result<OrderState, String> {
+    ) -> Result<Value, String> {
         let inst = self.inst_id(symbol);
         let sz = if self.perp {
             // монеты → контракты, вниз до шага лота
@@ -229,6 +229,18 @@ impl Client {
                 }
             }
         }
+        Ok(b)
+    }
+
+    pub async fn place(
+        &self,
+        local: u64,
+        symbol: &str,
+        side: Side,
+        qty: f64,
+        price: Option<f64>,
+    ) -> Result<OrderState, String> {
+        let b = self.order_body(local, symbol, side, qty, price)?;
         let r = self
             .call(reqwest::Method::POST, "/api/v5/trade/order", Some(b))
             .await?;
@@ -252,6 +264,41 @@ impl Client {
             )
             .await?;
         Ok(self.order_state(&r["data"][0]))
+    }
+
+    /// Ордер по приватному сокету (тот же, что события счёта).
+    pub fn ws_place(
+        &self,
+        id: &str,
+        local: u64,
+        symbol: &str,
+        side: Side,
+        qty: f64,
+        price: Option<f64>,
+    ) -> Result<String, String> {
+        Ok(json!({"id": id, "op": "order", "args": [self.order_body(local, symbol, side, qty, price)?]}).to_string())
+    }
+
+    pub fn ws_cancel(&self, id: &str, symbol: &str, ord_id: &str) -> String {
+        json!({"id": id, "op": "cancel-order", "args": [{"instId": self.inst_id(symbol), "ordId": ord_id}]}).to_string()
+    }
+
+    /// Ордер по своему номеру (исход запроса по сокету неизвестен).
+    pub async fn query_client(&self, symbol: &str, local: u64) -> Result<OrderState, String> {
+        let r = self
+            .call(
+                reqwest::Method::GET,
+                &format!(
+                    "/api/v5/trade/order?instId={}&clOrdId=hft{local}",
+                    self.inst_id(symbol)
+                ),
+                None,
+            )
+            .await?;
+        r["data"]
+            .get(0)
+            .map(|o| self.order_state(o))
+            .ok_or_else(|| "OKX: ордер не найден".into())
     }
 
     pub async fn cancel(&self, symbol: &str, id: &str) -> Result<OrderState, String> {
@@ -384,6 +431,33 @@ impl Client {
         .await
         .map(|_| ())
     }
+}
+
+/// Ответ на ордер или отмену по сокету: (id, первая запись data или ошибка «OKX код: текст»).
+pub fn ws_reply(v: &Value) -> Option<(String, Result<Value, String>)> {
+    if !matches!(v["op"].as_str(), Some("order" | "cancel-order")) {
+        return None;
+    }
+    let id = v["id"].as_str()?.to_owned();
+    let d = &v["data"][0];
+    Some((
+        id,
+        if v["code"] == "0" && d["sCode"].as_str().is_none_or(|c| c == "0") {
+            Ok(d.clone())
+        } else {
+            Err(format!(
+                "OKX {}: {}",
+                d["sCode"]
+                    .as_str()
+                    .unwrap_or(v["code"].as_str().unwrap_or("")),
+                d["sMsg"]
+                    .as_str()
+                    .filter(|m| !m.is_empty())
+                    .or(v["msg"].as_str())
+                    .unwrap_or("")
+            ))
+        },
+    ))
 }
 
 #[cfg(test)]

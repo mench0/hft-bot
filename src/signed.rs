@@ -198,15 +198,13 @@ impl Client {
 }
 
 impl Client {
-    /// Новый ордер (clientOrderId hft<номер>); ответ RESULT — состояние сразу.
-    pub async fn place(
-        &self,
+    fn place_params(
         local: u64,
         symbol: &str,
         side: crate::paper::Side,
         qty: f64,
         price: Option<f64>,
-    ) -> Result<OrderState, String> {
+    ) -> Vec<(&'static str, String)> {
         let mut p = vec![
             ("symbol", symbol.to_owned()),
             (
@@ -230,9 +228,87 @@ impl Client {
             p.push(("price", dec(px)));
             p.push(("timeInForce", "GTC".into()));
         }
+        p
+    }
+
+    /// Новый ордер (clientOrderId hft<номер>); ответ RESULT — состояние сразу.
+    pub async fn place(
+        &self,
+        local: u64,
+        symbol: &str,
+        side: crate::paper::Side,
+        qty: f64,
+        price: Option<f64>,
+    ) -> Result<OrderState, String> {
+        let p = Self::place_params(local, symbol, side, qty, price);
         OrderState::from(
             &self
                 .signed(reqwest::Method::POST, self.order_path(), &p)
+                .await?,
+        )
+    }
+
+    /// Подписанный запрос WebSocket API с параметрами (подпись — по параметрам в алфавитном порядке).
+    pub fn ws_signed(&self, id: &str, method: &str, params: &[(&str, String)]) -> String {
+        let ts = now_ms() + self.offset_ms.load(Ordering::Relaxed);
+        let mut p: Vec<(String, String)> = params
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect();
+        p.push(("apiKey".into(), self.keys.key.clone()));
+        p.push(("recvWindow".into(), self.recv_window.to_string()));
+        p.push(("timestamp".into(), ts.to_string()));
+        p.sort();
+        let query: Vec<String> = p.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let mut o = serde_json::Map::new();
+        for (k, v) in p {
+            o.insert(k, Value::from(v));
+        }
+        o.insert(
+            "signature".into(),
+            Value::from(sign(&self.keys.secret, &query.join("&"))),
+        );
+        serde_json::json!({"id": id, "method": method, "params": o}).to_string()
+    }
+
+    /// Ордер по сокету (ws-api спота, ws-fapi перпов).
+    pub fn ws_place(
+        &self,
+        id: &str,
+        local: u64,
+        symbol: &str,
+        side: crate::paper::Side,
+        qty: f64,
+        price: Option<f64>,
+    ) -> String {
+        self.ws_signed(
+            id,
+            "order.place",
+            &Self::place_params(local, symbol, side, qty, price),
+        )
+    }
+
+    /// Снять ордер по сокету.
+    pub fn ws_cancel(&self, id: &str, symbol: &str, order_id: &str) -> String {
+        self.ws_signed(
+            id,
+            "order.cancel",
+            &[
+                ("symbol", symbol.to_owned()),
+                ("orderId", order_id.to_owned()),
+            ],
+        )
+    }
+
+    /// Ордер по своему номеру (исход запроса по сокету неизвестен).
+    pub async fn query_client(&self, symbol: &str, local: u64) -> Result<OrderState, String> {
+        let p = [
+            ("symbol", symbol.to_owned()),
+            ("origClientOrderId", format!("hft{local}")),
+        ];
+        OrderState::from(
+            &self
+                .signed(reqwest::Method::GET, self.order_path(), &p)
                 .await?,
         )
     }
@@ -385,6 +461,38 @@ pub fn ws_api_url(testnet: bool) -> String {
                 "wss://ws-api.binance.com:443/ws-api/v3".into()
             }
         })
+}
+
+/// Адрес WebSocket API перпов (ордера по сокету); BINANCE_WS_FAPI_URL — свой адрес.
+pub fn ws_fapi_url(testnet: bool) -> String {
+    crate::util::env("BINANCE_WS_FAPI_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| {
+            if testnet {
+                "wss://testnet.binancefuture.com/ws-fapi/v1".into()
+            } else {
+                "wss://ws-fapi.binance.com/ws-fapi/v1".into()
+            }
+        })
+}
+
+/// Ответ WebSocket API на запрос: (id, результат или ошибка «Binance код: текст»); не ответ — None.
+pub fn ws_reply(v: &Value) -> Option<(String, Result<Value, String>)> {
+    let id = v["id"].as_str()?.to_owned();
+    v.get("status")?;
+    Some((
+        id,
+        if v["status"] == 200 {
+            Ok(v["result"].clone())
+        } else {
+            Err(format!(
+                "Binance {}: {}",
+                v["error"]["code"],
+                v["error"]["msg"].as_str().unwrap_or("")
+            ))
+        },
+    ))
 }
 
 /// Состояние ордера на бирже: статус, исполнено, сумма исполненного в котируемой валюте.

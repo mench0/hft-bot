@@ -116,6 +116,14 @@ impl Account {
         v
     }
 
+    /// Сокет ордеров живого счёта и входов, отклонённых без него.
+    pub fn trade_link(&self) -> Option<(std::sync::Arc<crate::trade_ws::TradeLink>, u64)> {
+        match self {
+            Account::Live(l) => l.trade.clone().map(|t| (t, l.ws_entries_blocked)),
+            Account::Paper(_) => None,
+        }
+    }
+
     /// "PAPER", "TESTNET" или "LIVE".
     pub fn mode(&self) -> &'static str {
         match self {

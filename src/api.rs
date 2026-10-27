@@ -251,14 +251,17 @@ fn control_status_json(bot: &Bot) -> Value {
         "торговля_включена": trading,
         "убрать": removable,
         "стакан": book_feeds(bot),
-        "баны": {},
+        "баны": s.selection.keys().filter_map(|e| {
+            let b = crate::ratelimit::snapshot(e).get("ban").cloned()?;
+            Some((e.clone(), b))
+        }).collect::<Map<String, Value>>(),
         "только_выход": bot.exit_only.lock().unwrap().iter().filter(|(_, m)| !m.is_empty())
             .map(|(e, m)| (e.clone(), json!(m))).collect::<Map<String, Value>>(),
     })
 }
 
 /// /status в формате Java-бота: признак запуска и по каждой выбранной бирже — подключение, сообщения, символы.
-/// «стакан» в /control/status: откуда идёт стакан подключённых бирж (у Rust-бэкенда — только WebSocket, ордеров пока нет).
+/// «стакан» в /control/status: откуда идёт стакан подключённых бирж и как идут ордера (сокет или REST).
 fn book_feeds(bot: &Bot) -> Value {
     let mut m = Map::new();
     if bot.running() {
@@ -271,10 +274,31 @@ fn book_feeds(bot: &Bot) -> Value {
             } else {
                 "нет данных"
             };
+            let link = bot
+                .accounts
+                .lock()
+                .unwrap()
+                .get(ex)
+                .and_then(|a| a.trade_link());
+            let (entries, exits, blocked, rest) = match &link {
+                None => (
+                    "REST (у биржи нет ордеров по сокету или wsOrders=false)",
+                    "REST",
+                    0,
+                    0,
+                ),
+                Some((l, _)) if l.ready() => ("по сокету ордеров", "по сокету ордеров", 0, 0),
+                Some((l, b)) => (
+                    "запрещены: сокет ордеров не подключён",
+                    "по REST (сокет ордеров не подключён)",
+                    *b,
+                    l.fallbacks.load(std::sync::atomic::Ordering::Relaxed),
+                ),
+            };
             m.insert(
                 ex.clone(),
-                json!({"feed": feed, "entries": "ордеров пока нет", "exits": "ордеров пока нет",
-                "restEntriesBlocked": 0, "restExits": 0}),
+                json!({"feed": feed, "entries": entries, "exits": exits,
+                "restEntriesBlocked": blocked, "restExits": rest}),
             );
         }
     }
@@ -297,7 +321,22 @@ fn request_stats_json(bot: &Bot) -> Value {
                 .unwrap()
                 .get(ex)
                 .map_or("PAPER", |a| a.mode());
+            let link = bot
+                .accounts
+                .lock()
+                .unwrap()
+                .get(ex)
+                .and_then(|a| a.trade_link());
+            let orders = match &link {
+                Some((l, b)) => {
+                    let mut w = l.stats();
+                    w["entriesBlocked"] = json!(b);
+                    json!({"transport": if l.ready() { "websocket" } else { "rest" }, "ws": w})
+                }
+                None => json!({"transport": if mode == "PAPER" { "paper" } else { "rest" }}),
+            };
             m.insert(ex.clone(), json!({
+                "orders": orders,
                 "mode": mode,
                 "modeTitle": match mode {
                     "LIVE" => "реальные ордера (основная сеть)",
@@ -848,7 +887,7 @@ async fn deselect(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiE
 async fn start(State(a): State<App>) -> Result<Json<Value>, ApiError> {
     a.bot.start().map_err(bad)?;
     Ok(ok(
-        "Соединения подняты: стаканы по WebSocket (ордеров в Rust-бэкенде пока нет)",
+        "Соединения подняты: стаканы по WebSocket, ордера — по сокету, где биржа умеет, иначе REST",
     ))
 }
 
@@ -1540,7 +1579,7 @@ mod tests {
             ("bybit", addrs[1], format!("ws://{}", feeds[1])),
         ] {
             let sel = format!(
-                "/control/select?exchange={exn}&symbols=XUSDT&market=spot&testnet=true&wsUrl={feed}&restUrl=http://{rest}&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
+                "/control/select?exchange={exn}&symbols=XUSDT&market=spot&testnet=true&wsUrl={feed}&restUrl=http://{rest}&wsOrders=false&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
             );
             assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
         }
@@ -1930,7 +1969,7 @@ mod tests {
         crate::util::set_env("OKX_TESTNET_PASSPHRASE", "pass");
         let (_d, r) = app("");
         let sel = format!(
-            "/control/select?exchange=okx&symbols=BTCUSDT&market=perp&leverage=3&testnet=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
+            "/control/select?exchange=okx&symbols=BTCUSDT&market=perp&leverage=3&testnet=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&wsOrders=false&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
         );
         assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
         call(&r, "POST", "/control/start", "").await;
@@ -3144,7 +3183,7 @@ mod tests {
         crate::util::set_env("HYPERLIQUID_TESTNET_API_SECRET", AGENT);
         let (_d, r) = app("");
         let sel = format!(
-            "/control/select?exchange=hyperliquid&symbols=BTCUSDC&market=perp&leverage=3&testnet=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
+            "/control/select?exchange=hyperliquid&symbols=BTCUSDC&market=perp&leverage=3&testnet=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&wsOrders=false&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
         );
         assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
         call(&r, "POST", "/control/start", "").await;
@@ -3778,7 +3817,7 @@ mod tests {
         crate::util::set_env("BINANCE_TESTNET_API_SECRET", SECRET);
         let (_d, r) = app("");
         let sel = format!(
-            "/control/select?exchange=binance&symbols=BTCUSDT&market=perp&leverage=5&testnet=true&wsUrl=ws://{waddr}/stream&restUrl=http://{raddr}&spreadCaptureEnabled=false&maxPositionQuote=1000&exchangeStopLossPercent=2.04"
+            "/control/select?exchange=binance&symbols=BTCUSDT&market=perp&leverage=5&testnet=true&wsUrl=ws://{waddr}/stream&restUrl=http://{raddr}&wsOrders=false&spreadCaptureEnabled=false&maxPositionQuote=1000&exchangeStopLossPercent=2.04"
         );
         assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
         call(&r, "POST", "/control/start", "").await;
@@ -4038,7 +4077,7 @@ mod tests {
         crate::util::set_env("BYBIT_TESTNET_API_SECRET", SECRET);
         let (_d, r) = app("");
         let sel = format!(
-            "/control/select?exchange=bybit&symbols=BTCUSDT&market=spot&testnet=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&spreadCaptureEnabled=false&maxPositionQuote=1000"
+            "/control/select?exchange=bybit&symbols=BTCUSDT&market=spot&testnet=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&wsOrders=false&spreadCaptureEnabled=false&maxPositionQuote=1000"
         );
         assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
         call(&r, "POST", "/control/start", "").await;
@@ -4152,6 +4191,23 @@ mod tests {
             cancels: u32,
             /// номер ордера на бирже → clientOrderId
             clients: Vec<(u64, String)>,
+            ws_orders: u32,
+            rest_orders: u32,
+        }
+        // ордер на бирже (общий для REST и сокета): рыночный исполняется сразу по 101
+        fn place(x: &mut Ex, qty: f64, market: bool, buy: bool, client: String) -> Value {
+            let id = 1000 + x.orders.len() as u64;
+            x.clients.push((id, client));
+            if market {
+                let s = if buy { 1.0 } else { -1.0 };
+                x.usdt -= s * qty * 101.0;
+                x.btc += s * qty;
+                x.orders.push((id, "FILLED".into(), qty, qty * 101.0));
+                json!({"orderId": id, "status": "FILLED", "executedQty": format!("{qty}"), "cummulativeQuoteQty": format!("{}", qty * 101.0)})
+            } else {
+                x.orders.push((id, "NEW".into(), 0.0, 0.0));
+                json!({"orderId": id, "status": "NEW", "executedQty": "0", "cummulativeQuoteQty": "0"})
+            }
         }
         let ex = Arc::new(Mutex::new(Ex {
             usdt: 1000.0,
@@ -4187,17 +4243,10 @@ mod tests {
                 let mut x = e2.lock().unwrap();
                 if !check(&q, &h) { x.bad_sig += 1; return (StatusCode::UNAUTHORIZED, Json(json!({"code": -1022, "msg": "Signature"}))); }
                 let qty: f64 = param(&q, "quantity").unwrap().parse().unwrap();
-                let id = 1000 + x.orders.len() as u64;
-                x.clients.push((id, param(&q, "newClientOrderId").unwrap_or_default()));
-                if param(&q, "type").as_deref() == Some("MARKET") {
-                    x.usdt -= qty * 101.0;
-                    x.btc += qty;
-                    x.orders.push((id, "FILLED".into(), qty, qty * 101.0));
-                    (StatusCode::OK, Json(json!({"orderId": id, "status": "FILLED", "executedQty": format!("{qty}"), "cummulativeQuoteQty": format!("{}", qty * 101.0)})))
-                } else {
-                    x.orders.push((id, "NEW".into(), 0.0, 0.0));
-                    (StatusCode::OK, Json(json!({"orderId": id, "status": "NEW", "executedQty": "0", "cummulativeQuoteQty": "0"})))
-                }
+                x.rest_orders += 1;
+                let r = place(&mut x, qty, param(&q, "type").as_deref() == Some("MARKET"), param(&q, "side").as_deref() == Some("BUY"),
+                    param(&q, "newClientOrderId").unwrap_or_default());
+                (StatusCode::OK, Json(r))
             }).get(move |RawQuery(q): RawQuery, h: HeaderMap| async move {
                 let q = q.unwrap_or_default();
                 let x = e3.lock().unwrap();
@@ -4242,6 +4291,23 @@ mod tests {
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let sub_ok = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let sub_ok2 = sub_ok.clone();
+        let kill = Arc::new(tokio::sync::Notify::new());
+        let (kill2, e5) = (kill.clone(), ex.clone());
+        // подпись запроса ws-api: все параметры, кроме signature, по алфавиту
+        fn ws_sig_ok(p: &Value) -> bool {
+            let mut kv: Vec<(String, String)> = p
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(k, _)| *k != "signature")
+                .map(|(k, v)| (k.clone(), v.as_str().map_or(v.to_string(), str::to_owned)))
+                .collect();
+            kv.sort();
+            let q: Vec<String> = kv.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            p["apiKey"] == "test-key"
+                && crate::signed::sign(SECRET, &q.join("&"))
+                    == p["signature"].as_str().unwrap_or("")
+        }
         let al = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let aaddr = al.local_addr().unwrap();
         tokio::spawn(async move {
@@ -4264,11 +4330,46 @@ mod tests {
             sub_ok2.store(ok, std::sync::atomic::Ordering::SeqCst);
             let reply = json!({"id": v["id"], "status": if ok { 200 } else { 401 }, "result": {"subscriptionId": 0}});
             ws.send(Message::text(reply.to_string())).await.unwrap();
-            while let Some(e) = ev_rx.recv().await {
-                if ws.send(Message::text(e)).await.is_err() {
-                    break;
+            // события счёта из канала; ордера и отмены по этому же сокету; kill — обрыв сокета
+            loop {
+                tokio::select! {
+                    e = ev_rx.recv() => {
+                        let Some(e) = e else { break };
+                        if ws.send(Message::text(e)).await.is_err() {
+                            break;
+                        }
+                    }
+                    m = ws.next() => {
+                        let Some(Ok(Message::Text(t))) = m else { break };
+                        let v: Value = serde_json::from_str(&t).unwrap();
+                        let p = &v["params"];
+                        let reply = {
+                            let mut x = e5.lock().unwrap();
+                            if !ws_sig_ok(p) {
+                                x.bad_sig += 1;
+                                json!({"id": v["id"], "status": 401, "error": {"code": -1022, "msg": "Signature"}})
+                            } else if v["method"] == "order.place" {
+                                x.ws_orders += 1;
+                                let qty: f64 = p["quantity"].as_str().unwrap().parse().unwrap();
+                                let r = place(&mut x, qty, p["type"] == "MARKET", p["side"] == "BUY", p["newClientOrderId"].as_str().unwrap().to_owned());
+                                json!({"id": v["id"], "status": 200, "result": r})
+                            } else if v["method"] == "order.cancel" {
+                                let id: u64 = p["orderId"].as_str().unwrap().parse().unwrap();
+                                x.cancels += 1;
+                                x.orders.iter_mut().find(|o| o.0 == id).unwrap().1 = "CANCELED".into();
+                                json!({"id": v["id"], "status": 200, "result": {"orderId": id, "status": "CANCELED", "executedQty": "0", "cummulativeQuoteQty": "0"}})
+                            } else {
+                                json!({"id": v["id"], "status": 400, "error": {"code": -1, "msg": "unknown"}})
+                            }
+                        };
+                        if ws.send(Message::text(reply.to_string())).await.is_err() {
+                            break;
+                        }
+                    }
+                    _ = kill2.notified() => break,
                 }
             }
+            drop(ws);
             // порт держится до конца теста: иначе его получит мок другого теста, а переподключение этого бота попадёт туда
             loop {
                 let _ = al.accept().await;
@@ -4299,6 +4400,19 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        // поток событий счёта и сокет ордеров: до подключения вход запрещён
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let (_, s) = call(&r, "GET", "/status", "").await;
+            if s["binance"]["поток_событий_счёта"] == json!(true) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < until,
+                "поток событий не подключён: {s}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         let (c, v) = call(
             &r,
             "POST",
@@ -4319,19 +4433,6 @@ mod tests {
                 "покупка не учтена: {b}"
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        // поток событий счёта: лимитная покупка исполнилась — узнаём из события, а не из опроса (он раз в 5 с)
-        let until = tokio::time::Instant::now() + Duration::from_secs(15);
-        loop {
-            let (_, s) = call(&r, "GET", "/status", "").await;
-            if s["binance"]["поток_событий_счёта"] == json!(true) {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < until,
-                "поток событий не подключён: {s}"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(
             sub_ok.load(std::sync::atomic::Ordering::SeqCst),
@@ -4394,6 +4495,55 @@ mod tests {
         .await;
         assert_eq!(v["статус"], json!("NEW"), "{v}");
         tokio::time::sleep(Duration::from_millis(300)).await;
+        {
+            let x = ex.lock().unwrap();
+            assert_eq!((x.ws_orders, x.rest_orders), (3, 0), "ордера — по сокету");
+        }
+        // сокет упал: новый вход запрещён, выход (продажа спота) — по REST
+        kill.notify_one();
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let (_, s) = call(&r, "GET", "/status", "").await;
+            if s["binance"]["поток_событий_счёта"] == json!(false) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < until, "обрыв не замечен: {s}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let (_, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=binance&symbol=BTCUSDT&side=BUY&type=MARKET&qty=1",
+            "",
+        )
+        .await;
+        assert!(
+            v.to_string().contains("сокет ордеров не подключён"),
+            "вход без сокета: {v}"
+        );
+        let (_, v) = call(
+            &r,
+            "POST",
+            "/order?exchange=binance&symbol=BTCUSDT&side=SELL&type=MARKET&qty=1",
+            "",
+        )
+        .await;
+        assert_eq!(v["статус"], json!("NEW"), "выход без сокета разрешён: {v}");
+        let until = tokio::time::Instant::now() + Duration::from_secs(15);
+        while ex.lock().unwrap().rest_orders == 0 {
+            assert!(tokio::time::Instant::now() < until, "выход не ушёл по REST");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (_, rs) = call(&r, "GET", "/exchanges/request-stats", "").await;
+        assert_eq!(
+            rs["binance"]["orders"]["ws"]["connected"],
+            json!(false),
+            "{rs}"
+        );
+        assert!(
+            rs["binance"]["orders"]["ws"]["calls"].as_u64().unwrap() >= 3,
+            "{rs}"
+        );
         call(&r, "POST", "/trading/panic", "").await;
         let until = tokio::time::Instant::now() + Duration::from_secs(15);
         while ex.lock().unwrap().cancels == 0 {
@@ -4409,7 +4559,7 @@ mod tests {
             json!("TESTNET"),
             "{s}"
         );
-        assert_eq!(s["binance"]["ордеров_принято"], json!(3));
+        assert_eq!(s["binance"]["ордеров_принято"], json!(4));
         assert_eq!(ex.lock().unwrap().bad_sig, 0, "все запросы подписаны верно");
         call(&r, "POST", "/control/stop", "").await;
     }

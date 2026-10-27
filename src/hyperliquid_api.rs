@@ -220,7 +220,8 @@ impl Client {
         Ok(v)
     }
 
-    async fn exchange(&self, action: Value) -> Result<Value, String> {
+    /// Подписанное действие (тело /exchange и запроса post по сокету).
+    fn signed(&self, action: Value) -> Value {
         // nonce — миллисекунды, строго растёт
         let n = self
             .nonce
@@ -229,7 +230,11 @@ impl Client {
             + 1;
         self.nonce.fetch_max(n, Ordering::SeqCst);
         let sig = sign_action(&self.wallet, &action, n, self.mainnet);
-        let body = json!({"action": action, "nonce": n, "signature": sig, "vaultAddress": null});
+        json!({"action": action, "nonce": n, "signature": sig, "vaultAddress": null})
+    }
+
+    async fn exchange(&self, action: Value) -> Result<Value, String> {
+        let body = self.signed(action);
         let r = self
             .http
             .post(format!("{}/exchange", self.base))
@@ -349,7 +354,7 @@ impl Client {
         Ok(())
     }
 
-    pub async fn place(
+    pub fn place_req(
         &self,
         local: u64,
         symbol: &str,
@@ -357,7 +362,7 @@ impl Client {
         qty: f64,
         price: Option<f64>,
         ref_px: f64,
-    ) -> Result<OrderState, String> {
+    ) -> Result<PlaceReq, String> {
         let a = self.asset(symbol)?;
         let buy = side == Side::Buy;
         let (px, tif) = match price {
@@ -379,9 +384,78 @@ impl Client {
         }
         let order = json!({"a": a.index, "b": buy, "p": format_price(px, a.sz_dec, if self.perp { 6 } else { 8 }), "s": sz,
             "r": false, "t": {"limit": {"tif": tif}}, "c": cloid(local)});
+        Ok(PlaceReq {
+            action: json!({"type": "order", "orders": [order], "grouping": "na"}),
+            sz,
+            ioc: tif == "Ioc",
+            qty,
+        })
+    }
+
+    pub async fn place(
+        &self,
+        local: u64,
+        symbol: &str,
+        side: Side,
+        qty: f64,
+        price: Option<f64>,
+        ref_px: f64,
+    ) -> Result<OrderState, String> {
+        let r = self.place_req(local, symbol, side, qty, price, ref_px)?;
+        let v = self.exchange(r.action.clone()).await?;
+        r.result(&v)
+    }
+
+    /// Ордер по сокету: запрос post с подписанным действием (id — число).
+    pub fn ws_place(&self, id: u64, r: &PlaceReq) -> String {
+        json!({"method": "post", "id": id, "request": {"type": "action", "payload": self.signed(r.action.clone())}}).to_string()
+    }
+
+    pub fn ws_cancel(&self, id: u64, symbol: &str, oid: &str) -> Result<String, String> {
+        let a = self.asset(symbol)?;
+        let o: u64 = oid.parse().map_err(|_| format!("номер ордера {oid}"))?;
+        Ok(json!({"method": "post", "id": id, "request": {"type": "action",
+            "payload": self.signed(json!({"type": "cancel", "cancels": [{"a": a.index, "o": o}]}))}}).to_string())
+    }
+
+    /// Ордер по своему номеру cloid (исход запроса по сокету неизвестен).
+    pub async fn query_client(&self, _symbol: &str, local: u64) -> Result<OrderState, String> {
         let v = self
-            .exchange(json!({"type": "order", "orders": [order], "grouping": "na"}))
+            .info(json!({"type": "orderStatus", "user": self.user, "oid": cloid(local)}))
             .await?;
+        let w = &v["order"];
+        if w.is_null() {
+            return Err("Hyperliquid: ордер не найден".into());
+        }
+        Ok(self.state(
+            &w["order"]["oid"].to_string(),
+            &w["order"],
+            w["status"].as_str().unwrap_or(""),
+        ))
+    }
+}
+
+/// Запрос ордера: действие и что нужно, чтобы понять ответ.
+pub struct PlaceReq {
+    pub action: Value,
+    sz: String,
+    ioc: bool,
+    qty: f64,
+}
+
+impl PlaceReq {
+    /// Ответ на ордер (тело ответа /exchange или payload ответа сокета).
+    pub fn result(&self, v: &Value) -> Result<OrderState, String> {
+        if v["status"] == "err" {
+            return Err(format!(
+                "Hyperliquid: {}",
+                v["response"]
+                    .as_str()
+                    .map_or_else(|| v.to_string(), str::to_owned)
+            ));
+        }
+        let (sz, qty) = (&self.sz, self.qty);
+        let tif = if self.ioc { "Ioc" } else { "Gtc" };
         let st = &v["response"]["data"]["statuses"][0];
         if let Some(f) = st.get("filled") {
             let (ex, avg) = (num(&f["totalSz"]), num(&f["avgPx"]));
@@ -410,7 +484,9 @@ impl Client {
         }
         Err(format!("Hyperliquid: неожиданный ответ на ордер: {v}"))
     }
+}
 
+impl Client {
     /// Состояние ордера: исполнено = origSz − sz; сумма — по исполнениям потока, иначе по цене ордера.
     fn state(&self, oid: &str, o: &Value, status: &str) -> OrderState {
         let (orig, left) = (num(&o["origSz"]), num(&o["sz"]));
@@ -625,6 +701,29 @@ impl Client {
             .await
             .map(|_| ())
     }
+}
+
+/// Ответ на запрос post по сокету: (id, payload действия или ошибка).
+pub fn ws_reply(v: &Value) -> Option<(String, Result<Value, String>)> {
+    if v["channel"] != "post" {
+        return None;
+    }
+    let d = &v["data"];
+    let id = d["id"].as_u64()?.to_string();
+    let r = &d["response"];
+    Some((
+        id,
+        if r["type"] == "error" {
+            Err(format!(
+                "Hyperliquid: {}",
+                r["payload"]
+                    .as_str()
+                    .map_or_else(|| r["payload"].to_string(), str::to_owned)
+            ))
+        } else {
+            Ok(r["payload"].clone())
+        },
+    ))
 }
 
 #[cfg(test)]

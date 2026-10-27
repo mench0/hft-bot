@@ -102,6 +102,10 @@ pub struct Live {
     stop_failed: HashMap<String, std::time::Instant>,
     /// Биржа (рынок) не поддерживает стопы в боте — защищает только стоп-лосс бота.
     pub stops_unsupported: bool,
+    /// Сокет ордеров (биржи с торговлей по WebSocket); без сокета вход запрещён, выход — по REST.
+    pub trade: Option<Arc<crate::trade_ws::TradeLink>>,
+    /// Входов отклонено, потому что сокет ордеров не подключён.
+    pub ws_entries_blocked: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +148,8 @@ impl Live {
             stops: HashMap::new(),
             stop_failed: HashMap::new(),
             stops_unsupported: false,
+            trade: None,
+            ws_entries_blocked: 0,
         }
     }
 
@@ -209,6 +215,15 @@ impl Live {
                 "недостаточно {asset}: нужно {need:.8}, свободно {:.8}",
                 self.ledger.free(&asset)
             );
+            self.ledger.note_rejected(&e);
+            return Err(e);
+        }
+        // торговля по сокету: сокет упал — новые входы нельзя, выход (продажа спота, уменьшение позиции) — по REST
+        if self.trade.as_ref().is_some_and(|t| !t.ready())
+            && pr.qty > self.ledger.exit_room(symbol, side) + 1e-12
+        {
+            self.ws_entries_blocked += 1;
+            let e = "сокет ордеров не подключён: вход запрещён, выход — по REST".to_owned();
             self.ledger.note_rejected(&e);
             return Err(e);
         }
@@ -834,6 +849,257 @@ impl Venue {
     }
 }
 
+/// Где у биржи ордера по сокету.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum TradeSocket {
+    /// Торговли по сокету нет — только REST.
+    None,
+    /// Тот же сокет, что события счёта (Binance спот ws-api, OKX, Hyperliquid).
+    Shared,
+    /// Отдельный торговый сокет (Binance перпы ws-fapi, Bybit /v5/trade).
+    Own,
+}
+
+/// Итог ордера или отмены по сокету.
+enum WsOut<T> {
+    NotReady,
+    Unknown(String),
+    Done(Result<T, String>),
+}
+
+impl Venue {
+    pub fn trade_socket(&self) -> TradeSocket {
+        match self {
+            Venue::Binance(c) if c.perp => TradeSocket::Own,
+            Venue::Binance(_) | Venue::Okx(_) | Venue::Hyperliquid(_) => TradeSocket::Shared,
+            Venue::Bybit(_) => TradeSocket::Own,
+            _ => TradeSocket::None,
+        }
+    }
+
+    /// Ответ на запрос по сокету ордеров: (id, данные или ошибка).
+    fn trade_reply(&self, text: &str) -> Option<(String, Result<serde_json::Value, String>)> {
+        let v: serde_json::Value = serde_json::from_str(text).ok()?;
+        match self {
+            Venue::Binance(_) => crate::signed::ws_reply(&v),
+            Venue::Okx(_) => crate::okx_api::ws_reply(&v),
+            Venue::Bybit(_) => crate::bybit_api::ws_reply(&v),
+            Venue::Hyperliquid(_) => crate::hyperliquid_api::ws_reply(&v),
+            _ => None,
+        }
+    }
+
+    /// Ордер по сокету.
+    #[allow(clippy::too_many_arguments)]
+    async fn place_ws(
+        &self,
+        link: &crate::trade_ws::TradeLink,
+        local: u64,
+        symbol: &str,
+        side: Side,
+        qty: f64,
+        price: Option<f64>,
+        ref_px: f64,
+    ) -> WsOut<OrderState> {
+        use crate::trade_ws::Call;
+        if !link.ready() {
+            link.fallbacks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return WsOut::NotReady;
+        }
+        let mut hl = None;
+        let (id, msg) = match self {
+            Venue::Binance(c) => {
+                let id = link.next_id("t");
+                let m = c.ws_place(&id, local, symbol, side, qty, price);
+                (id, m)
+            }
+            Venue::Okx(c) => {
+                let id = link.next_id("t");
+                match c.ws_place(&id, local, symbol, side, qty, price) {
+                    Ok(m) => (id, m),
+                    Err(e) => return WsOut::Done(Err(e)),
+                }
+            }
+            Venue::Bybit(c) => {
+                let id = link.next_id("t");
+                let m = c.ws_place(&id, local, symbol, side, qty, price);
+                (id, m)
+            }
+            Venue::Hyperliquid(c) => {
+                let r = match c.place_req(local, symbol, side, qty, price, ref_px) {
+                    Ok(r) => r,
+                    Err(e) => return WsOut::Done(Err(e)),
+                };
+                let id = link.next_id("");
+                let m = c.ws_place(id.parse().unwrap_or(0), &r);
+                hl = Some(r);
+                (id, m)
+            }
+            _ => return WsOut::NotReady,
+        };
+        match link.call(&id, msg, WS_TIMEOUT).await {
+            Call::NotReady => WsOut::NotReady,
+            Call::Unknown(e) => WsOut::Unknown(e),
+            Call::Reply(Err(e)) => WsOut::Done(Err(e)),
+            Call::Reply(Ok(v)) => WsOut::Done(match self {
+                Venue::Binance(_) => OrderState::from(&v),
+                Venue::Okx(_) => Ok(OrderState {
+                    id: v["ordId"].as_str().unwrap_or("").to_owned(),
+                    status: "NEW".into(),
+                    executed: 0.0,
+                    quote: 0.0,
+                }),
+                Venue::Bybit(_) => Ok(OrderState {
+                    id: v["orderId"].as_str().unwrap_or("").to_owned(),
+                    status: "NEW".into(),
+                    executed: 0.0,
+                    quote: 0.0,
+                }),
+                _ => hl
+                    .as_ref()
+                    .map_or(Err("нет запроса".into()), |r| r.result(&v)),
+            }),
+        }
+    }
+
+    /// Отмена по сокету: Some — состояние сразу (Binance), None — итог придёт потоком событий.
+    async fn cancel_ws(
+        &self,
+        link: &crate::trade_ws::TradeLink,
+        symbol: &str,
+        oid: &str,
+    ) -> WsOut<Option<OrderState>> {
+        use crate::trade_ws::Call;
+        if !link.ready() {
+            return WsOut::NotReady;
+        }
+        let (id, msg) = match self {
+            Venue::Binance(c) => {
+                let id = link.next_id("c");
+                let m = c.ws_cancel(&id, symbol, oid);
+                (id, m)
+            }
+            Venue::Okx(c) => {
+                let id = link.next_id("c");
+                let m = c.ws_cancel(&id, symbol, oid);
+                (id, m)
+            }
+            Venue::Bybit(c) => {
+                let id = link.next_id("c");
+                let m = c.ws_cancel(&id, symbol, oid);
+                (id, m)
+            }
+            Venue::Hyperliquid(c) => {
+                let id = link.next_id("");
+                match c.ws_cancel(id.parse().unwrap_or(0), symbol, oid) {
+                    Ok(m) => (id, m),
+                    Err(e) => return WsOut::Done(Err(e)),
+                }
+            }
+            _ => return WsOut::NotReady,
+        };
+        match link.call(&id, msg, WS_TIMEOUT).await {
+            Call::NotReady => WsOut::NotReady,
+            Call::Unknown(e) => WsOut::Unknown(e),
+            Call::Reply(Err(e)) => WsOut::Done(Err(e)),
+            Call::Reply(Ok(v)) => match self {
+                Venue::Binance(_) => WsOut::Done(OrderState::from(&v).map(Some)),
+                // ответ Hyperliquid «ok» бывает и с ошибкой внутри
+                Venue::Hyperliquid(_) => match v["response"]["data"]["statuses"][0].get("error") {
+                    Some(e) => WsOut::Done(Err(format!("Hyperliquid: {e}"))),
+                    None => WsOut::Done(Ok(None)),
+                },
+                _ => WsOut::Done(Ok(None)),
+            },
+        }
+    }
+
+    /// Ордер по своему номеру (исход запроса по сокету неизвестен).
+    async fn query_client(&self, symbol: &str, local: u64) -> Result<OrderState, String> {
+        match self {
+            Venue::Binance(c) => c.query_client(symbol, local).await,
+            Venue::Okx(c) => c.query_client(symbol, local).await,
+            Venue::Bybit(c) => c.query_client(symbol, local).await,
+            Venue::Hyperliquid(c) => c.query_client(symbol, local).await,
+            _ => Err("поиск по своему номеру не поддерживается".into()),
+        }
+    }
+
+    /// Адрес отдельного торгового сокета.
+    fn trade_url(&self, testnet: bool) -> String {
+        match self {
+            Venue::Bybit(_) => crate::bybit_api::trade_url(testnet),
+            _ => crate::signed::ws_fapi_url(testnet),
+        }
+    }
+}
+
+/// Сколько ждать ответа на запрос по сокету ордеров.
+const WS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Ордер: по сокету, если он подключён, иначе по REST; исход по сокету неизвестен — найти ордер по своему номеру.
+#[allow(clippy::too_many_arguments)]
+async fn place_order(
+    ex: &str,
+    client: &Venue,
+    link: Option<&crate::trade_ws::TradeLink>,
+    local: u64,
+    symbol: &str,
+    side: Side,
+    qty: f64,
+    price: Option<f64>,
+    ref_px: f64,
+) -> Result<OrderState, String> {
+    if let Some(link) = link {
+        if link.ready() {
+            let _ = crate::ratelimit::take(ex, "order").await;
+        }
+        let t = std::time::Instant::now();
+        match client
+            .place_ws(link, local, symbol, side, qty, price, ref_px)
+            .await
+        {
+            WsOut::NotReady => {}
+            WsOut::Done(r) => {
+                crate::metrics::record(ex, "order_ws", t.elapsed().as_micros() as u64, r.is_ok());
+                return r;
+            }
+            WsOut::Unknown(why) => {
+                tracing::warn!(
+                    "[{ex}] ордер #{local} {symbol}: {why} — ищу по своему номеру через REST"
+                );
+                crate::journal::action(
+                    ex,
+                    Some(symbol),
+                    &format!("ордер #{local}: {why} — проверка по REST"),
+                );
+                let mut last = why;
+                for i in 0..3 {
+                    if i > 0 {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    match crate::metrics::timed(ex, "query", client.query_client(symbol, local))
+                        .await
+                    {
+                        Ok(st) => return Ok(st),
+                        Err(e) => last = e,
+                    }
+                }
+                return Err(format!(
+                    "исход ордера по сокету неизвестен, по REST не найден: {last}"
+                ));
+            }
+        }
+    }
+    crate::metrics::timed(
+        ex,
+        "order",
+        client.place(local, symbol, side, qty, price, ref_px),
+    )
+    .await
+}
+
 /// Фоновая задача живого счёта: сверка часов, балансы, отправка и снятие ордеров, опрос статусов.
 pub async fn worker(
     acc: Shared,
@@ -842,6 +1108,7 @@ pub async fn worker(
     mut rx: mpsc::UnboundedReceiver<Cmd>,
     symbols: Vec<String>,
     leverage: Option<f64>,
+    ws_orders: bool,
 ) {
     if let Err(e) = crate::metrics::timed(&ex, "time", client.sync_time()).await {
         tracing::warn!("[{ex}] время сервера не получено: {e}");
@@ -858,6 +1125,13 @@ pub async fn worker(
         }
     }
     let testnet = with_live(&acc, &ex, |l| l.mode == "TESTNET").unwrap_or(false);
+    let mode = if ws_orders {
+        client.trade_socket()
+    } else {
+        TradeSocket::None
+    };
+    let link = (mode != TradeSocket::None).then(|| Arc::new(crate::trade_ws::TradeLink::default()));
+    with_live(&acc, &ex, |l| l.trade = link.clone());
     // Uniswap: потока событий нет — итог свопа известен по квитанции
     let _stream = (!matches!(client.as_ref(), Venue::Uniswap(_))).then(|| {
         AbortOnDrop(tokio::spawn(user_stream(
@@ -865,6 +1139,15 @@ pub async fn worker(
             ex.clone(),
             client.clone(),
             testnet,
+            link.clone().filter(|_| mode == TradeSocket::Shared),
+        )))
+    });
+    let _trade = link.clone().filter(|_| mode == TradeSocket::Own).map(|l| {
+        AbortOnDrop(tokio::spawn(trade_socket(
+            ex.clone(),
+            client.clone(),
+            testnet,
+            l,
         )))
     });
     let mut poll = tokio::time::interval(Duration::from_millis(500));
@@ -875,7 +1158,7 @@ pub async fn worker(
                 let Some(cmd) = cmd else { return };
                 match cmd {
                     Cmd::Place { local, symbol, side, qty, price, ref_px } => {
-                        let r = crate::metrics::timed(&ex, "order", client.place(local, &symbol, side, qty, price, ref_px)).await;
+                        let r = place_order(&ex, &client, link.as_deref(), local, &symbol, side, qty, price, ref_px).await;
                         crate::journal::action(&ex, Some(&symbol), &match &r {
                             Ok(st) => format!("биржа приняла ордер #{local} {side:?} {qty}{}: номер {}, {} {}", price.map_or(String::new(), |p| format!(" @ {p}")), st.id, st.status, st.executed),
                             Err(e) => format!("биржа отклонила ордер #{local} {side:?} {qty}: {e}"),
@@ -885,10 +1168,10 @@ pub async fn worker(
                             Err(e) => { tracing::warn!("[{ex}] ордер {symbol} отклонён: {e}"); l.on_error(local, e); false }
                         }).unwrap_or(false);
                         if cancel_now {
-                            cancel(&acc, &ex, &client, local).await;
+                            cancel(&acc, &ex, &client, link.as_deref(), local).await;
                         }
                     }
-                    Cmd::Cancel { local } => cancel(&acc, &ex, &client, local).await,
+                    Cmd::Cancel { local } => cancel(&acc, &ex, &client, link.as_deref(), local).await,
                     Cmd::PlaceStop { symbol, side, qty, price, old } => {
                         let r = crate::metrics::timed(&ex, "stop", client.place_stop(&symbol, side, qty, price)).await;
                         match &r {
@@ -1207,7 +1490,13 @@ impl Venue {
 
 /// Приватный поток событий счёта: подключение, вход и подписка (по бирже), пинги, события в учёт; при обрыве —
 /// переподключение с паузой 0.5 → 30 с (пока нет потока — частый опрос).
-async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) {
+async fn user_stream(
+    acc: Shared,
+    ex: String,
+    venue: Arc<Venue>,
+    testnet: bool,
+    link: Option<Arc<crate::trade_ws::TradeLink>>,
+) {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
     let mut backoff = crate::feed::Backoff::default();
@@ -1253,9 +1542,14 @@ async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) 
                 let sub = format!("sub{seq}");
                 let hello = venue.stream_hello(&sub);
                 let mut err = String::new();
+                // ордера по этому же сокету: запросы из worker идут сюда, пока сокет вошёл
+                let (otx, mut orx) = mpsc::unbounded_channel::<String>();
                 let ready = |acc: &Shared| {
                     tracing::info!("[{ex}] поток событий счёта подключён");
                     with_live(acc, &ex, |l| l.stream_ok = true);
+                    if let Some(k) = &link {
+                        k.attach(otx.clone());
+                    }
                 };
                 if hello.is_none() {
                     backoff.reset();
@@ -1270,6 +1564,10 @@ async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) 
                 while err.is_empty() {
                     let msg = tokio::select! {
                         m = ws.next() => m,
+                        Some(o) = orx.recv() => {
+                            err = ws.send(Message::text(o)).await.err().map(|e| e.to_string()).unwrap_or_default();
+                            continue;
+                        }
                         _ = ping.tick() => {
                             pings += 1;
                             if let Some(p) = venue.stream_ping() {
@@ -1309,6 +1607,12 @@ async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) 
                         },
                         m => m,
                     };
+                    if let (Some(k), Some(Ok(Message::Text(t)))) = (&link, &msg)
+                        && let Some((id, r)) = venue.trade_reply(t)
+                        && k.resolve(&id, r)
+                    {
+                        continue;
+                    }
                     match msg {
                         Some(Ok(Message::Text(t))) => match venue.stream_parse(&t, &sub) {
                             StreamMsg::Ignore => {}
@@ -1351,6 +1655,9 @@ async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) 
             }
             Err(e) => e.to_string(),
         };
+        if let Some(k) = &link {
+            k.detach();
+        }
         with_live(&acc, &ex, |l| {
             l.stream_ok = false;
             l.error = format!("поток событий: {err}");
@@ -1365,11 +1672,134 @@ async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) 
     }
 }
 
+/// Отдельный торговый сокет (Binance перпы ws-fapi, Bybit /v5/trade): подключение, вход (Bybit), пинги, ответы
+/// по id; при обрыве ордера идут по REST, переподключение с паузой 0.5 → 30 с.
+async fn trade_socket(
+    ex: String,
+    venue: Arc<Venue>,
+    testnet: bool,
+    link: Arc<crate::trade_ws::TradeLink>,
+) {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let mut backoff = crate::feed::Backoff::default();
+    loop {
+        let url = venue.trade_url(testnet);
+        let _ = crate::ratelimit::take(&ex, "ws_connect").await;
+        let conn = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio_tungstenite::connect_async(url.as_str()),
+        )
+        .await;
+        let err = match conn {
+            Err(_) => "подключение не ответило за 10 с".to_owned(),
+            Ok(Err(e)) => e.to_string(),
+            Ok(Ok((mut ws, _))) => {
+                let (otx, mut orx) = mpsc::unbounded_channel::<String>();
+                let mut err = String::new();
+                match venue.as_ref() {
+                    Venue::Bybit(c) => {
+                        err = ws
+                            .send(Message::text(c.auth_message()))
+                            .await
+                            .err()
+                            .map(|e| e.to_string())
+                            .unwrap_or_default()
+                    }
+                    _ => {
+                        backoff.reset();
+                        link.attach(otx.clone());
+                        tracing::info!("[{ex}] сокет ордеров подключён");
+                    }
+                }
+                let mut ping = tokio::time::interval_at(
+                    tokio::time::Instant::now() + Duration::from_secs(20),
+                    Duration::from_secs(20),
+                );
+                while err.is_empty() {
+                    let msg = tokio::select! {
+                        m = ws.next() => m,
+                        Some(o) = orx.recv() => {
+                            err = ws.send(Message::text(o)).await.err().map(|e| e.to_string()).unwrap_or_default();
+                            continue;
+                        }
+                        _ = ping.tick() => {
+                            if matches!(venue.as_ref(), Venue::Bybit(_)) {
+                                err = ws.send(Message::text(r#"{"op":"ping"}"#)).await.err().map(|e| e.to_string()).unwrap_or_default();
+                            }
+                            continue;
+                        }
+                    };
+                    match msg {
+                        Some(Ok(Message::Text(t))) => {
+                            let v: serde_json::Value = serde_json::from_str(&t).unwrap_or_default();
+                            if v["op"] == "auth" {
+                                if v["retCode"] == 0 {
+                                    backoff.reset();
+                                    link.attach(otx.clone());
+                                    tracing::info!("[{ex}] сокет ордеров подключён");
+                                } else {
+                                    err = format!("вход в сокет ордеров отклонён: {}", v["retMsg"]);
+                                }
+                            } else if let Some((id, r)) = venue.trade_reply(&t) {
+                                link.resolve(&id, r);
+                            }
+                        }
+                        Some(Ok(Message::Ping(p))) => {
+                            let _ = ws.send(Message::Pong(p)).await;
+                        }
+                        Some(Ok(Message::Close(c))) => err = format!("закрыто биржей: {c:?}"),
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => err = e.to_string(),
+                        None => err = "соединение закрыто".into(),
+                    }
+                }
+                err
+            }
+        };
+        link.detach();
+        let pause = backoff.next();
+        tracing::warn!(
+            "[{ex}] сокет ордеров: {err} — ордера по REST, переподключение через {} мс",
+            pause.as_millis()
+        );
+        tokio::time::sleep(pause).await;
+    }
+}
+
 /// Снять ордер на бирже; номера ещё нет — снимется, когда ордер встанет (см. Place).
-async fn cancel(acc: &Shared, ex: &str, client: &Venue, local: u64) {
+async fn cancel(
+    acc: &Shared,
+    ex: &str,
+    client: &Venue,
+    link: Option<&crate::trade_ws::TradeLink>,
+    local: u64,
+) {
     let Some((symbol, id)) = with_live(acc, ex, |l| l.cancel_target(local)).flatten() else {
         return;
     };
+    if let Some(link) = link {
+        if link.ready() {
+            let _ = crate::ratelimit::take(ex, "cancel").await;
+        }
+        let t = std::time::Instant::now();
+        match client.cancel_ws(link, &symbol, &id).await {
+            WsOut::Done(Ok(st)) => {
+                crate::metrics::record(ex, "cancel_ws", t.elapsed().as_micros() as u64, true);
+                crate::journal::action(ex, Some(&symbol), &format!("ордер {id} снят по сокету"));
+                if let Some(st) = st {
+                    with_live(acc, ex, |l| l.on_state(local, &st));
+                }
+                return;
+            }
+            // отказ (уже исполнен, снят) или исход неизвестен — итог узнаём по REST
+            WsOut::Done(Err(e)) | WsOut::Unknown(e) => {
+                crate::metrics::record(ex, "cancel_ws", t.elapsed().as_micros() as u64, false);
+                tracing::info!("[{ex}] отмена {id} по сокету: {e} — проверка по REST");
+            }
+            WsOut::NotReady => {}
+        }
+    }
     match crate::metrics::timed(ex, "cancel", client.cancel(&symbol, &id)).await {
         Ok(st) => {
             crate::journal::action(
@@ -1383,5 +1813,213 @@ async fn cancel(acc: &Shared, ex: &str, client: &Venue, local: u64) {
             crate::journal::action(ex, Some(&symbol), &format!("ордер {id} не снят: {e}"));
             tracing::warn!("[{ex}] не снят ордер {symbol} {id}: {e}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trade_ws::TradeLink;
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::{Value, json};
+    use tokio_tungstenite::tungstenite::Message;
+
+    /// Мок торгового сокета: на каждый запрос — ответ из reply; первый запрос сохраняется в seen.
+    async fn mock(
+        reply: fn(&Value) -> Option<Value>,
+    ) -> (String, Arc<Mutex<Vec<Value>>>, Arc<tokio::sync::Notify>) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let kill = Arc::new(tokio::sync::Notify::new());
+        let (s2, k2) = (seen.clone(), kill.clone());
+        tokio::spawn(async move {
+            let (tcp, _) = l.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            loop {
+                tokio::select! {
+                    m = ws.next() => {
+                        let Some(Ok(Message::Text(t))) = m else { break };
+                        let v: Value = serde_json::from_str(&t).unwrap();
+                        s2.lock().unwrap().push(v.clone());
+                        if let Some(r) = reply(&v) {
+                            ws.send(Message::text(r.to_string())).await.unwrap();
+                        }
+                    }
+                    _ = k2.notified() => break,
+                }
+            }
+            drop(ws);
+            loop {
+                let _ = l.accept().await;
+            }
+        });
+        (format!("ws://{addr}"), seen, kill)
+    }
+
+    fn keys() -> crate::signed::Keys {
+        crate::signed::Keys {
+            key: "k".into(),
+            secret: "s".into(),
+        }
+    }
+
+    async fn wait(f: impl Fn() -> bool) {
+        let until = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !f() {
+            assert!(tokio::time::Instant::now() < until, "не дождались");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn bybit_orders_over_trade_socket_and_rest_when_down() {
+        let (url, seen, kill) = mock(|v| match v["op"].as_str()? {
+            "auth" => Some(json!({"op": "auth", "retCode": 0, "retMsg": "OK"})),
+            "order.create" => Some(json!({"reqId": v["reqId"], "retCode": 0, "retMsg": "OK", "op": "order.create",
+                "data": {"orderId": "B-1", "orderLinkId": v["args"][0]["orderLinkId"]}})),
+            "order.cancel" => Some(json!({"reqId": v["reqId"], "retCode": 110001, "retMsg": "order not exists", "op": "order.cancel"})),
+            _ => None,
+        })
+        .await;
+        crate::util::set_env("BYBIT_WS_TRADE_URL", &url);
+        let mut c = crate::bybit_api::Client::new("http://127.0.0.1:9", keys());
+        c.category = "linear";
+        let venue = Arc::new(Venue::Bybit(c));
+        assert_eq!(venue.trade_socket(), TradeSocket::Own);
+        let link = Arc::new(TradeLink::default());
+        let _t = AbortOnDrop(tokio::spawn(trade_socket(
+            "bybit".into(),
+            venue.clone(),
+            true,
+            link.clone(),
+        )));
+        wait(|| link.ready()).await;
+        let st = place_order(
+            "bybit",
+            &venue,
+            Some(&link),
+            7,
+            "BTCUSDT",
+            Side::Buy,
+            0.5,
+            Some(100.0),
+            100.0,
+        )
+        .await
+        .unwrap();
+        assert_eq!((st.id.as_str(), st.status.as_str()), ("B-1", "NEW"));
+        let v = seen.lock().unwrap()[1].clone();
+        assert_eq!(v["args"][0]["orderLinkId"], "hft7");
+        assert_eq!(v["args"][0]["category"], "linear");
+        assert!(v["header"]["X-BAPI-TIMESTAMP"].is_string(), "{v}");
+        // отказ биржи по сокету — ошибка как есть
+        assert!(
+            matches!(venue.cancel_ws(&link, "BTCUSDT", "B-1").await, WsOut::Done(Err(e)) if e.contains("110001"))
+        );
+        // сокет упал — запрос не уходит в сокет (вызывающий идёт в REST)
+        kill.notify_one();
+        wait(|| !link.ready()).await;
+        assert!(matches!(
+            venue
+                .place_ws(&link, 8, "BTCUSDT", Side::Sell, 0.5, None, 100.0)
+                .await,
+            WsOut::NotReady
+        ));
+        assert!(link.fallbacks.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+    }
+
+    #[tokio::test]
+    async fn binance_perp_orders_over_ws_fapi() {
+        let (url, seen, _kill) = mock(|v| {
+            (v["method"] == "order.place").then(|| {
+                json!({"id": v["id"], "status": 200, "result": {"orderId": 55, "status": "FILLED",
+                "executedQty": "0.010", "cumQuote": "1000.5"}})
+            })
+        })
+        .await;
+        crate::util::set_env("BINANCE_WS_FAPI_URL", &url);
+        let venue = Arc::new(Venue::Binance(crate::signed::Client::new_perp(
+            "http://127.0.0.1:9",
+            keys(),
+        )));
+        assert_eq!(venue.trade_socket(), TradeSocket::Own);
+        let link = Arc::new(TradeLink::default());
+        let _t = AbortOnDrop(tokio::spawn(trade_socket(
+            "binance".into(),
+            venue.clone(),
+            true,
+            link.clone(),
+        )));
+        wait(|| link.ready()).await;
+        let st = place_order(
+            "binance",
+            &venue,
+            Some(&link),
+            3,
+            "BTCUSDT",
+            Side::Sell,
+            0.01,
+            None,
+            100000.0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (st.id.as_str(), st.status.as_str(), st.executed, st.quote),
+            ("55", "FILLED", 0.01, 1000.5)
+        );
+        let p = seen.lock().unwrap()[0]["params"].clone();
+        assert_eq!(
+            (
+                p["newClientOrderId"].as_str(),
+                p["type"].as_str(),
+                p["side"].as_str()
+            ),
+            (Some("hft3"), Some("MARKET"), Some("SELL"))
+        );
+        // подпись: параметры без signature по алфавиту
+        let mut kv: Vec<(String, String)> = p
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| *k != "signature")
+            .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_owned()))
+            .collect();
+        kv.sort();
+        let q: Vec<String> = kv.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        assert_eq!(
+            p["signature"].as_str().unwrap(),
+            crate::signed::sign("s", &q.join("&"))
+        );
+    }
+
+    #[test]
+    fn replies_of_shared_sockets() {
+        let okx =
+            crate::okx_api::ws_reply(&json!({"id": "t1", "op": "order", "code": "0", "msg": "",
+            "data": [{"ordId": "777", "clOrdId": "hft1", "sCode": "0", "sMsg": ""}]}))
+            .unwrap();
+        assert_eq!(
+            (okx.0.as_str(), okx.1.unwrap()["ordId"].as_str()),
+            ("t1", Some("777"))
+        );
+        let bad =
+            crate::okx_api::ws_reply(&json!({"id": "t2", "op": "order", "code": "1", "msg": "",
+            "data": [{"sCode": "51008", "sMsg": "Insufficient balance"}]}))
+            .unwrap();
+        assert_eq!(bad.1.unwrap_err(), "OKX 51008: Insufficient balance");
+        assert!(crate::okx_api::ws_reply(&json!({"event": "login", "code": "0"})).is_none());
+        let hl = crate::hyperliquid_api::ws_reply(&json!({"channel": "post", "data": {"id": 4, "response": {"type": "action",
+            "payload": {"status": "ok", "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 9}}]}}}}}})).unwrap();
+        assert_eq!(hl.0, "4");
+        assert_eq!(
+            hl.1.unwrap()["response"]["data"]["statuses"][0]["resting"]["oid"],
+            9
+        );
+        let he = crate::hyperliquid_api::ws_reply(&json!({"channel": "post", "data": {"id": 5, "response": {"type": "error", "payload": "bad nonce"}}})).unwrap();
+        assert_eq!(he.1.unwrap_err(), "Hyperliquid: bad nonce");
+        let bn = crate::signed::ws_reply(&json!({"id": "t9", "status": 400, "error": {"code": -2010, "msg": "insufficient balance"}})).unwrap();
+        assert_eq!(bn.1.unwrap_err(), "Binance -2010: insufficient balance");
     }
 }
