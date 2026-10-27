@@ -206,9 +206,14 @@ pub async fn timed<T>(
     f: impl std::future::Future<Output = Result<T, String>>,
 ) -> Result<T, String> {
     let t = std::time::Instant::now();
-    out(ex, source_of(kind));
+    crate::ratelimit::take(ex, source_of(kind)).await?;
     let r = f.await;
     record(ex, kind, t.elapsed().as_micros() as u64, r.is_ok());
+    if let Err(e) = &r
+        && crate::ratelimit::is_limit_error(e)
+    {
+        crate::ratelimit::hit(ex, e);
+    }
     r
 }
 
@@ -297,6 +302,69 @@ fn calls(o: &mut Out) {
     }
 }
 
+/// Лимиты запросов (как в Java): заполненность вёдер, ответы «слишком часто», свои отказы, ожидание, пауза.
+fn rate_budgets(o: &mut Out) {
+    let ids = crate::ratelimit::exchanges();
+    if ids.is_empty() {
+        return;
+    }
+    let snaps: Vec<(String, Value)> = ids
+        .into_iter()
+        .map(|e| {
+            let s = crate::ratelimit::snapshot(&e);
+            (e, s)
+        })
+        .collect();
+    o.gauge("hft_rate_used_ratio", "Заполненность ведра лимита запросов (1 = исчерпан запас бота, rateLimitSafety от лимита биржи)");
+    for (ex, s) in &snaps {
+        for b in s["buckets"].as_array().into_iter().flatten() {
+            o.line(
+                "hft_rate_used_ratio",
+                &[
+                    ("exchange", ex),
+                    ("bucket", b["name"].as_str().unwrap_or("")),
+                ],
+                f(&b["usedRatio"]),
+            );
+        }
+    }
+    for (name, key, help, counter) in [
+        (
+            "hft_rate_limited_total",
+            "rateLimited",
+            "Ответов биржи о превышении лимита (429/418/403 и коды лимита)",
+            true,
+        ),
+        (
+            "hft_rate_local_rejects_total",
+            "localRejects",
+            "Запросов, не отправленных из-за исчерпанного своего бюджета",
+            true,
+        ),
+        (
+            "hft_rate_waited_ms_total",
+            "waitedMs",
+            "Суммарное ожидание в очереди лимита, мс",
+            true,
+        ),
+        (
+            "hft_rate_blocked_ms",
+            "blockedMs",
+            "Сколько ещё мс запросы к бирже приостановлены",
+            false,
+        ),
+    ] {
+        if counter {
+            o.counter(name, help)
+        } else {
+            o.gauge(name, help)
+        }
+        for (ex, s) in &snaps {
+            o.line(name, &[("exchange", ex)], f(&s[key]));
+        }
+    }
+}
+
 /// Рантайм tokio: рабочие потоки, живые задачи, очередь.
 fn runtime(o: &mut Out) {
     let Ok(h) = tokio::runtime::Handle::try_current() else {
@@ -327,6 +395,7 @@ pub fn render(bot: &Bot) -> String {
     process(&mut o);
     runtime(&mut o);
     calls(&mut o);
+    rate_budgets(&mut o);
     let names = [
         (
             "hft_connected",

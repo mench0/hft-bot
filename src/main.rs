@@ -25,6 +25,7 @@ mod mexc_api;
 mod okx_api;
 mod paper;
 mod perparb;
+mod ratelimit;
 mod rest;
 mod screener;
 mod signed;

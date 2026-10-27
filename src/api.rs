@@ -304,6 +304,7 @@ fn request_stats_json(bot: &Bot) -> Value {
 fn requests_live(bot: &Bot) -> Value {
     let mut ids: std::collections::BTreeSet<String> =
         crate::metrics::rate_exchanges().into_iter().collect();
+    ids.extend(crate::ratelimit::exchanges());
     let active: Vec<String> = if bot.running() {
         bot.snapshot().selection.keys().cloned().collect()
     } else {
@@ -312,11 +313,19 @@ fn requests_live(bot: &Bot) -> Value {
     ids.extend(active.iter().cloned());
     let modes = request_stats_json(bot);
     let mut exs = Map::new();
-    let mut total = 0.0;
+    let (mut total, mut max_used) = (0.0, 0.0f64);
     for id in ids {
         let mut n = crate::metrics::rates_snapshot(&id);
         n["active"] = Value::Bool(active.contains(&id));
-        n["buckets"] = json!([]);
+        let rl = crate::ratelimit::snapshot(&id);
+        for k in ["buckets", "rateLimited", "localRejects", "blockedMs", "ban"] {
+            if let Some(v) = rl.get(k) {
+                n[k] = v.clone();
+            }
+        }
+        for b in rl["buckets"].as_array().into_iter().flatten() {
+            max_used = max_used.max(b["usedRatio"].as_f64().unwrap_or(0.0));
+        }
         if let Some(m) = modes.get(&id) {
             for k in ["mode", "modeTitle", "network"] {
                 n[k] = m[k].clone();
@@ -325,7 +334,7 @@ fn requests_live(bot: &Bot) -> Value {
         total += n["perSec"].as_f64().unwrap_or(0.0);
         exs.insert(id, n);
     }
-    json!({"ts": now_ms(), "exchanges": exs, "perSec": (total * 100.0).round() / 100.0, "maxUsedRatio": 0.0})
+    json!({"ts": now_ms(), "exchanges": exs, "perSec": (total * 100.0).round() / 100.0, "maxUsedRatio": (max_used * 1000.0).round() / 1000.0})
 }
 
 /// Переменные, которые читает бот (как в Java, плюс STATE_FILE Rust-бота): админка, ключи бирж, фразы OKX и KuCoin.
@@ -3471,6 +3480,26 @@ mod tests {
             );
         }
         assert_eq!(b["sources"]["funding"]["title"], "ставки funding");
+        // лимиты Binance по документации: вёдра с долей rateLimitSafety
+        let names: Vec<&str> = b["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|x| x["name"].as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "weight",
+                "raw",
+                "orders10s",
+                "orders1d",
+                "wsMessages",
+                "wsConnects"
+            ],
+            "{q}"
+        );
+        assert_eq!(b["buckets"][0]["capacity"], json!(4800.0));
         // тот же снимок потоком SSE
         let req = axum::http::Request::builder()
             .uri("/requests/stream")

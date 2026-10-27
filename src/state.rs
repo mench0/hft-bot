@@ -339,6 +339,14 @@ impl Bot {
         {
             return Err("Не выбрано ни одной монеты — выберите их в «Торговле»".into());
         }
+        // доля официального лимита запросов бирж — до создания первого бюджета
+        if let Some(s) = self
+            .settings()
+            .get("rateLimitSafety")
+            .and_then(Value::as_f64)
+        {
+            crate::ratelimit::set_safety(s);
+        }
         {
             let mut r = self.running.lock().unwrap();
             if *r {

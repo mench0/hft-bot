@@ -229,7 +229,7 @@ async fn rest_fallback(
             continue;
         }
         for (sym, url) in &urls {
-            crate::metrics::out(&ex, "book_poll");
+            let _ = crate::ratelimit::take(&ex, "book_poll").await;
             let r = match http.get(url).send().await {
                 Ok(r) => r,
                 Err(e) => {
@@ -579,7 +579,7 @@ pub async fn run(market: Arc<Market>, ex: String, d: Arc<dyn Dialect>, tune: Tun
             }
         };
         // зависшее рукопожатие не держит фид вечно
-        crate::metrics::out(&ex, "ws_connect");
+        let _ = crate::ratelimit::take(&ex, "ws_connect").await;
         let conn = match tokio::time::timeout(
             Duration::from_secs(10),
             tokio_tungstenite::connect_async(url),
@@ -602,7 +602,7 @@ pub async fn run(market: Arc<Market>, ex: String, d: Arc<dyn Dialect>, tune: Tun
                 });
                 let mut err = String::new();
                 for m in d.subscribe() {
-                    crate::metrics::out(&ex, "ws_send");
+                    let _ = crate::ratelimit::take(&ex, "ws_send").await;
                     if let Err(e) = ws.send(Message::text(m)).await {
                         err = e.to_string();
                     }
@@ -650,7 +650,7 @@ pub async fn run(market: Arc<Market>, ex: String, d: Arc<dyn Dialect>, tune: Tun
                                 if let Some(t) = t {
                                     market.with_feed(&ex, |f| f.messages += 1); crate::metrics::inbound(&ex, "market");
                                     if let Some(r) = d.reply(&t) {
-                                        crate::metrics::out(&ex, "ws_send"); if let Err(e) = ws.send(Message::text(r)).await { err = e.to_string(); }
+                                        let _ = crate::ratelimit::take(&ex, "ws_send").await; if let Err(e) = ws.send(Message::text(r)).await { err = e.to_string(); }
                                     } else {
                                         parsed = Some(d.parse(&t).map(|u| ups = u));
                                     }
@@ -663,7 +663,7 @@ pub async fn run(market: Arc<Market>, ex: String, d: Arc<dyn Dialect>, tune: Tun
                             None => err = "соединение закрыто".into(),
                         },
                         _ = ping.tick(), if !ping_msg.is_empty() => {
-                            crate::metrics::out(&ex, "ws_send"); if let Err(e) = ws.send(Message::text(ping_msg.clone())).await { err = e.to_string(); }
+                            let _ = crate::ratelimit::take(&ex, "ws_send").await; if let Err(e) = ws.send(Message::text(ping_msg.clone())).await { err = e.to_string(); }
                         }
                         _ = watch.tick() => {
                             if last.elapsed() >= tune.stale {
@@ -745,7 +745,7 @@ async fn rest_loop(
     symbols: Vec<String>,
 ) {
     loop {
-        crate::metrics::out(&ex, "reference");
+        let _ = crate::ratelimit::take(&ex, "reference").await;
         match crate::rest::filters(&base, perp, &symbols).await {
             Ok(f) => {
                 tracing::info!("[{ex}] правила пар получены: {}", f.len());
@@ -761,7 +761,7 @@ async fn rest_loop(
     loop {
         let mut err = String::new();
         for s in &symbols {
-            crate::metrics::out(&ex, "public");
+            let _ = crate::ratelimit::take(&ex, "public").await;
             match crate::rest::minute_volumes(&base, perp, s, 5).await {
                 Ok(v) => market.set_minutes(&ex, s, v),
                 Err(e) => err = format!("свечи {s}: {e}"),
@@ -780,7 +780,7 @@ async fn contract_sizes_loop(
     sizes: okx::ContractSizes,
 ) {
     loop {
-        crate::metrics::out(&ex, "reference");
+        let _ = crate::ratelimit::take(&ex, "reference").await;
         match crate::rest::contract_sizes(&ex, &base).await {
             Ok(m) if !m.is_empty() => {
                 tracing::info!("[{ex}] размеры контрактов получены: {}", m.len());
@@ -800,7 +800,7 @@ async fn contract_sizes_loop(
 async fn funding_loop(market: Arc<Market>, ex: String, base: String, symbols: Vec<String>) {
     loop {
         for s in &symbols {
-            crate::metrics::out(&ex, "funding");
+            let _ = crate::ratelimit::take(&ex, "funding").await;
             match crate::rest::funding(&ex, &base, s).await {
                 Ok(f) => market.set_funding(&ex, s, f),
                 Err(e) => market.with_feed(&ex, |st| st.rest_error = format!("funding {s}: {e}")),

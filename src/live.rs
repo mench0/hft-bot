@@ -1222,7 +1222,7 @@ async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) 
         };
         let mut pings = 0u32;
         // зависшее рукопожатие не держит поток вечно
-        crate::metrics::out(&ex, "ws_connect");
+        let _ = crate::ratelimit::take(&ex, "ws_connect").await;
         let conn = match tokio::time::timeout(Duration::from_secs(10), async {
             match venue.stream_request(&url) {
                 Ok(r) => tokio_tungstenite::connect_async(r).await,
@@ -1258,7 +1258,7 @@ async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) 
                     ready(&acc);
                 }
                 for m in hello.unwrap_or_default() {
-                    crate::metrics::out(&ex, "ws_send");
+                    let _ = crate::ratelimit::take(&ex, "ws_send").await;
                     if let Err(e) = ws.send(Message::text(m)).await {
                         err = e.to_string();
                     }
@@ -1269,7 +1269,7 @@ async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) 
                         _ = ping.tick() => {
                             pings += 1;
                             if let Some(p) = venue.stream_ping() {
-                                crate::metrics::out(&ex, "ws_send");
+                                let _ = crate::ratelimit::take(&ex, "ws_send").await;
                                 err = ws.send(Message::text(p)).await.err().map(|e| e.to_string()).unwrap_or_default();
                             }
                             if pings.is_multiple_of(90)
@@ -1314,14 +1314,14 @@ async fn user_stream(acc: Shared, ex: String, venue: Arc<Venue>, testnet: bool) 
                             }
                             StreamMsg::SendMany(ms) => {
                                 for m in ms {
-                                    crate::metrics::out(&ex, "ws_send");
+                                    let _ = crate::ratelimit::take(&ex, "ws_send").await;
                                     if let Err(e) = ws.send(Message::text(m)).await {
                                         err = e.to_string();
                                     }
                                 }
                             }
                             StreamMsg::Send(m) => {
-                                crate::metrics::out(&ex, "ws_send");
+                                let _ = crate::ratelimit::take(&ex, "ws_send").await;
                                 err = ws
                                     .send(Message::text(m))
                                     .await
