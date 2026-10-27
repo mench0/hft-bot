@@ -199,6 +199,11 @@ pub fn render(bot: &Bot) -> String {
             false,
         ),
         (
+            "hft_feed_realtime",
+            "1 если стакан идёт по WebSocket, 0 — по REST-опросу или нет данных",
+            false,
+        ),
+        (
             "hft_feed_gave_up",
             "1 если источник данных сдался (feedMaxFailures) — торговля на бирже на паузе",
             false,
@@ -283,6 +288,7 @@ pub fn render(bot: &Bot) -> String {
                 .unwrap_or(Value::Null);
             let v = match name {
                 "hft_connected" => b(fd.connected),
+                "hft_feed_realtime" => b(fd.connected && !fd.rest_polling),
                 "hft_feed_gave_up" => b(fd.gave_up),
                 "hft_feed_rest_polling" => b(fd.rest_polling),
                 "hft_trading_enabled" => b(bot
@@ -431,6 +437,32 @@ fn account(o: &mut Out, bot: &Bot, exchanges: &[String]) {
             }
         }
     }
+    o.counter(
+        "hft_ws_messages_in_total",
+        "Входящих сообщений WebSocket от биржи (channel: market — стакан, private — события счёта)",
+    );
+    for ex in exchanges {
+        let fd = bot.market.feed(ex).unwrap_or_default();
+        o.line(
+            "hft_ws_messages_in_total",
+            &[("exchange", ex), ("channel", "market")],
+            fd.messages as f64,
+        );
+        let ev = bot
+            .accounts
+            .lock()
+            .unwrap()
+            .get(ex)
+            .map(|a| a.stats())
+            .and_then(|s| s["событий_счёта"].as_f64());
+        if let Some(e) = ev {
+            o.line(
+                "hft_ws_messages_in_total",
+                &[("exchange", ex), ("channel", "private")],
+                e,
+            );
+        }
+    }
     o.gauge(
         "hft_orphan_positions",
         "Перпы: позиций без стратегии под защитой сторожа",
@@ -454,8 +486,37 @@ fn account(o: &mut Out, bot: &Bot, exchanges: &[String]) {
     }
 }
 
-/// Статарб по биржам.
+/// Стратегии по биржам: включены ли (метка strategy), статарб — позиции, сделки, результат, z-score пар.
 fn strategies(o: &mut Out, bot: &Bot, exchanges: &[String]) {
+    o.gauge(
+        "hft_strategy_enabled",
+        "1 если стратегия включена в параметрах биржи (метка strategy)",
+    );
+    for ex in exchanges {
+        let p = bot.params(ex);
+        let sc = crate::spread::Params::from(&p).enabled;
+        let sa = crate::statarb::Params::from(&p).enabled;
+        o.line(
+            "hft_strategy_enabled",
+            &[("exchange", ex), ("strategy", "spread-capture")],
+            b(sc),
+        );
+        o.line(
+            "hft_strategy_enabled",
+            &[("exchange", ex), ("strategy", "statarb")],
+            b(sa),
+        );
+    }
+    o.gauge("hft_statarb_zscore", "z-score спреда пары статарба");
+    for (ex, pairs) in bot.statarb_zscores(exchanges) {
+        for (pair, z) in pairs {
+            o.line(
+                "hft_statarb_zscore",
+                &[("exchange", &ex), ("pair", &pair)],
+                z,
+            );
+        }
+    }
     let sas = bot.statarb_numbers(exchanges);
     o.gauge(
         "hft_statarb_positions",

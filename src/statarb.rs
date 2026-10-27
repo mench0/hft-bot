@@ -248,6 +248,15 @@ pub struct StatArb {
 }
 
 impl StatArb {
+    /// Пары и текущий z-score (без значения — пропускаются).
+    pub fn zscores(&self) -> Vec<(String, f64)> {
+        self.windows
+            .iter()
+            .filter(|w| w.z.is_finite())
+            .map(|w| (w.name(), w.z))
+            .collect()
+    }
+
     pub fn position_count(&self) -> usize {
         self.positions.len()
     }

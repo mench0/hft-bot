@@ -620,6 +620,15 @@ impl Bot {
         }
     }
 
+    /// z-score пар статарба по биржам.
+    pub fn statarb_zscores(&self, exchanges: &[String]) -> Vec<(String, Vec<(String, f64)>)> {
+        let sas = self.statarbs.lock().unwrap();
+        exchanges
+            .iter()
+            .filter_map(|ex| Some((ex.clone(), sas.get(ex)?.zscores())))
+            .collect()
+    }
+
     /// Статарб по биржам: (позиций, сделок, результат).
     pub fn statarb_numbers(&self, exchanges: &[String]) -> Vec<(String, (usize, u64, f64))> {
         let sas = self.statarbs.lock().unwrap();

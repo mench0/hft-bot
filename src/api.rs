@@ -182,11 +182,14 @@ async fn auth(State(app): State<App>, req: Request, next: Next) -> Response {
     {
         return next.run(req).await;
     }
-    let got = req
-        .headers()
-        .get("x-admin-token")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    // X-Admin-Token или Authorization: Bearer (так шлёт токен Prometheus)
+    let got = {
+        let h = |k: &str| req.headers().get(k).and_then(|v| v.to_str().ok());
+        h("x-admin-token")
+            .or_else(|| h("authorization").and_then(|v| v.strip_prefix("Bearer ")))
+            .unwrap_or("")
+            .to_owned()
+    };
     if got != app.cfg.token {
         return ApiError(
             StatusCode::UNAUTHORIZED,
@@ -730,6 +733,16 @@ mod tests {
         assert_eq!(c, StatusCode::OK);
         assert!(t.contains("# TYPE hft_connected gauge"), "{t}");
         assert_eq!(text(&r, "/status", "").await.0, StatusCode::UNAUTHORIZED);
+        // токен Prometheus — Authorization: Bearer
+        let req = axum::http::Request::builder()
+            .uri("/status")
+            .header("authorization", "Bearer secret")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            r.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
     }
 
     async fn call(r: &Router, method: &str, uri: &str, token: &str) -> (StatusCode, Value) {
