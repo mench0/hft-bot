@@ -512,14 +512,25 @@ impl Client {
             return Err(format!("OKX: сумма {amount} не покрывает комиссию {fee}"));
         }
         self.move_funds(coin, amount, "18", "6").await?;
+        let back = || async {
+            // вывод не прошёл — монета обратно на торговый счёт
+            if let Err(e) = self.move_funds(coin, amount, "6", "18").await {
+                tracing::error!("перевод {amount} {coin} обратно на торговый счёт не удался: {e}");
+            }
+        };
         let to = if tag.is_empty() {
             address.to_owned()
         } else {
             format!("{address}:{tag}")
         };
-        let r = self.call(reqwest::Method::POST, "/api/v5/asset/withdrawal",
-            Some(json!({"ccy": coin, "amt": dec(amt), "dest": "4", "toAddr": to, "chain": chain}))).await?;
-        Ok(r["data"][0]["wdId"].as_str().unwrap_or("").to_owned())
+        match self.call(reqwest::Method::POST, "/api/v5/asset/withdrawal",
+            Some(json!({"ccy": coin, "amt": dec(amt), "dest": "4", "toAddr": to, "chain": chain}))).await {
+            Ok(r) => Ok(r["data"][0]["wdId"].as_str().unwrap_or("").to_owned()),
+            Err(e) => {
+                back().await;
+                Err(e)
+            }
+        }
     }
 
     /// Пришедший депозит — со счёта фондирования на торговый (вся свободная монета); сколько перенесено.

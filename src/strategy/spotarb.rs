@@ -295,7 +295,7 @@ impl SpotArb {
         self.last_check = Some(now);
         let before = self.next;
         self.scan(venues, p, now);
-        if p.rebalance && p.transfer {
+        if p.enabled && p.rebalance && p.transfer {
             self.rebalance(venues, p, now);
         }
         if self.next != before {
@@ -1048,6 +1048,29 @@ mod tests {
         assert!(sa.pnl > 1.5 && sa.pnl < 2.0, "{}", sa.pnl);
         assert!(acc["a"].free("X") < 1e-9);
         assert!((acc["a"].free("USDT") + acc["b"].free("USDT") - 2000.0 - sa.pnl).abs() < 1e-6);
+    }
+
+    #[test]
+    fn no_rebalance_when_spot_arb_disabled() {
+        let mut acc = accounts(0.0);
+        if let Account::Paper(b) = acc.get_mut("b").unwrap() {
+            b.set_balance("USDT", 100.0);
+        }
+        let mut sa = SpotArb::default();
+        let p = params(&[
+            ("spotArbEnabled", json!(false)),
+            ("spotArbRebalance", json!(true)),
+            ("spotArbRebalanceMinQuote", json!(200)),
+        ]);
+        run(
+            &mut acc,
+            &[("a", 10.0, 10.01), ("b", 10.0, 10.01)],
+            &mut sa,
+            &p,
+            Instant::now(),
+        );
+        assert!(sa.stats(&p)["inProgress"].as_array().unwrap().is_empty());
+        assert!((acc["a"].free("USDT") - 1000.0).abs() < 1e-9);
     }
 
     #[test]

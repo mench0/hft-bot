@@ -1131,6 +1131,11 @@ impl Venue {
     }
 }
 
+/// Начало ошибки «исход неизвестен»: ордер не считается отклонённым, его ищут по своему номеру ещё LOST_FOR.
+const LOST: &str = "исход ордера по сокету неизвестен, ";
+/// Сколько искать ордер с неизвестным исходом, прежде чем считать его не дошедшим до биржи.
+const LOST_FOR: Duration = Duration::from_secs(120);
+
 /// Сколько ждать ответа на запрос по сокету ордеров.
 const WS_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1191,9 +1196,7 @@ async fn place_order(
                         Err(e) => last = e,
                     }
                 }
-                return Err(format!(
-                    "исход ордера по сокету неизвестен, по REST не найден: {last}"
-                ));
+                return Err(format!("{LOST}по REST пока не найден: {last}"));
             }
         }
     }
@@ -1258,6 +1261,8 @@ pub async fn worker(
     });
     let mut poll = tokio::time::interval(Duration::from_millis(500));
     let mut n: u64 = 0;
+    // ордера с неизвестным исходом: (свой номер, символ, до какого времени искать)
+    let mut lost: Vec<(u64, String, tokio::time::Instant)> = Vec::new();
     loop {
         tokio::select! {
             cmd = rx.recv() => {
@@ -1280,8 +1285,15 @@ pub async fn worker(
                         let r = place_order(&ex, &client, link.as_deref(), local, &symbol, side, qty, price, ref_px).await;
                         crate::infra::journal::action(&ex, Some(&symbol), &match &r {
                             Ok(st) => format!("биржа приняла ордер #{local} {side:?} {qty}{}: номер {}, {} {}", price.map_or(String::new(), |p| format!(" @ {p}")), st.id, st.status, st.executed),
+                            Err(e) if e.starts_with(LOST) => format!("ордер #{local} {side:?} {qty}: {e}"),
                             Err(e) => format!("биржа отклонила ордер #{local} {side:?} {qty}: {e}"),
                         });
+                        // исход неизвестен — не «отклонён»: ордер мог встать; искать по своему номеру ещё 2 мин
+                        if let Err(e) = &r && e.starts_with(LOST) {
+                            tracing::warn!("[{ex}] ордер #{local} {symbol}: {e} — ищу ещё {} с", LOST_FOR.as_secs());
+                            lost.push((local, symbol.clone(), tokio::time::Instant::now() + LOST_FOR));
+                            continue;
+                        }
                         let cancel_now = with_live(&acc, &ex, |l| match &r {
                             Ok(st) => { l.on_state(local, st); l.wants_cancel(local) }
                             Err(e) => { tracing::warn!("[{ex}] ордер {symbol} отклонён: {e}"); l.on_error(local, e); false }
@@ -1348,6 +1360,29 @@ pub async fn worker(
                         Ok(st) => { with_live(&acc, &ex, |l| l.on_state(local, &st)); }
                         Err(e) => { with_live(&acc, &ex, |l| l.error = e); }
                     }
+                }
+                // ордера с неизвестным исходом — раз в 2 с по своему номеру
+                if n.is_multiple_of(4) && !lost.is_empty() {
+                    let mut keep = Vec::new();
+                    for (local, symbol, until) in std::mem::take(&mut lost) {
+                        match crate::infra::metrics::timed(&ex, "query", client.query_client(&symbol, local)).await {
+                            Ok(st) => {
+                                tracing::warn!("[{ex}] ордер #{local} {symbol} найден: {} {}", st.id, st.status);
+                                crate::infra::journal::action(&ex, Some(&symbol), &format!("ордер #{local} с неизвестным исходом найден: {} {}", st.id, st.status));
+                                let cancel_now = with_live(&acc, &ex, |l| { l.on_state(local, &st); l.wants_cancel(local) }).unwrap_or(false);
+                                if cancel_now {
+                                    cancel(&acc, &ex, &client, link.as_deref(), local).await;
+                                }
+                            }
+                            Err(_) if tokio::time::Instant::now() < until => keep.push((local, symbol, until)),
+                            Err(e) => {
+                                let e = format!("ордер не найден на бирже за {} с после обрыва сокета: {e}", LOST_FOR.as_secs());
+                                tracing::warn!("[{ex}] #{local} {symbol}: {e}");
+                                with_live(&acc, &ex, |l| l.on_error(local, &e));
+                            }
+                        }
+                    }
+                    lost = keep;
                 }
                 if n % 10 == 1 && client.perp() {
                     match crate::infra::metrics::timed(&ex, "positions", client.positions()).await {
@@ -2495,6 +2530,44 @@ mod tests {
         // Binance: рыночному ордеру опорная цена не нужна — запроса нет
         let bn = Venue::Binance(crate::exchange::binance::Client::new(&base, keys()));
         assert!(bn.fresh_top("XUSDT").await.is_none());
+    }
+
+    /// Исход неизвестен и по REST ордер пока не найден — ошибка «исход неизвестен», а не «отклонён» (ордер ищут дальше).
+    #[tokio::test]
+    async fn unknown_outcome_not_found_is_lost_not_rejected() {
+        use axum::{Json, Router, routing::get};
+        let empty =
+            || async { Json(json!({"retCode": 0, "retMsg": "OK", "result": {"list": []}})) };
+        let rest = Router::new()
+            .route("/v5/order/realtime", get(empty))
+            .route("/v5/order/history", get(empty));
+        let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", rl.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(rl, rest).await.unwrap() });
+        let link = Arc::new(TradeLink::default());
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        link.attach(tx);
+        // сокет «принял» запрос и упал — ответа нет
+        let l2 = link.clone();
+        tokio::spawn(async move {
+            let _ = rx.recv().await;
+            l2.detach();
+        });
+        let venue = Venue::Bybit(crate::exchange::bybit::Client::new(&base, keys()));
+        let e = place_order(
+            "bybit",
+            &venue,
+            Some(&link),
+            31,
+            "BTCUSDT",
+            Side::Buy,
+            0.5,
+            Some(100.0),
+            100.0,
+        )
+        .await
+        .unwrap_err();
+        assert!(e.starts_with(LOST), "{e}");
     }
 
     #[test]

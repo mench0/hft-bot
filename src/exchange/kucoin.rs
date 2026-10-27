@@ -699,15 +699,27 @@ impl Client {
         amount: f64,
     ) -> Result<String, String> {
         self.move_funds(coin, amount, "trade", "main").await?;
+        let back = || async {
+            // вывод не прошёл — монета обратно на торговый счёт
+            if let Err(e) = self.move_funds(coin, amount, "main", "trade").await {
+                tracing::error!("перевод {amount} {coin} обратно на торговый счёт не удался: {e}");
+            }
+        };
         let mut b = json!({"currency": coin, "toAddress": address, "amount": dec(amount), "withdrawType": "ADDRESS",
             "chain": chain, "isInner": false, "feeDeductType": "EXTERNAL"});
         if !tag.is_empty() {
             b["memo"] = json!(tag);
         }
-        let d = self
+        match self
             .call(reqwest::Method::POST, "/api/v3/withdrawals", Some(b))
-            .await?;
-        Ok(d["withdrawalId"].as_str().unwrap_or("").to_owned())
+            .await
+        {
+            Ok(d) => Ok(d["withdrawalId"].as_str().unwrap_or("").to_owned()),
+            Err(e) => {
+                back().await;
+                Err(e)
+            }
+        }
     }
 
     /// Пришедший депозит — со счёта фондирования на торговый; сколько перенесено.
