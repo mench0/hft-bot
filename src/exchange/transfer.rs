@@ -1,4 +1,6 @@
-//! Переводы монет между биржами: сети вывода, адрес депозита, вывод (Binance SAPI, Bybit v5 asset).
+//! Переводы монет между биржами: сети вывода, адрес депозита, вывод (Binance SAPI, Bybit v5 asset, OKX asset,
+//! Gate wallet, KuCoin v3). У OKX и KuCoin вывод — со счёта фондирования, депозит приходит туда же: перед выводом
+//! монета переводится с торгового счёта, пришедшая — обратно на торговый (sweep).
 
 use serde_json::Value;
 
@@ -22,11 +24,14 @@ pub fn norm(n: &str) -> String {
         "TRC20" | "TRON" => "TRX",
         "BEP20" | "BSC(BEP20)" | "BNB SMART CHAIN" => "BSC",
         "ERC20" => "ETH",
-        "ARBI" | "ARB" | "ARBITRUM ONE" => "ARBITRUM",
-        "OP" | "OPTIMISM" => "OPTIMISM",
+        "ARBI" | "ARB" | "ARBITRUM ONE" | "ARBEVM" => "ARBITRUM",
+        "OP" | "OPTIMISM" | "OPETH" => "OPTIMISM",
         "POLYGON" | "MATIC" | "POL" => "MATIC",
         "SOLANA" => "SOL",
-        "CAVAX" | "AVAX C-CHAIN" | "AVAXC" => "AVAXC",
+        "CAVAX" | "AVAX C-CHAIN" | "AVAXC" | "AVAX_C" | "AVALANCHE C-CHAIN" | "AVAXC-CHAIN" => {
+            "AVAXC"
+        }
+        "BSC" | "BNB" => "BSC",
         _ => return u,
     }
     .to_owned()
@@ -86,6 +91,73 @@ pub fn bybit_nets(r: &Value) -> Vec<Net> {
         .collect()
 }
 
+/// Сети OKX из /api/v5/asset/currencies (data): chain «USDT-TRC20» — имя после первого «-».
+pub fn okx_nets(data: &Value, coin: &str) -> Vec<Net> {
+    data.as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| c["ccy"] == coin)
+        .map(|c| {
+            let raw = c["chain"].as_str().unwrap_or("");
+            Net {
+                name: norm(raw.split_once('-').map_or(raw, |x| x.1)),
+                raw: raw.to_owned(),
+                withdraw_fee: num(&c["fee"]).max(num(&c["minFee"])),
+                withdraw_min: num(&c["minWd"]),
+                withdraw: c["canWd"] == true,
+                deposit: c["canDep"] == true,
+            }
+        })
+        .collect()
+}
+
+/// Сети Gate: /wallet/currency_chains (открыт ли вывод и депозит) и /wallet/withdraw_status (комиссия по сетям).
+pub fn gate_nets(chains: &Value, status: &Value) -> Vec<Net> {
+    let st = status
+        .as_array()
+        .and_then(|a| a.first())
+        .cloned()
+        .unwrap_or_default();
+    chains
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|c| {
+            let raw = c["chain"].as_str().unwrap_or("");
+            let off = |k: &str| c[k] == 1 || c[k] == "1" || c[k] == true;
+            Net {
+                name: norm(raw),
+                raw: raw.to_owned(),
+                withdraw_fee: num(&st["withdraw_fix_on_chains"][raw]),
+                withdraw_min: num(&st["withdraw_amount_mini"]),
+                withdraw: !off("is_disabled") && !off("is_withdraw_disabled"),
+                deposit: !off("is_disabled") && !off("is_deposit_disabled"),
+            }
+        })
+        .collect()
+}
+
+/// Сети KuCoin из /api/v3/currencies/{монета} (data): имя — chainName, для запросов — chainId.
+pub fn kucoin_nets(d: &Value) -> Vec<Net> {
+    d["chains"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|c| Net {
+            name: norm(c["chainName"].as_str().unwrap_or("")),
+            raw: c["chainId"]
+                .as_str()
+                .or(c["chain"].as_str())
+                .unwrap_or("")
+                .to_owned(),
+            withdraw_fee: num(&c["withdrawalMinFee"]),
+            withdraw_min: num(&c["withdrawalMinSize"]),
+            withdraw: c["isWithdrawEnabled"] == true,
+            deposit: c["isDepositEnabled"] == true,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +185,43 @@ mod tests {
             (n.raw.as_str(), raw, n.withdraw_fee),
             ("ARBI", "ARBITRUM", 0.8)
         );
+    }
+
+    #[test]
+    fn okx_gate_kucoin_networks() {
+        let o = okx_nets(
+            &json!([{"ccy": "USDT", "chain": "USDT-TRC20", "canDep": true, "canWd": true, "fee": "1", "minWd": "2"},
+            {"ccy": "USDT", "chain": "USDT-Arbitrum One", "canDep": true, "canWd": false, "fee": "0.1", "minWd": "1"}]),
+            "USDT",
+        );
+        assert_eq!(
+            (o[0].name.as_str(), o[0].raw.as_str(), o[0].withdraw_fee),
+            ("TRX", "USDT-TRC20", 1.0)
+        );
+        assert_eq!((o[1].name.as_str(), o[1].withdraw), ("ARBITRUM", false));
+        let g = gate_nets(
+            &json!([{"chain": "TRX", "is_disabled": 0, "is_deposit_disabled": 0, "is_withdraw_disabled": 0},
+            {"chain": "ARBEVM", "is_disabled": 0, "is_deposit_disabled": 1, "is_withdraw_disabled": 0}]),
+            &json!([{"currency": "USDT", "withdraw_amount_mini": "1.5", "withdraw_fix_on_chains": {"TRX": "1.2", "ARBEVM": "0.3"}}]),
+        );
+        assert_eq!(
+            (g[0].name.as_str(), g[0].withdraw_fee, g[0].withdraw_min),
+            ("TRX", 1.2, 1.5)
+        );
+        assert_eq!(
+            (g[1].name.as_str(), g[1].deposit, g[1].withdraw),
+            ("ARBITRUM", false, true)
+        );
+        let k = kucoin_nets(
+            &json!({"currency": "USDT", "chains": [{"chainName": "TRC20", "chainId": "trx", "withdrawalMinFee": "1.5",
+            "withdrawalMinSize": "10", "isWithdrawEnabled": true, "isDepositEnabled": true}]}),
+        );
+        assert_eq!((k[0].name.as_str(), k[0].raw.as_str()), ("TRX", "trx"));
+        // Gate → OKX: Arbitrum дешевле (депозит на OKX открыт, вывод с Gate — тоже), у получателя — своё имя сети
+        let (n, raw) = cheapest(&g, &o).unwrap();
+        assert_eq!((n.raw.as_str(), raw), ("ARBEVM", "USDT-Arbitrum One"));
+        // OKX → Gate: вывод по Arbitrum с OKX закрыт, депозит на Gate по нему тоже — TRX
+        let (n, raw) = cheapest(&o, &g).unwrap();
+        assert_eq!((n.raw.as_str(), raw), ("USDT-TRC20", "TRX"));
     }
 }

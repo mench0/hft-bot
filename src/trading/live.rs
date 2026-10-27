@@ -47,6 +47,10 @@ pub enum Cmd {
         symbol: String,
         id: String,
     },
+    /// Перенести пришедший депозит со счёта фондирования на торговый (OKX, KuCoin; у остальных — ничего).
+    Sweep {
+        coin: String,
+    },
     /// Вывести монету (номер перевода — свой).
     Withdraw {
         tid: u64,
@@ -808,14 +812,20 @@ impl Venue {
         match self {
             Venue::Binance(c) => c.networks(coin).await,
             Venue::Bybit(c) => c.networks(coin).await,
-            _ => Err("переводы с этой биржи в Rust-бэкенде не поддерживаются".into()),
+            Venue::Okx(c) if !c.perp => c.networks(coin).await,
+            Venue::Gate(c) if !c.perp => c.networks(coin).await,
+            Venue::Kucoin(c) if !c.perp => c.networks(coin).await,
+            _ => Err("переводы с этой биржи не поддерживаются (есть у Binance, Bybit, OKX, Gate, KuCoin — спот)".into()),
         }
     }
     async fn deposit_address(&self, coin: &str, net: &str) -> Result<(String, String), String> {
         match self {
             Venue::Binance(c) => c.deposit_address(coin, net).await,
             Venue::Bybit(c) => c.deposit_address(coin, net).await,
-            _ => Err("переводы с этой биржи в Rust-бэкенде не поддерживаются".into()),
+            Venue::Okx(c) if !c.perp => c.deposit_address(coin, net).await,
+            Venue::Gate(c) if !c.perp => c.deposit_address(coin, net).await,
+            Venue::Kucoin(c) if !c.perp => c.deposit_address(coin, net).await,
+            _ => Err("переводы с этой биржи не поддерживаются (есть у Binance, Bybit, OKX, Gate, KuCoin — спот)".into()),
         }
     }
     async fn withdraw(
@@ -829,9 +839,21 @@ impl Venue {
         match self {
             Venue::Binance(c) => c.withdraw(coin, net, address, tag, amount).await,
             Venue::Bybit(c) => c.withdraw(coin, net, address, tag, amount).await,
-            _ => Err("переводы с этой биржи в Rust-бэкенде не поддерживаются".into()),
+            Venue::Okx(c) if !c.perp => c.withdraw(coin, net, address, tag, amount).await,
+            Venue::Gate(c) if !c.perp => c.withdraw(coin, net, address, tag, amount).await,
+            Venue::Kucoin(c) if !c.perp => c.withdraw(coin, net, address, tag, amount).await,
+            _ => Err("переводы с этой биржи не поддерживаются (есть у Binance, Bybit, OKX, Gate, KuCoin — спот)".into()),
         }
     }
+    /// Депозит со счёта фондирования — на торговый (OKX, KuCoin); сколько перенесено.
+    async fn sweep(&self, coin: &str) -> Result<f64, String> {
+        match self {
+            Venue::Okx(c) if !c.perp => c.sweep(coin).await,
+            Venue::Kucoin(c) if !c.perp => c.sweep(coin).await,
+            _ => Ok(0.0),
+        }
+    }
+
     async fn balances(&self) -> Result<std::collections::BTreeMap<String, f64>, String> {
         match self {
             Venue::Binance(c) => c.balances().await,
@@ -1244,6 +1266,11 @@ pub async fn worker(
                         let r = crate::infra::metrics::timed(&ex, "transfer", client.deposit_address(&coin, &network)).await;
                         with_live(&acc, &ex, |l| { l.addresses.insert((coin, network), r); });
                     }
+                    Cmd::Sweep { coin } => match crate::infra::metrics::timed(&ex, "transfer", client.sweep(&coin)).await {
+                        Ok(n) if n > 0.0 => tracing::warn!("[{ex}] депозит {n} {coin} перенесён на торговый счёт"),
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!("[{ex}] перенос {coin} на торговый счёт не удался: {e}"),
+                    },
                     Cmd::Withdraw { tid, coin, network, address, tag, amount } => {
                         let r = crate::infra::metrics::timed(&ex, "transfer", client.withdraw(&coin, &network, &address, &tag, amount)).await;
                         match &r {
@@ -2190,6 +2217,187 @@ mod tests {
         .unwrap();
         assert_eq!(st.id, "K1");
         assert_eq!(urls.lock().unwrap().len(), 2, "второе подключение");
+    }
+
+    /// Сокет упал сразу после отправки ордера (ответа нет): ордер не повторяется, а ищется по REST по orderLinkId.
+    #[tokio::test]
+    async fn unknown_outcome_resolved_over_rest_by_client_id() {
+        use axum::{Json, Router, extract::RawQuery, routing::get};
+        let queries = Arc::new(Mutex::new(Vec::<String>::new()));
+        let q2 = queries.clone();
+        let rest = Router::new().route(
+            "/v5/order/realtime",
+            get(move |RawQuery(q): RawQuery| async move {
+                let q = q.unwrap_or_default();
+                q2.lock().unwrap().push(q.clone());
+                Json(json!({"retCode": 0, "retMsg": "OK", "result": {"list": if q.contains("orderLinkId=hft21") {
+                    json!([{"orderId": "B-21", "orderStatus": "Filled", "cumExecQty": "0.5", "cumExecValue": "50"}]) } else { json!([]) }}}))
+            }),
+        );
+        let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", rl.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(rl, rest).await.unwrap() });
+        // торговый сокет: вход — да, на ордер не отвечает и рвёт соединение
+        let (url, seen, kill) =
+            mock(|v| (v["op"] == "auth").then(|| json!({"op": "auth", "retCode": 0}))).await;
+        let s2 = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                if s2.lock().unwrap().iter().any(|v| v["op"] == "order.create") {
+                    kill.notify_one();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        crate::infra::util::set_env("BYBIT_WS_TRADE_URL", &url);
+        let venue = Arc::new(Venue::Bybit(crate::exchange::bybit::Client::new(
+            &base,
+            keys(),
+        )));
+        let link = Arc::new(TradeLink::default());
+        let _t = AbortOnDrop(tokio::spawn(trade_socket(
+            "bybit".into(),
+            venue.clone(),
+            true,
+            link.clone(),
+        )));
+        wait(|| link.ready()).await;
+        let st = place_order(
+            "bybit",
+            &venue,
+            Some(&link),
+            21,
+            "BTCUSDT",
+            Side::Buy,
+            0.5,
+            None,
+            100.0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (st.id.as_str(), st.status.as_str(), st.executed),
+            ("B-21", "FILLED", 0.5)
+        );
+        assert_eq!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|v| v["op"] == "order.create")
+                .count(),
+            1,
+            "ордер не повторён"
+        );
+        assert!(queries.lock().unwrap()[0].contains("orderLinkId=hft21"));
+        assert_eq!(link.unknown.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// Переводы OKX: вывод — перевод с торгового счёта на фондирования, затем вывод суммы за вычетом комиссии;
+    /// пришедший депозит — обратно на торговый. Gate: адрес из multichain_addresses, вывод со спота.
+    #[tokio::test]
+    async fn okx_and_gate_transfers_against_mock() {
+        use axum::{
+            Json, Router,
+            routing::{get, post},
+        };
+        let calls = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let (c1, c2, c3) = (calls.clone(), calls.clone(), calls.clone());
+        let okx = Router::new()
+            .route("/api/v5/asset/currencies", get(|| async { Json(json!({"code": "0", "data": [
+                {"ccy": "USDT", "chain": "USDT-TRC20", "canDep": true, "canWd": true, "fee": "1", "minWd": "2"}]})) }))
+            .route("/api/v5/asset/transfer", post(move |b: String| async move {
+                c1.lock().unwrap().push(("transfer".into(), serde_json::from_str(&b).unwrap()));
+                Json(json!({"code": "0", "data": [{"transId": "1"}]}))
+            }))
+            .route("/api/v5/asset/withdrawal", post(move |b: String| async move {
+                c2.lock().unwrap().push(("withdrawal".into(), serde_json::from_str(&b).unwrap()));
+                Json(json!({"code": "0", "data": [{"wdId": "W9"}]}))
+            }))
+            .route("/api/v5/asset/balances", get(|| async { Json(json!({"code": "0", "data": [{"ccy": "USDT", "availBal": "48.5"}]})) }))
+            .route("/api/v5/asset/deposit-address", get(|| async { Json(json!({"code": "0", "data": [
+                {"chain": "USDT-ERC20", "addr": "0xe"}, {"chain": "USDT-TRC20", "addr": "Tabc", "tag": ""}]})) }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, okx).await.unwrap() });
+        let v = Venue::Okx(crate::exchange::okx::Client::new(
+            &base,
+            keys(),
+            "p".into(),
+            false,
+            true,
+        ));
+        assert_eq!(
+            v.deposit_address("USDT", "USDT-TRC20").await.unwrap().0,
+            "Tabc"
+        );
+        assert_eq!(
+            v.withdraw("USDT", "USDT-TRC20", "Txyz", "", 50.0)
+                .await
+                .unwrap(),
+            "W9"
+        );
+        assert_eq!(v.sweep("USDT").await.unwrap(), 48.5);
+        let c = calls.lock().unwrap().clone();
+        assert_eq!(
+            (
+                c[0].1["from"].as_str(),
+                c[0].1["to"].as_str(),
+                c[0].1["amt"].as_str()
+            ),
+            (Some("18"), Some("6"), Some("50"))
+        );
+        assert_eq!(
+            (
+                c[1].1["amt"].as_str(),
+                c[1].1["toAddr"].as_str(),
+                c[1].1["chain"].as_str()
+            ),
+            (Some("49"), Some("Txyz"), Some("USDT-TRC20"))
+        );
+        assert_eq!(
+            (
+                c[2].1["from"].as_str(),
+                c[2].1["to"].as_str(),
+                c[2].1["amt"].as_str()
+            ),
+            (Some("6"), Some("18"), Some("48.5"))
+        );
+        let gate = Router::new()
+            .route("/api/v4/wallet/currency_chains", get(|| async { Json(json!([{"chain": "TRX", "is_disabled": 0, "is_deposit_disabled": 0, "is_withdraw_disabled": 0}])) }))
+            .route("/api/v4/wallet/withdraw_status", get(|| async { Json(json!([{"currency": "USDT", "withdraw_amount_mini": "1", "withdraw_fix_on_chains": {"TRX": "1"}}])) }))
+            .route("/api/v4/wallet/deposit_address", get(|| async { Json(json!({"currency": "USDT", "multichain_addresses": [
+                {"chain": "TRX", "address": "Tgate", "payment_id": "", "obtain_failed": 0}]})) }))
+            .route("/api/v4/withdrawals", post(move |b: String| async move {
+                c3.lock().unwrap().push(("gate".into(), serde_json::from_str(&b).unwrap()));
+                Json(json!({"id": "g1", "status": "REQUEST"}))
+            }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, gate).await.unwrap() });
+        let g = Venue::Gate(crate::exchange::gate::Client::new(
+            &base,
+            keys(),
+            false,
+            true,
+            &[],
+        ));
+        let n = g.networks("USDT").await.unwrap();
+        assert_eq!((n[0].name.as_str(), n[0].withdraw_fee), ("TRX", 1.0));
+        assert_eq!(g.deposit_address("USDT", "TRX").await.unwrap().0, "Tgate");
+        assert_eq!(
+            g.withdraw("USDT", "TRX", "Tokx", "", 20.0).await.unwrap(),
+            "g1"
+        );
+        let w = calls.lock().unwrap().last().unwrap().1.clone();
+        assert_eq!(
+            (
+                w["chain"].as_str(),
+                w["amount"].as_str(),
+                w["address"].as_str()
+            ),
+            (Some("TRX"), Some("20"), Some("Tokx"))
+        );
     }
 
     #[test]

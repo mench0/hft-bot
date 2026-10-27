@@ -39,6 +39,10 @@ pub struct Params {
     pub live_withdraw: bool,
     pub transfer_timeout: Duration,
     pub max_transfers: usize,
+    /// Выравнивание котируемой валюты между биржами (spotArbRebalance*).
+    pub rebalance: bool,
+    pub rebalance_min_quote: f64,
+    pub rebalance_every: Duration,
 }
 
 impl Params {
@@ -80,6 +84,9 @@ impl Params {
                 f("spotArbTransferTimeoutMinutes", 120.0) * 60.0,
             ),
             max_transfers: f("spotArbMaxTransfers", 3.0) as usize,
+            rebalance: b("spotArbRebalance", false),
+            rebalance_min_quote: f("spotArbRebalanceMinQuote", 200.0),
+            rebalance_every: Duration::from_secs_f64(f("spotArbRebalanceMinutes", 30.0) * 60.0),
         }
     }
 
@@ -145,6 +152,10 @@ struct Round {
     pending: Vec<(String, u64)>,
     started: Instant,
     note: String,
+    /// Перевод котируемой валюты для выравнивания (без покупки и продажи).
+    rebalance: bool,
+    /// Когда последний раз просили перенести депозит на торговый счёт.
+    last_sweep: Option<Instant>,
 }
 
 impl Round {
@@ -183,6 +194,8 @@ pub struct SpotArb {
     pub completed: u64,
     pub failed: u64,
     pub pnl: f64,
+    last_rebalance: Option<Instant>,
+    pub rebalances: u64,
 }
 
 fn pct(x: f64) -> f64 {
@@ -282,6 +295,9 @@ impl SpotArb {
         self.last_check = Some(now);
         let before = self.next;
         self.scan(venues, p, now);
+        if p.rebalance && p.transfer {
+            self.rebalance(venues, p, now);
+        }
         if self.next != before {
             self.progress(venues, p, now); // новый круг — сразу дальше (бумажная покупка уже исполнилась)
         }
@@ -493,6 +509,8 @@ impl SpotArb {
             pending: Vec::new(),
             started: now,
             note: String::new(),
+            rebalance: false,
+            last_sweep: None,
         });
         let v = venues.get_mut(buy).unwrap();
         let book = v.books.get(sym).cloned();
@@ -701,6 +719,17 @@ impl SpotArb {
                     None => venues[&sell].account.free(&coin) >= baseline + r.qty * 0.98,
                 };
                 if !arrived {
+                    // OKX, KuCoin: депозит приходит на счёт фондирования — раз в 10 с переносить на торговый
+                    if eta.is_none()
+                        && r.last_sweep
+                            .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(10))
+                        && let Some(l) = venues.get_mut(&sell).and_then(|v| v.account.live())
+                    {
+                        l.request(Cmd::Sweep { coin: coin.clone() });
+                        if let Some(x) = self.rounds.iter_mut().find(|x| x.id == id) {
+                            x.last_sweep = Some(now);
+                        }
+                    }
                     if eta.is_none() && now.duration_since(since) > p.transfer_timeout {
                         set(
                             self,
@@ -714,6 +743,17 @@ impl SpotArb {
                 }
                 if let Some(paper) = venues.get_mut(&sell).unwrap().account.paper() {
                     paper.deposit(&coin, r.qty, avg);
+                }
+                if r.rebalance {
+                    tracing::info!("[spot-arb] выравнивание: {} {coin} пришли на {sell}", r.qty);
+                    if let Some(x) = self.rounds.iter_mut().find(|x| x.id == id) {
+                        // результат выравнивания — комиссия сети
+                        x.cash = -x.network.as_ref().map_or(0.0, |n| n.2);
+                        x.held.clear();
+                        x.stage = Stage::Done;
+                    }
+                    self.rebalances += 1;
+                    return;
                 }
                 if let Some(x) = self.rounds.iter_mut().find(|x| x.id == id) {
                     *x.held.entry(sell.clone()).or_default() += r.qty;
@@ -756,6 +796,91 @@ impl SpotArb {
         }
     }
 
+    /// Выравнивание котируемой валюты: раз в spotArbRebalanceMinutes, когда других кругов нет, — если у самой богатой
+    /// биржи свободной валюты больше, чем у самой бедной, на spotArbRebalanceMinQuote, половина разницы переводится
+    /// по самой дешёвой общей сети (бумага — условно; биржа — только при spotArbLiveWithdraw).
+    fn rebalance(&mut self, venues: &mut HashMap<String, Venue>, p: &Params, now: Instant) {
+        if !self.rounds.is_empty()
+            || self
+                .last_rebalance
+                .is_some_and(|t| now.duration_since(t) < p.rebalance_every)
+        {
+            return;
+        }
+        let mut quotes: Vec<String> = venues
+            .values()
+            .filter(|v| !v.account.is_perp())
+            .flat_map(|v| {
+                v.books
+                    .keys()
+                    .filter_map(|s| split(s).map(|x| x.1))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        quotes.sort();
+        quotes.dedup();
+        for q in quotes {
+            let mut bal: Vec<(String, f64)> = venues
+                .iter()
+                .filter(|(_, v)| {
+                    !v.account.is_perp()
+                        && v.books.keys().any(|s| split(s).is_some_and(|x| x.1 == q))
+                })
+                .map(|(e, v)| (e.clone(), v.account.free(&q)))
+                .collect();
+            if bal.len() < 2 {
+                continue;
+            }
+            bal.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+            let ((poor, lo), (rich, hi)) = (bal[0].clone(), bal[bal.len() - 1].clone());
+            if hi - lo < p.rebalance_min_quote {
+                continue;
+            }
+            let amount = ((hi - lo) / 2.0).floor();
+            // сеть: пока биржи не ответили — в следующий раз
+            let Some(n) = Self::network(venues, &q, &rich, &poor, 1.0, p) else {
+                continue;
+            };
+            if amount < n.withdraw_min + n.withdraw_fee || n.withdraw_fee > amount * 0.01 {
+                self.last_rebalance = Some(now);
+                tracing::info!(
+                    "[spot-arb] выравнивание {q} {rich}→{poor}: комиссия сети {} — невыгодно",
+                    n.withdraw_fee
+                );
+                return;
+            }
+            self.last_rebalance = Some(now);
+            self.next += 1;
+            let (from, to) = n
+                .raw
+                .split_once('>')
+                .map(|(a, b)| (a.to_owned(), b.to_owned()))
+                .unwrap_or((n.raw.clone(), n.raw.clone()));
+            tracing::warn!(
+                "[spot-arb] выравнивание {q}: {rich} {hi:.2} → {poor} {lo:.2}, перевод {amount} по {from}"
+            );
+            self.rounds.push(Round {
+                id: self.next,
+                coin: q.clone(),
+                symbol: String::new(),
+                sell_ex: poor,
+                buy_ex: rich.clone(),
+                stage: Stage::Address,
+                qty: amount,
+                network: Some((from, to, n.withdraw_fee)),
+                held: HashMap::from([(rich, amount)]),
+                cash: 0.0,
+                pending: Vec::new(),
+                started: now,
+                note: format!("выравнивание {q}"),
+                rebalance: true,
+                last_sweep: None,
+            });
+            return;
+        }
+        self.last_rebalance = Some(now);
+    }
+
     /// Состояние для /arbitrage (spotPrice), как в Java, плюс переводы.
     pub fn stats(&self, p: &Params) -> Value {
         let now = Instant::now();
@@ -793,7 +918,8 @@ impl SpotArb {
             })
             .collect();
         json!({"enabled": p.enabled, "rounds": self.completed, "failed": self.failed, "pnl": self.pnl,
-            "transferMode": p.transfer, "liveWithdraw": p.live_withdraw, "inProgress": rounds, "opportunities": opp})
+            "transferMode": p.transfer, "liveWithdraw": p.live_withdraw, "rebalance": p.rebalance, "rebalances": self.rebalances,
+            "inProgress": rounds, "opportunities": opp})
     }
 }
 
@@ -922,6 +1048,56 @@ mod tests {
         assert!(sa.pnl > 1.5 && sa.pnl < 2.0, "{}", sa.pnl);
         assert!(acc["a"].free("X") < 1e-9);
         assert!((acc["a"].free("USDT") + acc["b"].free("USDT") - 2000.0 - sa.pnl).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rebalance_moves_half_the_quote_gap() {
+        let mut acc = accounts(0.0);
+        if let Account::Paper(b) = acc.get_mut("b").unwrap() {
+            b.set_balance("USDT", 100.0);
+        }
+        let mut sa = SpotArb::default();
+        let p = params(&[
+            ("spotArbRebalance", json!(true)),
+            ("spotArbRebalanceMinQuote", json!(200)),
+        ]);
+        let t0 = Instant::now();
+        // цены одинаковые — арбитража нет; на a 1000 USDT, на b 100 — перевод половины разницы (450) a → b
+        let books = [("a", 10.0, 10.01), ("b", 10.0, 10.01)];
+        run(&mut acc, &books, &mut sa, &p, t0);
+        let st = sa.stats(&p);
+        assert_eq!(st["inProgress"][0]["coin"], json!("USDT"), "{st}");
+        assert_eq!(
+            (
+                st["inProgress"][0]["buy"].as_str(),
+                st["inProgress"][0]["sell"].as_str()
+            ),
+            (Some("a"), Some("b"))
+        );
+        assert!((acc["a"].free("USDT") - 550.0).abs() < 1e-9);
+        // бумажный перевод — 10 мин; комиссия сети 1 USDT
+        run(&mut acc, &books, &mut sa, &p, t0 + Duration::from_secs(601));
+        run(&mut acc, &books, &mut sa, &p, t0 + Duration::from_secs(602));
+        assert_eq!(sa.rebalances, 1, "{}", sa.stats(&p));
+        assert!(
+            (acc["b"].free("USDT") - 549.0).abs() < 1e-9,
+            "{}",
+            acc["b"].free("USDT")
+        );
+        assert!(
+            (sa.pnl + 1.0).abs() < 1e-9,
+            "результат — минус комиссия сети: {}",
+            sa.pnl
+        );
+        // разница теперь 1 — следующего выравнивания нет
+        run(
+            &mut acc,
+            &books,
+            &mut sa,
+            &p,
+            t0 + Duration::from_secs(4000),
+        );
+        assert!(sa.stats(&p)["inProgress"].as_array().unwrap().is_empty());
     }
 
     #[test]

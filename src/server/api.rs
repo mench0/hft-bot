@@ -1602,7 +1602,7 @@ mod tests {
             ("bybit", addrs[1], format!("ws://{}", feeds[1])),
         ] {
             let sel = format!(
-                "/control/select?exchange={exn}&symbols=XUSDT&market=spot&testnet=true&wsUrl={feed}&restUrl=http://{rest}&wsOrders=false&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
+                "/control/select?exchange={exn}&symbols=XUSDT&market=spot&testnet=true&wsUrl={feed}&restUrl=http://{rest}&wsTrade=false&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
             );
             assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
         }
@@ -1858,6 +1858,8 @@ mod tests {
             leverage: Vec<Value>,
             bad: u32,
             pos: f64,
+            rest_orders: u32,
+            ws_orders: u32,
         }
         let ex = Arc::new(Mutex::new(Ex::default()));
         // подпись: время + метод + путь_с_query + тело; ключ, passphrase и демо-заголовок
@@ -1900,6 +1902,7 @@ mod tests {
                 let mut x = e4.lock().unwrap();
                 if !ok(&h, "POST", "/api/v5/trade/order", &body) { x.bad += 1; }
                 let b: Value = serde_json::from_str(&body).unwrap();
+                x.rest_orders += 1;
                 let id = format!("o{}", x.orders.len());
                 let c: f64 = b["sz"].as_str().unwrap().parse().unwrap();
                 x.pos += if b["side"] == "sell" { -c } else { c };
@@ -1939,7 +1942,7 @@ mod tests {
         // приватный поток: проверить login, ответить, принять подписку, слать события
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let login_ok = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let lo = login_ok.clone();
+        let (lo, e6) = (login_ok.clone(), ex.clone());
         let pl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let paddr = pl.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1978,9 +1981,37 @@ mod tests {
             ))
             .await
             .unwrap();
-            while let Some(e) = ev_rx.recv().await {
-                if ws.send(Message::text(e)).await.is_err() {
-                    break;
+            // события из канала; ордера по этому же сокету (op order) — как REST: позиция меняется сразу
+            loop {
+                tokio::select! {
+                    e = ev_rx.recv() => {
+                        let Some(e) = e else { break };
+                        if ws.send(Message::text(e)).await.is_err() {
+                            break;
+                        }
+                    }
+                    m = ws.next() => {
+                        let Some(Ok(Message::Text(t))) = m else { break };
+                        if t.as_str() == "ping" {
+                            continue;
+                        }
+                        let v: Value = serde_json::from_str(&t).unwrap();
+                        if v["op"] != "order" {
+                            continue;
+                        }
+                        let o = v["args"][0].clone();
+                        let id = {
+                            let mut x = e6.lock().unwrap();
+                            x.ws_orders += 1;
+                            let c: f64 = o["sz"].as_str().unwrap().parse().unwrap();
+                            x.pos += if o["side"] == "sell" { -c } else { c };
+                            x.orders.push(o.clone());
+                            format!("o{}", x.orders.len() - 1)
+                        };
+                        let r = json!({"id": v["id"], "op": "order", "code": "0", "msg": "",
+                            "data": [{"ordId": id, "clOrdId": o["clOrdId"], "sCode": "0", "sMsg": ""}]});
+                        let _ = ws.send(Message::text(r.to_string())).await;
+                    }
                 }
             }
             // порт держится до конца теста: иначе его получит мок другого теста, а переподключение этого бота попадёт туда
@@ -1995,7 +2026,7 @@ mod tests {
         crate::infra::util::set_env("OKX_TESTNET_PASSPHRASE", "pass");
         let (_d, r) = app("");
         let sel = format!(
-            "/control/select?exchange=okx&symbols=BTCUSDT&market=perp&leverage=3&testnet=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&wsOrders=false&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
+            "/control/select?exchange=okx&symbols=BTCUSDT&market=perp&leverage=3&testnet=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
         );
         assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
         call(&r, "POST", "/control/start", "").await;
@@ -2042,6 +2073,11 @@ mod tests {
         {
             let x = ex.lock().unwrap();
             assert_eq!(x.orders[0]["sz"], json!("50"), "объём в контрактах");
+            assert_eq!(
+                (x.ws_orders, x.rest_orders),
+                (1, 0),
+                "ордер — по приватному сокету"
+            );
             assert_eq!(
                 (
                     x.orders[0]["tdMode"].as_str(),
@@ -2462,7 +2498,7 @@ mod tests {
         crate::infra::util::set_env("KUCOIN_PASSPHRASE", "kc-pass");
         let (_d, r) = app("");
         let sel = format!(
-            "/control/select?exchange=kucoin&symbols=XUSDT&market=spot&live=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&wsOrders=false&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
+            "/control/select?exchange=kucoin&symbols=XUSDT&market=spot&live=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&wsTrade=false&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
         );
         assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
         call(&r, "POST", "/control/start", "").await;
@@ -3174,10 +3210,40 @@ mod tests {
             actions: Vec<Value>,
             bad: u32,
             pos: f64,
+            ws_orders: u32,
         }
         let ex = Arc::new(Mutex::new(Ex::default()));
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let (e1, e2) = (ex.clone(), ex.clone());
+        // подписанное действие (тело /exchange или payload запроса post по сокету) → ответ биржи
+        fn exchange(
+            x: &mut Ex,
+            b: &Value,
+            ev: &tokio::sync::mpsc::UnboundedSender<String>,
+        ) -> Value {
+            // подпись детерминирована (RFC 6979): та же, что посчитает биржа для этого действия и nonce
+            let w = crate::exchange::evm::Wallet::from_hex(AGENT).unwrap();
+            let want = crate::exchange::hyperliquid::sign_action(
+                &w,
+                &b["action"],
+                b["nonce"].as_u64().unwrap(),
+                false,
+            );
+            if want != b["signature"] {
+                x.bad += 1;
+            }
+            x.actions.push(b["action"].clone());
+            if b["action"]["type"] == "order" {
+                let o = &b["action"]["orders"][0];
+                let q: f64 = o["s"].as_str().unwrap().parse().unwrap();
+                x.pos += if o["b"] == true { q } else { -q };
+                let _ = ev.send(json!({"channel": "orderUpdates", "data": [{"status": "filled",
+                    "order": {"oid": 9, "coin": "BTC", "cloid": o["c"], "origSz": o["s"], "sz": "0", "limitPx": o["p"]}}]}).to_string());
+                // IOC исполняется сразу: биржа отвечает объёмом и средней ценой
+                return json!({"status": "ok", "response": {"type": "order", "data": {"statuses": [{"filled": {"oid": 9, "totalSz": o["s"], "avgPx": "99.9"}}]}}});
+            }
+            json!({"status": "ok", "response": {"type": "default"}})
+        }
+        let (e1, e2, e3, ev2) = (ex.clone(), ex.clone(), ex.clone(), ev_tx.clone());
         let rest = Router::new()
             .route("/info", axum::routing::post(move |Json(b): Json<Value>| async move {
                 let x = e1.lock().unwrap();
@@ -3192,24 +3258,7 @@ mod tests {
                 })
             }))
             .route("/exchange", axum::routing::post(move |Json(b): Json<Value>| async move {
-                let mut x = e2.lock().unwrap();
-                // подпись детерминирована (RFC 6979): та же, что посчитает биржа для этого действия и nonce
-                let w = crate::exchange::evm::Wallet::from_hex(AGENT).unwrap();
-                let want = crate::exchange::hyperliquid::sign_action(&w, &b["action"], b["nonce"].as_u64().unwrap(), false);
-                if want != b["signature"] {
-                    x.bad += 1;
-                }
-                x.actions.push(b["action"].clone());
-                if b["action"]["type"] == "order" {
-                    let o = &b["action"]["orders"][0];
-                    let q: f64 = o["s"].as_str().unwrap().parse().unwrap();
-                    x.pos += if o["b"] == true { q } else { -q };
-                    let _ = ev_tx.send(json!({"channel": "orderUpdates", "data": [{"status": "filled",
-                        "order": {"oid": 9, "coin": "BTC", "cloid": o["c"], "origSz": o["s"], "sz": "0", "limitPx": o["p"]}}]}).to_string());
-                    // IOC исполняется сразу: биржа отвечает объёмом и средней ценой
-                    return Json(json!({"status": "ok", "response": {"type": "order", "data": {"statuses": [{"filled": {"oid": 9, "totalSz": o["s"], "avgPx": "99.9"}}]}}}));
-                }
-                Json(json!({"status": "ok", "response": {"type": "default"}}))
+                Json(exchange(&mut e2.lock().unwrap(), &b, &ev_tx))
             }));
         let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let raddr = rl.local_addr().unwrap();
@@ -3249,9 +3298,29 @@ mod tests {
             ))
             .await
             .unwrap();
-            while let Some(e) = ev_rx.recv().await {
-                if ws.send(Message::text(e)).await.is_err() {
-                    break;
+            // события из канала; ордера по этому же сокету: post с подписанным действием → ответ channel post
+            loop {
+                tokio::select! {
+                    e = ev_rx.recv() => {
+                        let Some(e) = e else { break };
+                        if ws.send(Message::text(e)).await.is_err() {
+                            break;
+                        }
+                    }
+                    m = ws.next() => {
+                        let Some(Ok(Message::Text(t))) = m else { break };
+                        let v: Value = serde_json::from_str(&t).unwrap();
+                        if v["method"] != "post" {
+                            continue;
+                        }
+                        let r = {
+                            let mut x = e3.lock().unwrap();
+                            x.ws_orders += 1;
+                            exchange(&mut x, &v["request"]["payload"], &ev2)
+                        };
+                        let reply = json!({"channel": "post", "data": {"id": v["id"], "response": {"type": "action", "payload": r}}});
+                        let _ = ws.send(Message::text(reply.to_string())).await;
+                    }
                 }
             }
             loop {
@@ -3263,7 +3332,7 @@ mod tests {
         crate::infra::util::set_env("HYPERLIQUID_TESTNET_API_SECRET", AGENT);
         let (_d, r) = app("");
         let sel = format!(
-            "/control/select?exchange=hyperliquid&symbols=BTCUSDC&market=perp&leverage=3&testnet=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&wsOrders=false&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
+            "/control/select?exchange=hyperliquid&symbols=BTCUSDC&market=perp&leverage=3&testnet=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&spreadCaptureEnabled=false&statArbEnabled=false&maxPositionQuote=1000"
         );
         assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
         call(&r, "POST", "/control/start", "").await;
@@ -3305,6 +3374,7 @@ mod tests {
         }
         let x = ex.lock().unwrap();
         assert_eq!(x.bad, 0, "подписи не сошлись");
+        assert_eq!(x.ws_orders, 1, "ордер — по сокету (method post)");
         assert_eq!(
             x.actions[0],
             json!({"type": "updateLeverage", "asset": 1, "isCross": true, "leverage": 3})
@@ -3897,7 +3967,7 @@ mod tests {
         crate::infra::util::set_env("BINANCE_TESTNET_API_SECRET", SECRET);
         let (_d, r) = app("");
         let sel = format!(
-            "/control/select?exchange=binance&symbols=BTCUSDT&market=perp&leverage=5&testnet=true&wsUrl=ws://{waddr}/stream&restUrl=http://{raddr}&wsOrders=false&spreadCaptureEnabled=false&maxPositionQuote=1000&exchangeStopLossPercent=2.04"
+            "/control/select?exchange=binance&symbols=BTCUSDT&market=perp&leverage=5&testnet=true&wsUrl=ws://{waddr}/stream&restUrl=http://{raddr}&wsTrade=false&spreadCaptureEnabled=false&maxPositionQuote=1000&exchangeStopLossPercent=2.04"
         );
         assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
         call(&r, "POST", "/control/start", "").await;
@@ -4157,7 +4227,7 @@ mod tests {
         crate::infra::util::set_env("BYBIT_TESTNET_API_SECRET", SECRET);
         let (_d, r) = app("");
         let sel = format!(
-            "/control/select?exchange=bybit&symbols=BTCUSDT&market=spot&testnet=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&wsOrders=false&spreadCaptureEnabled=false&maxPositionQuote=1000"
+            "/control/select?exchange=bybit&symbols=BTCUSDT&market=spot&testnet=true&wsUrl=ws://{waddr}&restUrl=http://{raddr}&wsTrade=false&spreadCaptureEnabled=false&maxPositionQuote=1000"
         );
         assert_eq!(call(&r, "POST", &sel, "").await.0, StatusCode::OK);
         call(&r, "POST", "/control/start", "").await;

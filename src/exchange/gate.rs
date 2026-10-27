@@ -647,6 +647,72 @@ impl Client {
     }
 }
 
+impl Client {
+    /// Сети монеты: открыт ли вывод и депозит (публичный запрос) и комиссии по сетям.
+    pub async fn networks(
+        &self,
+        coin: &str,
+    ) -> Result<Vec<crate::exchange::transfer::Net>, String> {
+        let q = format!("currency={coin}");
+        let chains = self
+            .call(reqwest::Method::GET, "/wallet/currency_chains", &q, None)
+            .await?;
+        let status = self
+            .call(reqwest::Method::GET, "/wallet/withdraw_status", &q, None)
+            .await?;
+        Ok(crate::exchange::transfer::gate_nets(&chains, &status))
+    }
+
+    /// Адрес депозита монеты в сети (адрес, тег).
+    pub async fn deposit_address(
+        &self,
+        coin: &str,
+        chain: &str,
+    ) -> Result<(String, String), String> {
+        let r = self
+            .call(
+                reqwest::Method::GET,
+                "/wallet/deposit_address",
+                &format!("currency={coin}"),
+                None,
+            )
+            .await?;
+        let a = r["multichain_addresses"]
+            .as_array()
+            .and_then(|a| {
+                a.iter()
+                    .find(|x| x["chain"] == chain && x["obtain_failed"] != 1)
+            })
+            .ok_or_else(|| format!("Gate: нет адреса {coin} в сети {chain}"))?;
+        Ok((
+            a["address"].as_str().unwrap_or("").to_owned(),
+            a["payment_id"].as_str().unwrap_or("").to_owned(),
+        ))
+    }
+
+    /// Вывод со спот-счёта; номер вывода.
+    pub async fn withdraw(
+        &self,
+        coin: &str,
+        chain: &str,
+        address: &str,
+        tag: &str,
+        amount: f64,
+    ) -> Result<String, String> {
+        let mut b =
+            json!({"currency": coin, "address": address, "amount": dec(amount), "chain": chain});
+        if !tag.is_empty() {
+            b["memo"] = json!(tag);
+        }
+        let r = self
+            .call(reqwest::Method::POST, "/withdrawals", "", Some(b))
+            .await?;
+        Ok(r["id"]
+            .as_str()
+            .map_or_else(|| r["id"].to_string(), str::to_owned))
+    }
+}
+
 /// Ответ WS API на ордер или отмену: (req_id, result или ошибка «Gate метка: текст»); подтверждения ack — None.
 pub fn ws_reply(v: &Value) -> Option<(String, Result<Value, String>)> {
     if v.get("header").is_none() || v["ack"] == true {

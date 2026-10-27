@@ -433,6 +433,118 @@ impl Client {
     }
 }
 
+impl Client {
+    /// Сети монеты (вывод и депозит).
+    pub async fn networks(
+        &self,
+        coin: &str,
+    ) -> Result<Vec<crate::exchange::transfer::Net>, String> {
+        let r = self
+            .call(
+                reqwest::Method::GET,
+                &format!("/api/v5/asset/currencies?ccy={coin}"),
+                None,
+            )
+            .await?;
+        Ok(crate::exchange::transfer::okx_nets(&r["data"], coin))
+    }
+
+    /// Адрес депозита монеты в сети (адрес, тег).
+    pub async fn deposit_address(
+        &self,
+        coin: &str,
+        chain: &str,
+    ) -> Result<(String, String), String> {
+        let r = self
+            .call(
+                reqwest::Method::GET,
+                &format!("/api/v5/asset/deposit-address?ccy={coin}"),
+                None,
+            )
+            .await?;
+        let a = r["data"]
+            .as_array()
+            .and_then(|a| a.iter().find(|x| x["chain"] == chain))
+            .ok_or_else(|| format!("OKX: нет адреса {coin} в сети {chain}"))?;
+        let tag = a["tag"]
+            .as_str()
+            .or(a["memo"].as_str())
+            .or(a["pmtId"].as_str())
+            .unwrap_or("");
+        Ok((a["addr"].as_str().unwrap_or("").to_owned(), tag.to_owned()))
+    }
+
+    /// Перевод между своими счетами: 18 — торговый, 6 — фондирования.
+    async fn move_funds(
+        &self,
+        coin: &str,
+        amount: f64,
+        from: &str,
+        to: &str,
+    ) -> Result<(), String> {
+        self.call(
+            reqwest::Method::POST,
+            "/api/v5/asset/transfer",
+            Some(json!({"ccy": coin, "amt": dec(amount), "from": from, "to": to, "type": "0"})),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Вывод: amount — сколько списать всего, получатель получит amount − комиссия (как у Binance). OKX берёт
+    /// комиссию сверху и выводит со счёта фондирования — сначала перевод туда с торгового.
+    pub async fn withdraw(
+        &self,
+        coin: &str,
+        chain: &str,
+        address: &str,
+        tag: &str,
+        amount: f64,
+    ) -> Result<String, String> {
+        let fee = self
+            .networks(coin)
+            .await?
+            .into_iter()
+            .find(|n| n.raw == chain)
+            .map_or(0.0, |n| n.withdraw_fee);
+        let amt = amount - fee;
+        if amt <= 0.0 {
+            return Err(format!("OKX: сумма {amount} не покрывает комиссию {fee}"));
+        }
+        self.move_funds(coin, amount, "18", "6").await?;
+        let to = if tag.is_empty() {
+            address.to_owned()
+        } else {
+            format!("{address}:{tag}")
+        };
+        let r = self.call(reqwest::Method::POST, "/api/v5/asset/withdrawal",
+            Some(json!({"ccy": coin, "amt": dec(amt), "dest": "4", "toAddr": to, "chain": chain}))).await?;
+        Ok(r["data"][0]["wdId"].as_str().unwrap_or("").to_owned())
+    }
+
+    /// Пришедший депозит — со счёта фондирования на торговый (вся свободная монета); сколько перенесено.
+    pub async fn sweep(&self, coin: &str) -> Result<f64, String> {
+        let r = self
+            .call(
+                reqwest::Method::GET,
+                &format!("/api/v5/asset/balances?ccy={coin}"),
+                None,
+            )
+            .await?;
+        let free: f64 = r["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|b| b["ccy"] == coin)
+            .filter_map(|b| b["availBal"].as_str()?.parse::<f64>().ok())
+            .sum();
+        if free > 0.0 {
+            self.move_funds(coin, free, "6", "18").await?;
+        }
+        Ok(free)
+    }
+}
+
 /// Ответ на ордер или отмену по сокету: (id, первая запись data или ошибка «OKX код: текст»).
 pub fn ws_reply(v: &Value) -> Option<(String, Result<Value, String>)> {
     if !matches!(v["op"].as_str(), Some("order" | "cancel-order")) {

@@ -487,6 +487,25 @@
    "restart": false,
    "help": "Сколько переводов может идти одновременно"
   },
+  "spotArbRebalance": {
+   "default": "false",
+   "restart": false,
+   "help": "Выравнивать котируемую валюту (USDT и т. п.) между биржами спот-арбитража: раз в spotArbRebalanceMinutes, когда кругов нет, половина разницы между самой богатой и самой бедной биржей переводится по самой дешёвой общей сети (комиссия сети ≤ 1% суммы). На бирже — только при spotArbLiveWithdraw"
+  },
+  "spotArbRebalanceMinQuote": {
+   "default": "200",
+   "min": 1.0,
+   "max": 1000000.0,
+   "restart": false,
+   "help": "С какой разницы свободной котируемой валюты между биржами выравнивать"
+  },
+  "spotArbRebalanceMinutes": {
+   "default": "30",
+   "min": 1.0,
+   "max": 1440.0,
+   "restart": false,
+   "help": "Как часто проверять, нужно ли выравнивание, мин"
+  },
   "leadLagEnabled": {
    "default": "true",
    "restart": false,

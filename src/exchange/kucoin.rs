@@ -41,6 +41,9 @@ pub struct Client {
     /// Исполнения из потока по номеру ордера: (объём, сумма) — для средней цены.
     fills: Mutex<HashMap<String, (f64, f64)>>,
     http: reqwest::Client,
+    /// Счёт в режиме UTA (единый торговый счёт, KUCOIN_UTA=true): спот по сокету — uta.order / uta.cancel с
+    /// tradeType=SPOT (как в Java; схема аргументов взята из документации, полностью не сверена).
+    pub uta: bool,
 }
 
 impl Client {
@@ -57,6 +60,8 @@ impl Client {
                 .timeout(Duration::from_secs(10))
                 .build()
                 .expect("HTTP-клиент"),
+            uta: crate::infra::util::env("KUCOIN_UTA")
+                .is_ok_and(|v| v.trim().eq_ignore_ascii_case("true")),
         }
     }
 
@@ -287,24 +292,29 @@ impl Client {
         qty: f64,
         price: Option<f64>,
     ) -> Result<String, String> {
+        let mut b = self.order_body(local, symbol, side, qty, price)?;
         let op = if self.perp {
             "futures.order"
+        } else if self.uta {
+            b["tradeType"] = json!("SPOT");
+            "uta.order"
         } else {
             "spot.order"
         };
-        Ok(
-            json!({"id": id, "op": op, "args": self.order_body(local, symbol, side, qty, price)?})
-                .to_string(),
-        )
+        Ok(json!({"id": id, "op": op, "args": b}).to_string())
     }
 
     pub fn ws_cancel(&self, id: &str, symbol: &str, order_id: &str) -> String {
+        let mut a = json!({"orderId": order_id, "symbol": self.instrument(symbol)});
         let op = if self.perp {
             "futures.cancel"
+        } else if self.uta {
+            a["tradeType"] = json!("SPOT");
+            "uta.cancel"
         } else {
             "spot.cancel"
         };
-        json!({"id": id, "op": op, "args": {"orderId": order_id, "symbol": self.instrument(symbol)}}).to_string()
+        json!({"id": id, "op": op, "args": a}).to_string()
     }
 
     /// Адрес торгового сокета с подписью в параметрах; KUCOIN_WS_TRADE_URL — свой адрес.
@@ -620,6 +630,108 @@ impl Client {
     }
 }
 
+impl Client {
+    /// Сети монеты (вывод и депозит).
+    pub async fn networks(
+        &self,
+        coin: &str,
+    ) -> Result<Vec<crate::exchange::transfer::Net>, String> {
+        let d = self
+            .call(
+                reqwest::Method::GET,
+                &format!("/api/v3/currencies/{coin}"),
+                None,
+            )
+            .await?;
+        Ok(crate::exchange::transfer::kucoin_nets(&d))
+    }
+
+    /// Адрес депозита монеты в сети (адрес, тег); адреса ещё нет — создаётся.
+    pub async fn deposit_address(
+        &self,
+        coin: &str,
+        chain: &str,
+    ) -> Result<(String, String), String> {
+        let d = self
+            .call(
+                reqwest::Method::GET,
+                &format!("/api/v3/deposit-addresses?currency={coin}&chain={chain}"),
+                None,
+            )
+            .await?;
+        let a = match d.as_array().and_then(|a| a.first()).cloned() {
+            Some(a) => a,
+            None => {
+                self.call(
+                    reqwest::Method::POST,
+                    "/api/v3/deposit-address/create",
+                    Some(json!({"currency": coin, "chain": chain})),
+                )
+                .await?
+            }
+        };
+        let addr = a["address"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("KuCoin: нет адреса {coin} в сети {chain}"))?;
+        Ok((addr.to_owned(), a["memo"].as_str().unwrap_or("").to_owned()))
+    }
+
+    /// Перевод между своими счетами (trade — торговый, main — фондирования).
+    async fn move_funds(
+        &self,
+        coin: &str,
+        amount: f64,
+        from: &str,
+        to: &str,
+    ) -> Result<(), String> {
+        self.call(reqwest::Method::POST, "/api/v2/accounts/inner-transfer",
+            Some(json!({"clientOid": format!("hft{}", now_ms()), "currency": coin, "from": from, "to": to, "amount": dec(amount)}))).await.map(|_| ())
+    }
+
+    /// Вывод: со счёта фондирования (сначала перевод туда с торгового); комиссия — из суммы (EXTERNAL), как у Binance.
+    pub async fn withdraw(
+        &self,
+        coin: &str,
+        chain: &str,
+        address: &str,
+        tag: &str,
+        amount: f64,
+    ) -> Result<String, String> {
+        self.move_funds(coin, amount, "trade", "main").await?;
+        let mut b = json!({"currency": coin, "toAddress": address, "amount": dec(amount), "withdrawType": "ADDRESS",
+            "chain": chain, "isInner": false, "feeDeductType": "EXTERNAL"});
+        if !tag.is_empty() {
+            b["memo"] = json!(tag);
+        }
+        let d = self
+            .call(reqwest::Method::POST, "/api/v3/withdrawals", Some(b))
+            .await?;
+        Ok(d["withdrawalId"].as_str().unwrap_or("").to_owned())
+    }
+
+    /// Пришедший депозит — со счёта фондирования на торговый; сколько перенесено.
+    pub async fn sweep(&self, coin: &str) -> Result<f64, String> {
+        let d = self
+            .call(
+                reqwest::Method::GET,
+                &format!("/api/v1/accounts?currency={coin}&type=main"),
+                None,
+            )
+            .await?;
+        let free: f64 = d
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|a| a["available"].as_str()?.parse::<f64>().ok())
+            .sum();
+        if free > 0.0 {
+            self.move_funds(coin, free, "main", "trade").await?;
+        }
+        Ok(free)
+    }
+}
+
 /// Ответ торгового сокета: (id, data или ошибка «KuCoin код: текст»); пинги и служебные — None.
 pub fn ws_reply(v: &Value) -> Option<(String, Result<Value, String>)> {
     let id = v["id"]
@@ -643,6 +755,47 @@ pub fn ws_reply(v: &Value) -> Option<(String, Result<Value, String>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uta_orders_over_socket() {
+        let mut c = Client::new(
+            "http://x",
+            Keys {
+                key: "k".into(),
+                secret: "s".into(),
+            },
+            "p".into(),
+            false,
+        );
+        let v: Value = serde_json::from_str(
+            &c.ws_place("k1", 5, "BTCUSDT", Side::Buy, 0.1, Some(100.0))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            (v["op"].as_str(), v["args"].get("tradeType")),
+            (Some("spot.order"), None)
+        );
+        c.uta = true;
+        let v: Value = serde_json::from_str(
+            &c.ws_place("k2", 5, "BTCUSDT", Side::Buy, 0.1, Some(100.0))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            (v["op"].as_str(), v["args"]["tradeType"].as_str()),
+            (Some("uta.order"), Some("SPOT"))
+        );
+        let v: Value = serde_json::from_str(&c.ws_cancel("k3", "BTCUSDT", "o1")).unwrap();
+        assert_eq!(
+            (
+                v["op"].as_str(),
+                v["args"]["tradeType"].as_str(),
+                v["args"]["symbol"].as_str()
+            ),
+            (Some("uta.cancel"), Some("SPOT"), Some("BTC-USDT"))
+        );
+    }
 
     fn client(perp: bool) -> Client {
         Client::new(

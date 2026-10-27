@@ -354,7 +354,6 @@ impl Client {
         Ok(r["id"].as_str().unwrap_or("").to_owned())
     }
 
-    /// Вход в приватный поток.
     /// Ордер по торговому сокету /v5/trade.
     pub fn ws_place(
         &self,
