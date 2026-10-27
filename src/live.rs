@@ -843,13 +843,15 @@ pub async fn worker(
     symbols: Vec<String>,
     leverage: Option<f64>,
 ) {
-    if let Err(e) = client.sync_time().await {
+    if let Err(e) = crate::metrics::timed(&ex, "time", client.sync_time()).await {
         tracing::warn!("[{ex}] время сервера не получено: {e}");
     }
     // перпы: плечо на бирже — как в параметрах
     if let Some(lev) = leverage {
         for s in &symbols {
-            if let Err(e) = client.set_leverage(s, lev).await {
+            if let Err(e) =
+                crate::metrics::timed(&ex, "leverage", client.set_leverage(s, lev)).await
+            {
                 tracing::warn!("[{ex}] плечо {lev} для {s} не выставлено: {e}");
                 with_live(&acc, &ex, |l| l.error = format!("плечо {s}: {e}"));
             }
@@ -873,7 +875,7 @@ pub async fn worker(
                 let Some(cmd) = cmd else { return };
                 match cmd {
                     Cmd::Place { local, symbol, side, qty, price, ref_px } => {
-                        let r = client.place(local, &symbol, side, qty, price, ref_px).await;
+                        let r = crate::metrics::timed(&ex, "order", client.place(local, &symbol, side, qty, price, ref_px)).await;
                         let cancel_now = with_live(&acc, &ex, |l| match &r {
                             Ok(st) => { l.on_state(local, st); l.wants_cancel(local) }
                             Err(e) => { tracing::warn!("[{ex}] ордер {symbol} отклонён: {e}"); l.on_error(local, e); false }
@@ -884,7 +886,7 @@ pub async fn worker(
                     }
                     Cmd::Cancel { local } => cancel(&acc, &ex, &client, local).await,
                     Cmd::PlaceStop { symbol, side, qty, price, old } => {
-                        let r = client.place_stop(&symbol, side, qty, price).await;
+                        let r = crate::metrics::timed(&ex, "stop", client.place_stop(&symbol, side, qty, price)).await;
                         match &r {
                             Ok(Some(id)) => tracing::warn!("[{ex}] стоп на бирже {symbol} {side:?} {qty} @ {price} (id {id})"),
                             Ok(None) => {}
@@ -893,26 +895,26 @@ pub async fn worker(
                         // старый снимается только после нового (у Bybit стоп позиции один — id тот же)
                         if let (Ok(Some(id)), Some(o)) = (&r, &old)
                             && id != o
-                            && let Err(e) = client.cancel_stop(&symbol, o).await
+                            && let Err(e) = crate::metrics::timed(&ex, "stop_cancel", client.cancel_stop(&symbol, o)).await
                         {
                             tracing::warn!("[{ex}] стоп {o} по {symbol} не снят: {e}");
                         }
                         with_live(&acc, &ex, |l| l.stop_placed(&symbol, &r, old));
                     }
-                    Cmd::CancelStop { symbol, id } => match client.cancel_stop(&symbol, &id).await {
+                    Cmd::CancelStop { symbol, id } => match crate::metrics::timed(&ex, "stop_cancel", client.cancel_stop(&symbol, &id)).await {
                         Ok(()) => tracing::info!("[{ex}] стоп {id} по {symbol} снят"),
                         Err(e) => tracing::warn!("[{ex}] стоп {id} по {symbol} не снят (возможно, сработал): {e}"),
                     },
                     Cmd::Networks { coin } => {
-                        let r = client.networks(&coin).await;
+                        let r = crate::metrics::timed(&ex, "transfer", client.networks(&coin)).await;
                         with_live(&acc, &ex, |l| { l.networks.insert(coin, r); });
                     }
                     Cmd::Address { coin, network } => {
-                        let r = client.deposit_address(&coin, &network).await;
+                        let r = crate::metrics::timed(&ex, "transfer", client.deposit_address(&coin, &network)).await;
                         with_live(&acc, &ex, |l| { l.addresses.insert((coin, network), r); });
                     }
                     Cmd::Withdraw { tid, coin, network, address, tag, amount } => {
-                        let r = client.withdraw(&coin, &network, &address, &tag, amount).await;
+                        let r = crate::metrics::timed(&ex, "transfer", client.withdraw(&coin, &network, &address, &tag, amount)).await;
                         match &r {
                             Ok(id) => tracing::warn!("[{ex}] вывод {amount} {coin} по {network} на {address}: номер {id}"),
                             Err(e) => tracing::warn!("[{ex}] вывод {amount} {coin} по {network} отклонён: {e}"),
@@ -931,19 +933,19 @@ pub async fn worker(
                     with_live(&acc, &ex, |l| { l.trim(); l.pending() }).unwrap_or_default()
                 };
                 for (local, symbol, id) in pending {
-                    match client.query(&symbol, &id).await {
+                    match crate::metrics::timed(&ex, "query", client.query(&symbol, &id)).await {
                         Ok(st) => { with_live(&acc, &ex, |l| l.on_state(local, &st)); }
                         Err(e) => { with_live(&acc, &ex, |l| l.error = e); }
                     }
                 }
                 if n % 10 == 1 && client.perp() {
-                    match client.positions().await {
+                    match crate::metrics::timed(&ex, "positions", client.positions()).await {
                         Ok(ps) => { with_live(&acc, &ex, |l| l.sync_positions(&ps)); }
                         Err(e) => { tracing::warn!("[{ex}] позиции не получены: {e}"); with_live(&acc, &ex, |l| l.error = e); }
                     }
                 }
                 if n % 10 == 1 {
-                    match client.balances().await {
+                    match crate::metrics::timed(&ex, "balances", client.balances()).await {
                         Ok(b) => { with_live(&acc, &ex, |l| { l.ledger.set_balances(b); l.error.clear(); }); }
                         Err(e) => { tracing::warn!("[{ex}] балансы не получены: {e}"); with_live(&acc, &ex, |l| l.error = e); }
                     }
@@ -1356,7 +1358,7 @@ async fn cancel(acc: &Shared, ex: &str, client: &Venue, local: u64) {
     let Some((symbol, id)) = with_live(acc, ex, |l| l.cancel_target(local)).flatten() else {
         return;
     };
-    match client.cancel(&symbol, &id).await {
+    match crate::metrics::timed(ex, "cancel", client.cancel(&symbol, &id)).await {
         Ok(st) => {
             with_live(acc, ex, |l| l.on_state(local, &st));
         }

@@ -3470,6 +3470,20 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert_eq!(ex.lock().unwrap().stops_cancelled, ["777"]);
+        // метрики Rust-процесса: запросы к бирже по видам, задержка ордеров, рантайм tokio, процесс
+        let (_, m) = text(&r, "/metrics", "").await;
+        for want in [
+            "hft_requests_total{exchange=\"binance\",kind=\"order\"} ",
+            "hft_requests_total{exchange=\"binance\",kind=\"stop\"} ",
+            "hft_requests_total{exchange=\"binance\",kind=\"leverage\"} ",
+            "hft_order_latency_p99_micros{exchange=\"binance\"} ",
+            "hft_tokio_workers ",
+            "hft_tokio_alive_tasks ",
+            "hft_process_cpu_seconds_total ",
+            "hft_process_open_fds ",
+        ] {
+            assert!(m.contains(want), "нет «{want}» в\n{m}");
+        }
         assert_eq!(ex.lock().unwrap().bad_sig, 0, "все подписи верны");
         call(&r, "POST", "/control/stop", "").await;
     }

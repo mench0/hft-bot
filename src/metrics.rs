@@ -45,10 +45,153 @@ fn f(v: &Value) -> f64 {
     v.as_f64().unwrap_or(f64::NAN)
 }
 
+/// Запросы к бирже по (бирже, виду): вызовов, ошибок, последние задержки в микросекундах.
+#[derive(Default)]
+struct Calls {
+    total: u64,
+    errors: u64,
+    lat: std::collections::VecDeque<u64>,
+}
+
+const LAT_KEEP: usize = 1000;
+
+static CALLS: std::sync::Mutex<std::collections::BTreeMap<(String, &'static str), Calls>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Время старта процесса (для hft_process_uptime_seconds).
+static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+pub fn mark_start() {
+    STARTED.get_or_init(std::time::Instant::now);
+}
+
+/// Выполнить запрос к бирже и учесть его: вызов, ошибка, задержка.
+pub async fn timed<T>(
+    ex: &str,
+    kind: &'static str,
+    f: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    let t = std::time::Instant::now();
+    let r = f.await;
+    record(ex, kind, t.elapsed().as_micros() as u64, r.is_ok());
+    r
+}
+
+pub fn record(ex: &str, kind: &'static str, micros: u64, ok: bool) {
+    let mut m = CALLS.lock().unwrap();
+    let c = m.entry((ex.to_owned(), kind)).or_default();
+    c.total += 1;
+    if !ok {
+        c.errors += 1;
+    }
+    if c.lat.len() >= LAT_KEEP {
+        c.lat.pop_front();
+    }
+    c.lat.push_back(micros);
+}
+
+fn pct(v: &[u64], q: f64) -> f64 {
+    let mut v = v.to_vec();
+    v.sort_unstable();
+    v.get(((v.len() as f64 - 1.0) * q).round() as usize)
+        .map_or(f64::NAN, |x| *x as f64)
+}
+
+/// Запросы к биржам и задержка ордеров.
+fn calls(o: &mut Out) {
+    let m = CALLS.lock().unwrap();
+    if m.is_empty() {
+        return;
+    }
+    o.counter(
+        "hft_requests_total",
+        "Запросов к бирже по видам (order, cancel, query, balances, positions, stop, …)",
+    );
+    for ((ex, k), c) in m.iter() {
+        o.line(
+            "hft_requests_total",
+            &[("exchange", ex), ("kind", k)],
+            c.total as f64,
+        );
+    }
+    o.counter("hft_request_errors_total", "Запросов к бирже с ошибкой");
+    for ((ex, k), c) in m.iter() {
+        o.line(
+            "hft_request_errors_total",
+            &[("exchange", ex), ("kind", k)],
+            c.errors as f64,
+        );
+    }
+    for (name, q, help) in [
+        (
+            "hft_request_latency_p50_micros",
+            0.5,
+            "Задержка запроса к бирже, p50 последних 1000, микросекунды",
+        ),
+        (
+            "hft_request_latency_p99_micros",
+            0.99,
+            "Задержка запроса к бирже, p99 последних 1000, микросекунды",
+        ),
+    ] {
+        o.gauge(name, help);
+        for ((ex, k), c) in m.iter() {
+            let v: Vec<u64> = c.lat.iter().copied().collect();
+            o.line(name, &[("exchange", ex), ("kind", k)], pct(&v, q));
+        }
+    }
+    // как в Java: латентность отправки ордера
+    for (name, q, help) in [
+        (
+            "hft_order_latency_p50_micros",
+            0.5,
+            "Латентность отправки ордера, p50, микросекунды",
+        ),
+        (
+            "hft_order_latency_p99_micros",
+            0.99,
+            "Латентность отправки ордера, p99, микросекунды",
+        ),
+    ] {
+        o.gauge(name, help);
+        for ((ex, k), c) in m.iter().filter(|((_, k), _)| *k == "order") {
+            let _ = k;
+            let v: Vec<u64> = c.lat.iter().copied().collect();
+            o.line(name, &[("exchange", ex)], pct(&v, q));
+        }
+    }
+}
+
+/// Рантайм tokio: рабочие потоки, живые задачи, очередь.
+fn runtime(o: &mut Out) {
+    let Ok(h) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let m = h.metrics();
+    o.gauge("hft_tokio_workers", "Рабочих потоков рантайма tokio");
+    o.line("hft_tokio_workers", &[], m.num_workers() as f64);
+    o.gauge(
+        "hft_tokio_alive_tasks",
+        "Живых задач tokio (фиды, потоки счетов, фоновые циклы)",
+    );
+    o.line("hft_tokio_alive_tasks", &[], m.num_alive_tasks() as f64);
+    o.gauge(
+        "hft_tokio_global_queue_depth",
+        "Задач в глобальной очереди tokio (растёт — рантайм не успевает)",
+    );
+    o.line(
+        "hft_tokio_global_queue_depth",
+        &[],
+        m.global_queue_depth() as f64,
+    );
+}
+
 /// Все метрики.
 pub fn render(bot: &Bot) -> String {
     let mut o = Out(String::with_capacity(4096));
     process(&mut o);
+    runtime(&mut o);
+    calls(&mut o);
     let names = [
         (
             "hft_connected",
@@ -391,11 +534,72 @@ fn process(o: &mut Out) {
         o.gauge("hft_process_threads", "Потоков процесса");
         o.line("hft_process_threads", &[], t);
     }
+    if let Some(kb) = field("VmSize:") {
+        o.gauge("hft_process_virtual_bytes", "Виртуальная память процесса");
+        o.line("hft_process_virtual_bytes", &[], kb * 1024.0);
+    }
+    // CPU: поля utime и stime из /proc/self/stat (такты, обычно 100 в секунду)
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    let f: Vec<&str> = stat
+        .rsplit_once(')')
+        .map(|x| x.1)
+        .unwrap_or("")
+        .split_whitespace()
+        .collect();
+    if let (Some(u), Some(st)) = (
+        f.get(11).and_then(|x| x.parse::<f64>().ok()),
+        f.get(12).and_then(|x| x.parse::<f64>().ok()),
+    ) {
+        o.counter(
+            "hft_process_cpu_seconds_total",
+            "Процессорное время процесса (user + system), секунды",
+        );
+        o.line("hft_process_cpu_seconds_total", &[], (u + st) / 100.0);
+    }
+    if let Ok(d) = std::fs::read_dir("/proc/self/fd") {
+        o.gauge(
+            "hft_process_open_fds",
+            "Открытых файловых дескрипторов (сокеты бирж, файлы)",
+        );
+        o.line("hft_process_open_fds", &[], d.count() as f64);
+    }
+    if let Some(t) = STARTED.get() {
+        o.gauge(
+            "hft_process_uptime_seconds",
+            "Сколько секунд работает процесс",
+        );
+        o.line(
+            "hft_process_uptime_seconds",
+            &[],
+            t.elapsed().as_secs() as f64,
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requests_and_percentiles() {
+        for i in 1..=100u64 {
+            record("testex", "order", i, i % 10 != 0);
+        }
+        let mut o = Out(String::new());
+        calls(&mut o);
+        assert!(
+            o.0.contains("hft_requests_total{exchange=\"testex\",kind=\"order\"} 100"),
+            "{}",
+            o.0
+        );
+        assert!(o.0.contains("hft_request_errors_total{exchange=\"testex\",kind=\"order\"} 10"));
+        assert!(
+            o.0.contains("hft_order_latency_p50_micros{exchange=\"testex\"} 51"),
+            "{}",
+            o.0
+        );
+        assert!(o.0.contains("hft_order_latency_p99_micros{exchange=\"testex\"} 99"));
+    }
 
     #[test]
     fn format() {
