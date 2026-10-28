@@ -58,6 +58,30 @@ struct Budget {
 }
 
 static SAFETY: Mutex<f64> = Mutex::new(0.8);
+/// Биржи, торгующие перпами: у Binance USDⓈ-M свои лимиты (fapi), не спотовые.
+static PERP: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+/// Рынок биржи (спот или перпы): бюджет пересоздаётся с лимитами этого рынка.
+pub fn set_perp(ex: &str, perp: bool) {
+    let mut p = PERP.lock().unwrap();
+    let set = p.get_or_insert_with(Default::default);
+    let changed = if perp {
+        set.insert(ex.to_owned())
+    } else {
+        set.remove(ex)
+    };
+    drop(p);
+    if changed && let Some(all) = ALL.lock().unwrap().as_mut() {
+        all.remove(ex);
+    }
+}
+
+fn is_perp(ex: &str) -> bool {
+    PERP.lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|s| s.contains(ex))
+}
 static ALL: Mutex<Option<HashMap<String, Budget>>> = Mutex::new(None);
 
 /// Доля официального лимита (настройка rateLimitSafety); действует на бюджеты, созданные после вызова.
@@ -68,8 +92,17 @@ pub fn set_safety(s: f64) {
 /// Вёдра биржи по документации (как в Java RateLimits): (имя, официальная ёмкость, окно мс, виды).
 fn limits(ex: &str) -> Vec<(&'static str, f64, u64, &'static [Kind])> {
     // «биржа#метка» — отдельный бюджет с вёдрами биржи (тесты)
+    let perp = is_perp(ex);
     let ex = ex.split('#').next().unwrap_or(ex);
     match ex {
+        // USDⓈ-M перпы: вес 2400/мин, ордера 300/10 с и 1200/мин; WS 10 сообщений/с
+        "binance" if perp => vec![
+            ("weight", 2400.0, 60_000, REST),
+            ("orders10s", 300.0, 10_000, &[Order]),
+            ("orders1m", 1200.0, 60_000, &[Order]),
+            ("wsMessages", 10.0, 1_000, &[WsMessage]),
+            ("wsConnects", 300.0, 300_000, &[WsConnect]),
+        ],
         // вес 6000/мин на IP, ордера 50/10 с и 160 000/сутки, сырые 61 000/5 мин; WS 5 сообщений/с, 300 подключений/5 мин
         "binance" => vec![
             ("weight", 6000.0, 60_000, REST),
@@ -362,6 +395,7 @@ pub fn sync_headers(ex: &str, h: &reqwest::header::HeaderMap) {
         ("x-mbx-used-weight-1m", "weight"),
         ("x-mbx-order-count-10s", "orders10s"),
         ("x-mbx-order-count-1d", "orders1d"),
+        ("x-mbx-order-count-1m", "orders1m"),
     ] {
         if let Some(used) = num(header) {
             sync_used(ex, bucket, used.max(0) as f64);
@@ -544,6 +578,31 @@ mod tests {
             until > now_ms() + 2_000 && until <= now_ms() + 3_100,
             "пауза до сброса"
         );
+    }
+
+    #[test]
+    fn binance_perp_has_its_own_limits() {
+        set_perp("binance#perp", true);
+        let w = with("binance#perp", |b| {
+            b.buckets
+                .iter()
+                .map(|k| (k.name, k.capacity))
+                .collect::<Vec<_>>()
+        });
+        let s = *SAFETY.lock().unwrap();
+        assert!(
+            w.contains(&("weight", 2400.0 * s)) && w.iter().any(|k| k.0 == "orders1m"),
+            "{w:?}"
+        );
+        // обратно на спот — бюджет пересоздан со спотовыми лимитами
+        set_perp("binance#perp", false);
+        let w = with("binance#perp", |b| {
+            b.buckets
+                .iter()
+                .map(|k| (k.name, k.capacity))
+                .collect::<Vec<_>>()
+        });
+        assert!(w.contains(&("weight", 6000.0 * s)), "{w:?}");
     }
 
     #[test]

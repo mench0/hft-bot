@@ -154,6 +154,8 @@ struct Round {
     note: String,
     /// Перевод котируемой валюты для выравнивания (без покупки и продажи).
     rebalance: bool,
+    /// Когда начался перевод (мс эпохи) — депозиты раньше не его.
+    transit_ms: u64,
     /// Когда последний раз просили перенести депозит на торговый счёт.
     last_sweep: Option<Instant>,
 }
@@ -510,6 +512,7 @@ impl SpotArb {
             started: now,
             note: String::new(),
             rebalance: false,
+            transit_ms: 0,
             last_sweep: None,
         });
         let v = venues.get_mut(buy).unwrap();
@@ -679,6 +682,8 @@ impl SpotArb {
                             x.qty = (amount - fee).max(0.0);
                             x.note = format!("баланс {coin} на {sell} до перевода: {baseline}");
                             x.stage = Stage::Withdrawing { tid };
+                            // запас 60 с на расхождение часов с биржей
+                            x.transit_ms = crate::infra::util::now_ms().saturating_sub(60_000);
                             x.held.insert(format!("{sell}#baseline"), baseline);
                         }
                     }
@@ -725,7 +730,11 @@ impl SpotArb {
                             .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(10))
                         && let Some(l) = venues.get_mut(&sell).and_then(|v| v.account.live())
                     {
-                        l.request(Cmd::Sweep { coin: coin.clone() });
+                        l.request(Cmd::Sweep {
+                            coin: coin.clone(),
+                            since_ms: r.transit_ms,
+                            max: r.qty,
+                        });
                         if let Some(x) = self.rounds.iter_mut().find(|x| x.id == id) {
                             x.last_sweep = Some(now);
                         }
@@ -874,6 +883,7 @@ impl SpotArb {
                 started: now,
                 note: format!("выравнивание {q}"),
                 rebalance: true,
+                transit_ms: 0,
                 last_sweep: None,
             });
             return;

@@ -708,17 +708,50 @@ impl Client {
         tag: &str,
         amount: f64,
     ) -> Result<String, String> {
-        let mut b =
-            json!({"currency": coin, "address": address, "amount": dec(amount), "chain": chain});
+        // свой номер вывода: ответа нет (таймаут) — вывод ищется по нему, а не считается неудачным
+        let cid = format!("hft{}", now_ms());
+        let mut b = json!({"currency": coin, "address": address, "amount": dec(amount), "chain": chain,
+            "withdraw_order_id": cid});
         if !tag.is_empty() {
             b["memo"] = json!(tag);
         }
-        let r = self
+        let id = |r: &Value| {
+            r["id"]
+                .as_str()
+                .map_or_else(|| r["id"].to_string(), str::to_owned)
+        };
+        match self
             .call(reqwest::Method::POST, "/withdrawals", "", Some(b))
-            .await?;
-        Ok(r["id"]
-            .as_str()
-            .map_or_else(|| r["id"].to_string(), str::to_owned))
+            .await
+        {
+            Ok(r) => Ok(id(&r)),
+            Err(e) => {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let found = self
+                    .call(
+                        reqwest::Method::GET,
+                        "/wallet/withdrawals",
+                        &format!("currency={coin}&withdraw_order_id={cid}"),
+                        None,
+                    )
+                    .await
+                    .ok()
+                    .and_then(|r| {
+                        r.as_array()
+                            .and_then(|a| a.iter().find(|w| w["withdraw_order_id"] == cid.as_str()))
+                            .map(id)
+                    });
+                match found {
+                    Some(i) => {
+                        tracing::warn!(
+                            "Gate: вывод {cid} ответил ошибкой ({e}), но есть в истории: {i}"
+                        );
+                        Ok(i)
+                    }
+                    None => Err(e),
+                }
+            }
+        }
     }
 }
 

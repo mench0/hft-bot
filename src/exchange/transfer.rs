@@ -158,6 +158,28 @@ pub fn kucoin_nets(d: &Value) -> Vec<Net> {
         .collect()
 }
 
+/// Сумма депозитов OKX с момента since_ms (data /asset/deposit-history; state 1 — зачислен, 2 — успешно).
+pub fn okx_deposits(data: &Value, coin: &str, since_ms: u64) -> f64 {
+    data.as_array()
+        .into_iter()
+        .flatten()
+        .filter(|d| d["ccy"] == coin && (d["state"] == "1" || d["state"] == "2"))
+        .filter(|d| num(&d["ts"]) as u64 >= since_ms)
+        .map(|d| num(&d["amt"]))
+        .sum()
+}
+
+/// Сумма депозитов KuCoin с момента since_ms (data /api/v1/deposits, status SUCCESS).
+pub fn kucoin_deposits(d: &Value, since_ms: u64) -> f64 {
+    d["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|x| x["status"] == "SUCCESS" && num(&x["createdAt"]) as u64 >= since_ms)
+        .map(|x| num(&x["amount"]))
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

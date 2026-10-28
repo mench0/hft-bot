@@ -710,20 +710,67 @@ impl Client {
         if !tag.is_empty() {
             b["memo"] = json!(tag);
         }
+        let started = now_ms().saturating_sub(60_000);
         match self
             .call(reqwest::Method::POST, "/api/v3/withdrawals", Some(b))
             .await
         {
             Ok(d) => Ok(d["withdrawalId"].as_str().unwrap_or("").to_owned()),
             Err(e) => {
-                back().await;
-                Err(e)
+                // своего номера у вывода KuCoin нет: ответа нет (таймаут) — ищем в истории тот же адрес и сумму
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let found = self
+                    .call(
+                        reqwest::Method::GET,
+                        &format!("/api/v1/withdrawals?currency={coin}&startAt={started}"),
+                        None,
+                    )
+                    .await
+                    .ok()
+                    .and_then(|d| {
+                        d["items"]
+                            .as_array()?
+                            .iter()
+                            .find(|w| {
+                                w["address"] == address
+                                    && w["status"] != "FAILURE"
+                                    && w["amount"]
+                                        .as_str()
+                                        .and_then(|a| a.parse::<f64>().ok())
+                                        .is_some_and(|a| (a - amount).abs() <= amount * 1e-6 + 1e-9)
+                            })
+                            .and_then(|w| w["id"].as_str().map(str::to_owned))
+                    });
+                match found {
+                    Some(id) => {
+                        tracing::warn!(
+                            "KuCoin: вывод ответил ошибкой ({e}), но есть в истории: {id}"
+                        );
+                        Ok(id)
+                    }
+                    None => {
+                        back().await;
+                        Err(e)
+                    }
+                }
             }
         }
     }
 
-    /// Пришедший депозит — со счёта фондирования на торговый; сколько перенесено.
-    pub async fn sweep(&self, coin: &str) -> Result<f64, String> {
+    /// Сколько монеты пришло депозитами с момента since_ms (status SUCCESS).
+    pub async fn deposits_since(&self, coin: &str, since_ms: u64) -> Result<f64, String> {
+        let d = self
+            .call(
+                reqwest::Method::GET,
+                &format!("/api/v1/deposits?currency={coin}&status=SUCCESS&startAt={since_ms}"),
+                None,
+            )
+            .await?;
+        Ok(crate::exchange::transfer::kucoin_deposits(&d, since_ms))
+    }
+
+    /// Перенести на торговый счёт до amount монеты со счёта фондирования (не больше, чем там свободно); сколько перенесено.
+    pub async fn sweep(&self, coin: &str, amount: f64) -> Result<f64, String> {
         let d = self
             .call(
                 reqwest::Method::GET,
@@ -737,10 +784,11 @@ impl Client {
             .flatten()
             .filter_map(|a| a["available"].as_str()?.parse::<f64>().ok())
             .sum();
-        if free > 0.0 {
-            self.move_funds(coin, free, "main", "trade").await?;
+        let n = amount.min(free);
+        if n > 0.0 {
+            self.move_funds(coin, n, "main", "trade").await?;
         }
-        Ok(free)
+        Ok(n.max(0.0))
     }
 }
 

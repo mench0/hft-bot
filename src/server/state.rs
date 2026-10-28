@@ -843,7 +843,10 @@ impl Bot {
                 )),
             };
             let mut account = account;
-            if p.get("market").and_then(Value::as_str) == Some("perp") {
+            let is_perp = p.get("market").and_then(Value::as_str) == Some("perp");
+            // лимиты частоты — по рынку биржи (у Binance перпов свои)
+            crate::infra::ratelimit::set_perp(ex, is_perp);
+            if is_perp {
                 account.set_perp(leverage(&p));
             }
             let mut account = account;

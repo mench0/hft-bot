@@ -433,6 +433,9 @@ impl Client {
     }
 }
 
+/// Сколько ждать перед проверкой истории выводов после ошибки запроса вывода.
+const WITHDRAW_RECHECK: Duration = Duration::from_secs(2);
+
 impl Client {
     /// Сети монеты (вывод и депозит).
     pub async fn networks(
@@ -523,18 +526,48 @@ impl Client {
         } else {
             format!("{address}:{tag}")
         };
+        // свой номер вывода: ответа нет (таймаут) — вывод ищется по нему, а не считается неудачным
+        let cid = format!("hft{}", now_ms());
         match self.call(reqwest::Method::POST, "/api/v5/asset/withdrawal",
-            Some(json!({"ccy": coin, "amt": dec(amt), "dest": "4", "toAddr": to, "chain": chain}))).await {
+            Some(json!({"ccy": coin, "amt": dec(amt), "dest": "4", "toAddr": to, "chain": chain, "clientId": cid}))).await {
             Ok(r) => Ok(r["data"][0]["wdId"].as_str().unwrap_or("").to_owned()),
             Err(e) => {
-                back().await;
-                Err(e)
+                tokio::time::sleep(WITHDRAW_RECHECK).await;
+                let found = self
+                    .call(reqwest::Method::GET, &format!("/api/v5/asset/withdrawal-history?ccy={coin}&clientId={cid}"), None)
+                    .await
+                    .ok()
+                    .and_then(|r| r["data"][0]["wdId"].as_str().filter(|s| !s.is_empty()).map(str::to_owned));
+                match found {
+                    Some(id) => {
+                        tracing::warn!("OKX: вывод {cid} ответил ошибкой ({e}), но есть в истории: {id}");
+                        Ok(id)
+                    }
+                    None => {
+                        back().await;
+                        Err(e)
+                    }
+                }
             }
         }
     }
 
-    /// Пришедший депозит — со счёта фондирования на торговый (вся свободная монета); сколько перенесено.
-    pub async fn sweep(&self, coin: &str) -> Result<f64, String> {
+    /// Сколько монеты пришло депозитами с момента since_ms (зачислено: state 1 или 2).
+    pub async fn deposits_since(&self, coin: &str, since_ms: u64) -> Result<f64, String> {
+        let r = self
+            .call(
+                reqwest::Method::GET,
+                &format!("/api/v5/asset/deposit-history?ccy={coin}"),
+                None,
+            )
+            .await?;
+        Ok(crate::exchange::transfer::okx_deposits(
+            &r["data"], coin, since_ms,
+        ))
+    }
+
+    /// Перенести на торговый счёт до amount монеты со счёта фондирования (не больше, чем там свободно); сколько перенесено.
+    pub async fn sweep(&self, coin: &str, amount: f64) -> Result<f64, String> {
         let r = self
             .call(
                 reqwest::Method::GET,
@@ -549,10 +582,11 @@ impl Client {
             .filter(|b| b["ccy"] == coin)
             .filter_map(|b| b["availBal"].as_str()?.parse::<f64>().ok())
             .sum();
-        if free > 0.0 {
-            self.move_funds(coin, free, "6", "18").await?;
+        let n = amount.min(free);
+        if n > 0.0 {
+            self.move_funds(coin, n, "6", "18").await?;
         }
-        Ok(free)
+        Ok(n.max(0.0))
     }
 }
 

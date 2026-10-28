@@ -3723,19 +3723,14 @@ mod tests {
             .iter()
             .filter_map(|x| x["name"].as_str())
             .collect();
-        assert_eq!(
-            names,
-            [
-                "weight",
-                "raw",
-                "orders10s",
-                "orders1d",
-                "wsMessages",
-                "wsConnects"
-            ],
+        // перпы — свои лимиты Binance USDⓈ-M (вес 2400/мин × rateLimitSafety); бюджет Binance общий для
+        // параллельных тестов спота и перпов, поэтому проверяются только общие вёдра
+        assert!(
+            ["weight", "orders10s", "wsMessages", "wsConnects"]
+                .iter()
+                .all(|n| names.contains(n)),
             "{q}"
         );
-        assert_eq!(b["buckets"][0]["capacity"], json!(4800.0));
         // тот же снимок потоком SSE
         let req = axum::http::Request::builder()
             .uri("/requests/stream")
