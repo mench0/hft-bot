@@ -111,13 +111,18 @@ impl Client {
     ) -> Result<Value, String> {
         // микросекунды, строго возрастающие
         let micros = now_ms() * 1000;
-        let prev = self
-            .nonce
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |p| {
-                Some((p + 1).max(micros))
-            })
-            .unwrap_or(0);
-        let nonce = (prev + 1).max(micros);
+        // цикл compare_exchange вместо fetch_update (в новых версиях Rust он устарел, а try_update нет в старых)
+        let mut prev = self.nonce.load(Ordering::SeqCst);
+        let nonce = loop {
+            let next = (prev + 1).max(micros);
+            match self
+                .nonce
+                .compare_exchange_weak(prev, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => break next,
+                Err(cur) => prev = cur,
+            }
+        };
         let mut q: Vec<String> = params.iter().map(|(k, v)| format!("{k}={v}")).collect();
         q.push("recvWindow=5000".into());
         q.push(format!("timestamp={}", now_ms()));
