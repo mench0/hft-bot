@@ -1087,7 +1087,6 @@ pub struct Params {
     pub order_quote: f64,
     pub arb_min_volume: f64,
     pub arb_max_gross: f64,
-    pub arb_min_profit: f64,
     /// Стат-арб: оборот самых ликвидных монет не меньше; корреляция минутных доходностей не меньше.
     pub min_volume: f64,
     pub statarb_min_corr: f64,
@@ -1128,7 +1127,6 @@ impl Params {
             order_quote: f("scOrderQuote", 20.0),
             arb_min_volume: f("discoveryArbMinVolume", 50_000.0),
             arb_max_gross: f("discoveryArbMaxGrossPercent", 5.0),
-            arb_min_profit: f("spotArbMinProfitPercent", 0.05),
             min_volume: f("discoveryMinVolume", 1_000_000.0),
             statarb_min_corr: f("statArbMinCorrelation", 0.6),
             min_volume_1h: f("discoveryMinVolume1h", 50_000.0),
@@ -1784,75 +1782,6 @@ fn bad_book(bids: &[(f64, f64)], asks: &[(f64, f64)], p: &Params) -> Option<Stri
     None
 }
 
-/// Спот – спот на разных биржах: по каждой монете дешевле всего купить и дороже всего продать.
-pub fn cross_arb(tickers: &[Ticker], p: &Params) -> Value {
-    let mut by: BTreeMap<String, Vec<&Ticker>> = BTreeMap::new();
-    for t in tickers.iter().filter(|t| {
-        !t.perp
-            && excluded(t, p).is_none()
-            && t.bid > 0.0
-            && t.ask > 0.0
-            && t.volume >= p.arb_min_volume
-    }) {
-        by.entry(t.symbol.clone()).or_default().push(t);
-    }
-    let mut out = Vec::new();
-    for (sym, ts) in by {
-        let (Some(buy), Some(sell)) = (
-            ts.iter().min_by(|a, b| a.ask.total_cmp(&b.ask)),
-            ts.iter().max_by(|a, b| a.bid.total_cmp(&b.bid)),
-        ) else {
-            continue;
-        };
-        if buy.exchange == sell.exchange || sell.bid <= buy.ask {
-            continue;
-        }
-        let gross = (sell.bid - buy.ask) / buy.ask * 100.0;
-        if gross > p.arb_max_gross {
-            continue; // скорее ошибка данных или разные монеты под одним тикером
-        }
-        let fees = fee(&buy.exchange, "takerFeePct") + fee(&sell.exchange, "takerFeePct");
-        let net = gross - fees;
-        if net <= 0.0 {
-            continue;
-        }
-        let ok = net >= p.arb_min_profit;
-        let mut m = pick(
-            "spot",
-            &[(&buy.exchange, &buy.symbol), (&sell.exchange, &sell.symbol)],
-        );
-        m.insert("grossPct".into(), json!(gross));
-        m.insert("netPct".into(), json!(net));
-        m.insert("buyAsk".into(), json!(buy.ask));
-        m.insert("sellBid".into(), json!(sell.bid));
-        let why = vec![
-            format!(
-                "{} {} → {} {}",
-                buy.exchange, buy.ask, sell.exchange, sell.bid
-            ),
-            format!(
-                "разница {}, после двух комиссий тейкера {}",
-                pct(gross),
-                pct(net)
-            ),
-            format!("оборот {} / {}", money(buy.volume), money(sell.volume)),
-            "без запаса монеты на бирже продажи — перевод (комиссия сети не учтена)".into(),
-        ];
-        let verdict = if ok {
-            "подходит"
-        } else {
-            "не подходит"
-        };
-        out.push(candidate(&format!("{}→{}", buy.exchange, sell.exchange), &sym, verdict, net, why, Value::Object(m),
-            Some(json!({"text": format!("{} с круга", pct(net)), "note": "разница цен минус две комиссии тейкера"}))));
-    }
-    sort(&mut out);
-    json!({"id": "cross-exchange-arb", "title": "Спот – спот на разных биржах", "executable": true,
-        "description": "Купить там, где дешевле, продать там, где дороже: сразу при запасе монеты или после перевода.",
-        "criteria": [format!("после комиссий ≥ {}%", p.arb_min_profit), format!("разница ≤ {}%", p.arb_max_gross), format!("оборот ≥ {}", money(p.arb_min_volume))],
-        "candidates": out})
-}
-
 fn sort(v: &mut [Value]) {
     v.sort_by(|a, b| num(&b["score"]).total_cmp(&num(&a["score"])));
 }
@@ -1981,10 +1910,8 @@ pub async fn run(
         .into_iter()
         .filter_map(|(k, c)| Some((k, c?)))
         .collect();
-    let cross = Params::at(settings, "", "cross-exchange-arb");
     let mut out = vec![
         spread_capture(&all, &books, &candles, &sc),
-        cross_arb(&all, &cross),
         lead_lag(&all, &|ex| Params::at(settings, ex, "lead-lag")),
         perp_arb(&all, &|ex| Params::at(settings, ex, "perp-arb")),
         stat_arb(&pools, &closes, &sa),
@@ -2361,26 +2288,6 @@ mod tests {
     }
 
     #[test]
-    fn cross_arb_finds_cheapest_and_dearest() {
-        let ts = vec![
-            t("upbit", "XUSDT", 9.9, 10.0, 1e6),
-            t("lbank", "XUSDT", 10.2, 10.21, 1e6),
-            t("binance", "XUSDT", 10.05, 10.06, 1e6),
-            t("binance", "YUSDT", 1.0, 1.001, 1e6),
-            t("lbank", "YUSDT", 2.0, 2.01, 1e6), // 100% — ошибка данных
-        ];
-        let v = cross_arb(&ts, &params());
-        let c = v["candidates"].as_array().unwrap();
-        assert_eq!(c.len(), 1, "{v}");
-        assert_eq!(c[0]["exchange"], "upbit→lbank");
-        assert_eq!(c[0]["verdict"], "подходит");
-        assert_eq!(
-            c[0]["metrics"]["symbols"],
-            json!({"lbank": ["XUSDT"], "upbit": ["XUSDT"]})
-        );
-    }
-
-    #[test]
     fn impact() {
         let asks = vec![(10.0, 1.0), (11.0, 10.0)];
         assert_eq!(impact_pct(&asks, 5.0), 0.0);
@@ -2444,13 +2351,6 @@ mod tests {
                 .count(),
             8,
             "стакан проверен у 8 лучших"
-        );
-        // C1: на Upbit аск 1.01, на LBank бид 1.05 — спот – спот
-        let x = &strategies[1]["candidates"][0];
-        assert_eq!(
-            (x["exchange"].as_str(), x["symbol"].as_str()),
-            (Some("upbit→lbank"), Some("C1USDT")),
-            "{x}"
         );
     }
 }

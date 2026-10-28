@@ -27,15 +27,6 @@ pub enum Cmd {
     Cancel {
         local: u64,
     },
-    /// Узнать сети монеты.
-    Networks {
-        coin: String,
-    },
-    /// Узнать адрес депозита монеты в сети.
-    Address {
-        coin: String,
-        network: String,
-    },
     /// Поставить защитный стоп (перпы); old — прежний стоп, снимается после установки нового.
     PlaceStop {
         symbol: String,
@@ -48,22 +39,6 @@ pub enum Cmd {
     CancelStop {
         symbol: String,
         id: String,
-    },
-    /// Перенести пришедший перевод со счёта фондирования на торговый (OKX, KuCoin; у остальных — ничего): только
-    /// депозиты с момента since_ms и не больше max — свои монеты на счёте фондирования не трогаются.
-    Sweep {
-        coin: String,
-        since_ms: u64,
-        max: f64,
-    },
-    /// Вывести монету (номер перевода — свой).
-    Withdraw {
-        tid: u64,
-        coin: String,
-        network: String,
-        address: String,
-        tag: String,
-        amount: f64,
     },
 }
 
@@ -99,12 +74,6 @@ pub struct Live {
     pub stream_events: u64,
     /// Последняя ошибка приватного потока (не стирается удачным опросом балансов).
     pub stream_error: String,
-    /// Сети монет (ответы на Cmd::Networks): Err — ошибка запроса.
-    pub networks: HashMap<String, Result<Vec<crate::exchange::transfer::Net>, String>>,
-    /// Адреса депозита по (монета, сеть).
-    pub addresses: HashMap<(String, String), Result<(String, String), String>>,
-    /// Итог выводов по своему номеру: номер на бирже или ошибка.
-    pub withdrawals: HashMap<u64, Result<String, String>>,
     /// Защитные стопы на бирже по символам.
     stops: HashMap<String, Stop>,
     /// Последняя неудача стопа по символу (повтор не раньше чем через STOP_RETRY).
@@ -153,9 +122,6 @@ impl Live {
             stream_ok: false,
             stream_events: 0,
             stream_error: String::new(),
-            networks: HashMap::new(),
-            addresses: HashMap::new(),
-            withdrawals: HashMap::new(),
             stops: HashMap::new(),
             stop_failed: HashMap::new(),
             stops_unsupported: false,
@@ -581,11 +547,6 @@ impl Live {
         }
     }
 
-    /// Запросить у биржи сети, адрес или вывод (ответ — в networks / addresses / withdrawals).
-    pub fn request(&self, cmd: Cmd) {
-        let _ = self.tx.send(cmd);
-    }
-
     /// Позиции с биржи: заменяют учётные (у кого на бирже позиции нет — закрыта).
     pub fn sync_positions(&mut self, ps: &[(String, f64, f64)]) {
         let known: Vec<String> = self.ledger.positions.keys().cloned().collect();
@@ -851,62 +812,6 @@ impl Venue {
             Venue::Lbank(_) | Venue::Upbit(_) | Venue::Uniswap(_) => Ok(()),
         }
     }
-    async fn networks(&self, coin: &str) -> Result<Vec<crate::exchange::transfer::Net>, String> {
-        match self {
-            Venue::Binance(c) => c.networks(coin).await,
-            Venue::Bybit(c) => c.networks(coin).await,
-            Venue::Okx(c) if !c.perp => c.networks(coin).await,
-            Venue::Gate(c) if !c.perp => c.networks(coin).await,
-            Venue::Kucoin(c) if !c.perp => c.networks(coin).await,
-            _ => Err("переводы с этой биржи не поддерживаются (есть у Binance, Bybit, OKX, Gate, KuCoin — спот)".into()),
-        }
-    }
-    async fn deposit_address(&self, coin: &str, net: &str) -> Result<(String, String), String> {
-        match self {
-            Venue::Binance(c) => c.deposit_address(coin, net).await,
-            Venue::Bybit(c) => c.deposit_address(coin, net).await,
-            Venue::Okx(c) if !c.perp => c.deposit_address(coin, net).await,
-            Venue::Gate(c) if !c.perp => c.deposit_address(coin, net).await,
-            Venue::Kucoin(c) if !c.perp => c.deposit_address(coin, net).await,
-            _ => Err("переводы с этой биржи не поддерживаются (есть у Binance, Bybit, OKX, Gate, KuCoin — спот)".into()),
-        }
-    }
-    async fn withdraw(
-        &self,
-        coin: &str,
-        net: &str,
-        address: &str,
-        tag: &str,
-        amount: f64,
-    ) -> Result<String, String> {
-        match self {
-            Venue::Binance(c) => c.withdraw(coin, net, address, tag, amount).await,
-            Venue::Bybit(c) => c.withdraw(coin, net, address, tag, amount).await,
-            Venue::Okx(c) if !c.perp => c.withdraw(coin, net, address, tag, amount).await,
-            Venue::Gate(c) if !c.perp => c.withdraw(coin, net, address, tag, amount).await,
-            Venue::Kucoin(c) if !c.perp => c.withdraw(coin, net, address, tag, amount).await,
-            _ => Err("переводы с этой биржи не поддерживаются (есть у Binance, Bybit, OKX, Gate, KuCoin — спот)".into()),
-        }
-    }
-    /// Перевод, пришедший на счёт фондирования (OKX, KuCoin), — на торговый: депозиты с since_ms за вычетом уже
-    /// перенесённого (moved), не больше max; сколько перенесено сейчас.
-    async fn sweep(&self, coin: &str, since_ms: u64, max: f64, moved: f64) -> Result<f64, String> {
-        let arrived = match self {
-            Venue::Okx(c) if !c.perp => c.deposits_since(coin, since_ms).await?,
-            Venue::Kucoin(c) if !c.perp => c.deposits_since(coin, since_ms).await?,
-            _ => return Ok(0.0),
-        };
-        let n = arrived.min(max) - moved;
-        if n <= 1e-12 {
-            return Ok(0.0);
-        }
-        match self {
-            Venue::Okx(c) => c.sweep(coin, n).await,
-            Venue::Kucoin(c) => c.sweep(coin, n).await,
-            _ => Ok(0.0),
-        }
-    }
-
     async fn balances(&self) -> Result<std::collections::BTreeMap<String, f64>, String> {
         match self {
             Venue::Binance(c) => c.balances().await,
@@ -1277,7 +1182,6 @@ pub async fn worker(
     // ордера с неизвестным исходом: (свой номер, символ, до какого времени искать)
     let mut lost: Vec<(u64, String, tokio::time::Instant)> = Vec::new();
     // уже перенесено на торговый счёт по переводу (монета, начало перевода)
-    let mut swept: HashMap<(String, u64), f64> = HashMap::new();
     loop {
         tokio::select! {
             cmd = rx.recv() => {
@@ -1338,33 +1242,6 @@ pub async fn worker(
                         Ok(()) => tracing::info!("[{ex}] стоп {id} по {symbol} снят"),
                         Err(e) => tracing::warn!("[{ex}] стоп {id} по {symbol} не снят (возможно, сработал): {e}"),
                     },
-                    Cmd::Networks { coin } => {
-                        let r = crate::infra::metrics::timed(&ex, "transfer", client.networks(&coin)).await;
-                        with_live(&acc, &ex, |l| { l.networks.insert(coin, r); });
-                    }
-                    Cmd::Address { coin, network } => {
-                        let r = crate::infra::metrics::timed(&ex, "transfer", client.deposit_address(&coin, &network)).await;
-                        with_live(&acc, &ex, |l| { l.addresses.insert((coin, network), r); });
-                    }
-                    Cmd::Sweep { coin, since_ms, max } => {
-                        let done = swept.get(&(coin.clone(), since_ms)).copied().unwrap_or(0.0);
-                        match crate::infra::metrics::timed(&ex, "transfer", client.sweep(&coin, since_ms, max, done)).await {
-                            Ok(n) if n > 0.0 => {
-                                *swept.entry((coin.clone(), since_ms)).or_default() += n;
-                                tracing::warn!("[{ex}] пришедший перевод {n} {coin} перенесён на торговый счёт");
-                            }
-                            Ok(_) => {}
-                            Err(e) => tracing::warn!("[{ex}] перенос {coin} на торговый счёт не удался: {e}"),
-                        }
-                    }
-                    Cmd::Withdraw { tid, coin, network, address, tag, amount } => {
-                        let r = crate::infra::metrics::timed(&ex, "transfer", client.withdraw(&coin, &network, &address, &tag, amount)).await;
-                        match &r {
-                            Ok(id) => tracing::warn!("[{ex}] вывод {amount} {coin} по {network} на {address}: номер {id}"),
-                            Err(e) => tracing::warn!("[{ex}] вывод {amount} {coin} по {network} отклонён: {e}"),
-                        }
-                        with_live(&acc, &ex, |l| { l.withdrawals.insert(tid, r); });
-                    }
                 }
             }
             _ = poll.tick() => {
@@ -2405,123 +2282,6 @@ mod tests {
         assert_eq!(link.unknown.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
-    /// Переводы OKX: вывод — перевод с торгового счёта на фондирования, затем вывод суммы за вычетом комиссии;
-    /// пришедший депозит — обратно на торговый. Gate: адрес из multichain_addresses, вывод со спота.
-    #[tokio::test]
-    async fn okx_and_gate_transfers_against_mock() {
-        use axum::{
-            Json, Router,
-            routing::{get, post},
-        };
-        let calls = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
-        let (c1, c2, c3) = (calls.clone(), calls.clone(), calls.clone());
-        let okx = Router::new()
-            .route("/api/v5/asset/currencies", get(|| async { Json(json!({"code": "0", "data": [
-                {"ccy": "USDT", "chain": "USDT-TRC20", "canDep": true, "canWd": true, "fee": "1", "minWd": "2"}]})) }))
-            .route("/api/v5/asset/transfer", post(move |b: String| async move {
-                c1.lock().unwrap().push(("transfer".into(), serde_json::from_str(&b).unwrap()));
-                Json(json!({"code": "0", "data": [{"transId": "1"}]}))
-            }))
-            .route("/api/v5/asset/withdrawal", post(move |b: String| async move {
-                c2.lock().unwrap().push(("withdrawal".into(), serde_json::from_str(&b).unwrap()));
-                Json(json!({"code": "0", "data": [{"wdId": "W9"}]}))
-            }))
-            // на счёте фондирования 548.5: 500 — свои монеты, 48.5 — пришедший перевод (депозит после начала вывода)
-            .route("/api/v5/asset/balances", get(|| async { Json(json!({"code": "0", "data": [{"ccy": "USDT", "availBal": "548.5"}]})) }))
-            .route("/api/v5/asset/deposit-history", get(|| async { Json(json!({"code": "0", "data": [
-                {"ccy": "USDT", "amt": "48.5", "state": "2", "ts": "2000"}, {"ccy": "USDT", "amt": "500", "state": "2", "ts": "500"}]})) }))
-            .route("/api/v5/asset/deposit-address", get(|| async { Json(json!({"code": "0", "data": [
-                {"chain": "USDT-ERC20", "addr": "0xe"}, {"chain": "USDT-TRC20", "addr": "Tabc", "tag": ""}]})) }));
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", l.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(l, okx).await.unwrap() });
-        let v = Venue::Okx(crate::exchange::okx::Client::new(
-            &base,
-            keys(),
-            "p".into(),
-            false,
-            true,
-        ));
-        assert_eq!(
-            v.deposit_address("USDT", "USDT-TRC20").await.unwrap().0,
-            "Tabc"
-        );
-        assert_eq!(
-            v.withdraw("USDT", "USDT-TRC20", "Txyz", "", 50.0)
-                .await
-                .unwrap(),
-            "W9"
-        );
-        // переносится только перевод (депозит после 1000), не свои 500
-        assert_eq!(v.sweep("USDT", 1000, 49.0, 0.0).await.unwrap(), 48.5);
-        // уже перенесено — второй раз ничего
-        assert_eq!(v.sweep("USDT", 1000, 49.0, 48.5).await.unwrap(), 0.0);
-        let c = calls.lock().unwrap().clone();
-        assert_eq!(
-            (
-                c[0].1["from"].as_str(),
-                c[0].1["to"].as_str(),
-                c[0].1["amt"].as_str()
-            ),
-            (Some("18"), Some("6"), Some("50"))
-        );
-        assert_eq!(
-            (
-                c[1].1["amt"].as_str(),
-                c[1].1["toAddr"].as_str(),
-                c[1].1["chain"].as_str()
-            ),
-            (Some("49"), Some("Txyz"), Some("USDT-TRC20"))
-        );
-        assert_eq!(
-            (
-                c[2].1["from"].as_str(),
-                c[2].1["to"].as_str(),
-                c[2].1["amt"].as_str()
-            ),
-            (Some("6"), Some("18"), Some("48.5"))
-        );
-        let gate = Router::new()
-            .route("/api/v4/wallet/currency_chains", get(|| async { Json(json!([{"chain": "TRX", "is_disabled": 0, "is_deposit_disabled": 0, "is_withdraw_disabled": 0}])) }))
-            .route("/api/v4/wallet/withdraw_status", get(|| async { Json(json!([{"currency": "USDT", "withdraw_amount_mini": "1", "withdraw_fix_on_chains": {"TRX": "1"}}])) }))
-            .route("/api/v4/wallet/deposit_address", get(|| async { Json(json!({"currency": "USDT", "multichain_addresses": [
-                {"chain": "TRX", "address": "Tgate", "payment_id": "", "obtain_failed": 0}]})) }))
-            .route("/api/v4/withdrawals", post(move |b: String| async move {
-                c3.lock().unwrap().push(("gate".into(), serde_json::from_str(&b).unwrap()));
-                Json(json!({"id": "g1", "status": "REQUEST"}))
-            }));
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", l.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(l, gate).await.unwrap() });
-        let g = Venue::Gate(crate::exchange::gate::Client::new(
-            &base,
-            keys(),
-            false,
-            true,
-            &[],
-        ));
-        let n = g.networks("USDT").await.unwrap();
-        assert_eq!((n[0].name.as_str(), n[0].withdraw_fee), ("TRX", 1.0));
-        assert_eq!(g.deposit_address("USDT", "TRX").await.unwrap().0, "Tgate");
-        assert_eq!(
-            g.withdraw("USDT", "TRX", "Tokx", "", 20.0).await.unwrap(),
-            "g1"
-        );
-        let w = calls.lock().unwrap().last().unwrap().1.clone();
-        assert_eq!(
-            (
-                w["chain"].as_str(),
-                w["amount"].as_str(),
-                w["address"].as_str()
-            ),
-            (Some("TRX"), Some("20"), Some("Tokx"))
-        );
-        assert!(
-            w["withdraw_order_id"].as_str().unwrap().starts_with("hft"),
-            "свой номер вывода"
-        );
-    }
-
     /// Выход по старому стакану (или без стакана): ордер всё равно уходит, фоновая задача берёт свежую цену по REST.
     #[tokio::test]
     async fn exit_with_stale_book_refreshes_price_over_rest() {
@@ -2602,59 +2362,6 @@ mod tests {
         .await
         .unwrap_err();
         assert!(e.starts_with(LOST), "{e}");
-    }
-
-    /// Вывод OKX ответил ошибкой (таймаут), но есть в истории по своему clientId — это успех, монета не возвращается.
-    #[tokio::test]
-    async fn okx_withdraw_error_but_present_in_history() {
-        use axum::{
-            Json, Router,
-            extract::RawQuery,
-            routing::{get, post},
-        };
-        let moves = Arc::new(Mutex::new(Vec::<Value>::new()));
-        let cid = Arc::new(Mutex::new(String::new()));
-        let (m1, c1, c2) = (moves.clone(), cid.clone(), cid.clone());
-        let app = Router::new()
-            .route("/api/v5/asset/currencies", get(|| async { Json(json!({"code": "0", "data": [
-                {"ccy": "USDT", "chain": "USDT-TRC20", "canDep": true, "canWd": true, "fee": "1", "minWd": "2"}]})) }))
-            .route("/api/v5/asset/transfer", post(move |b: String| async move {
-                m1.lock().unwrap().push(serde_json::from_str(&b).unwrap());
-                Json(json!({"code": "0", "data": [{}]}))
-            }))
-            .route("/api/v5/asset/withdrawal", post(move |b: String| async move {
-                let v: Value = serde_json::from_str(&b).unwrap();
-                *c1.lock().unwrap() = v["clientId"].as_str().unwrap().to_owned();
-                // вывод на бирже создан, а ответ — ошибка (как при обрыве)
-                Json(json!({"code": "50001", "msg": "service temporarily unavailable", "data": []}))
-            }))
-            .route("/api/v5/asset/withdrawal-history", get(move |RawQuery(q): RawQuery| async move {
-                let want = c2.lock().unwrap().clone();
-                let hit = q.unwrap_or_default().contains(&format!("clientId={want}"));
-                Json(json!({"code": "0", "data": if hit { json!([{"wdId": "W77", "clientId": want}]) } else { json!([]) }}))
-            }));
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", l.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
-        let v = Venue::Okx(crate::exchange::okx::Client::new(
-            &base,
-            keys(),
-            "p".into(),
-            false,
-            true,
-        ));
-        assert_eq!(
-            v.withdraw("USDT", "USDT-TRC20", "Txyz", "", 50.0)
-                .await
-                .unwrap(),
-            "W77"
-        );
-        assert!(cid.lock().unwrap().starts_with("hft"));
-        assert_eq!(
-            moves.lock().unwrap().len(),
-            1,
-            "только перевод на фондирование, без возврата"
-        );
     }
 
     #[test]

@@ -13,6 +13,5 @@ pub mod mexc;
 pub mod okx;
 pub mod regions;
 pub mod rest;
-pub mod transfer;
 pub mod uniswap;
 pub mod upbit;

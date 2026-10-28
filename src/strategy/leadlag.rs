@@ -11,7 +11,7 @@
 //!   `leadLagMaxHoldMs`; выключение стратегии или торговли — тоже выход.
 
 use crate::market::book::Book;
-use crate::strategy::spotarb::Venue;
+use crate::strategy::Venue;
 use crate::trading::paper::{Amount, Side, split};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};

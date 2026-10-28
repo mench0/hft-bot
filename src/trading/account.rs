@@ -240,15 +240,8 @@ impl Account {
         matches!(self, Account::Live(_))
     }
 
-    /// Живой счёт.
-    pub fn live(&mut self) -> Option<&mut Live> {
-        match self {
-            Account::Live(l) => Some(l),
-            Account::Paper(_) => None,
-        }
-    }
-
     /// Бумажный счёт.
+    #[cfg(test)]
     pub fn paper(&mut self) -> Option<&mut Paper> {
         match self {
             Account::Paper(p) => Some(p),

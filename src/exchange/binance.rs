@@ -385,59 +385,7 @@ impl Client {
     }
 }
 
-impl Client {
-    /// Сети вывода и депозита монеты.
-    pub async fn networks(
-        &self,
-        coin: &str,
-    ) -> Result<Vec<crate::exchange::transfer::Net>, String> {
-        let v = self
-            .signed(reqwest::Method::GET, "/sapi/v1/capital/config/getall", &[])
-            .await?;
-        Ok(crate::exchange::transfer::binance_nets(&v, coin))
-    }
-
-    /// Адрес депозита монеты в сети (адрес, тег).
-    pub async fn deposit_address(
-        &self,
-        coin: &str,
-        network: &str,
-    ) -> Result<(String, String), String> {
-        let p = [("coin", coin.to_owned()), ("network", network.to_owned())];
-        let v = self
-            .signed(reqwest::Method::GET, "/sapi/v1/capital/deposit/address", &p)
-            .await?;
-        let a = v["address"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| format!("нет адреса: {v}"))?;
-        Ok((a.to_owned(), v["tag"].as_str().unwrap_or("").to_owned()))
-    }
-
-    /// Вывод; получатель получит amount − комиссия сети. Ответ — номер вывода.
-    pub async fn withdraw(
-        &self,
-        coin: &str,
-        network: &str,
-        address: &str,
-        tag: &str,
-        amount: f64,
-    ) -> Result<String, String> {
-        let mut p = vec![
-            ("coin", coin.to_owned()),
-            ("network", network.to_owned()),
-            ("address", address.to_owned()),
-            ("amount", dec(amount)),
-        ];
-        if !tag.is_empty() {
-            p.push(("addressTag", tag.to_owned()));
-        }
-        let v = self
-            .signed(reqwest::Method::POST, "/sapi/v1/capital/withdraw/apply", &p)
-            .await?;
-        Ok(v["id"].as_str().unwrap_or("").to_owned())
-    }
-}
+impl Client {}
 
 /// Адрес потока событий счёта перпов (к нему добавляется /listenKey); BINANCE_FSTREAM_URL — свой адрес.
 pub fn fstream_url(testnet: bool) -> String {

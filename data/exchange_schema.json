@@ -213,11 +213,6 @@
   "restart": false,
   "help": "Стакан старше — ордер отклоняется, мс"
  },
- "meanReversionEnabled": {
-  "default": "false",
-  "restart": false,
-  "help": "Возврат к среднему убран из бота: стратегия не включается (всегда false)"
- },
  "entryZ": {
   "default": "2",
   "min": 0.1,

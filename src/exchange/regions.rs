@@ -79,19 +79,14 @@ impl Distance {
 }
 
 /// Стратегии (id) и названия — в порядке Java.
-pub const STRATEGIES: [(&str, &str); 6] = [
+pub const STRATEGIES: [(&str, &str); 4] = [
     ("perp-arb", "Перп – перп на разных биржах"),
     ("stat-arb", "Статистический арбитраж"),
-    ("mean-reversion", "Возврат к среднему"),
-    (
-        "cross-exchange-arb",
-        "Спот – спот на разных биржах (сканер)",
-    ),
     ("lead-lag", "Lead-lag: ведущая биржа – ведомая"),
     ("spread-capture", "Сбор спреда (сканер)"),
 ];
 /// Соседний регион и блокчейн: без быстрых арбитражей и маркет-мейкинга.
-const SLOW: [&str; 2] = ["stat-arb", "mean-reversion"];
+const SLOW: [&str; 1] = ["stat-arb"];
 
 pub fn region(id: &str) -> Region {
     match id {
@@ -232,7 +227,7 @@ mod tests {
                 .contains("соседний регион")
         );
         assert!(why_not("spread-capture", None, "binance").is_none());
-        let mut s = vec![json!({"id": "cross-exchange-arb", "candidates": [
+        let mut s = vec![json!({"id": "lead-lag", "candidates": [
             {"exchange": "binance→gate", "verdict": "подходит", "suitable": true, "reasons": []},
             {"exchange": "binance→bybit", "verdict": "подходит", "suitable": true, "reasons": []}]})];
         mark(&mut s, Some(Region::Tokyo));
@@ -250,7 +245,7 @@ mod tests {
                 r["distance"].as_str(),
                 r["forYou"].as_array().unwrap().len()
             ),
-            (Some("рядом"), 6)
+            (Some("рядом"), 4)
         );
     }
 }

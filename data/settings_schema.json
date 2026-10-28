@@ -396,116 +396,6 @@
    "restart": false,
    "help": "Монеты или символы через запятую; пусто — все общие"
   },
-  "spotArbEnabled": {
-   "default": "true",
-   "restart": false,
-   "help": "Включена ли стратегия (вкладка «Стратегии»; ордера — только при tradingEnabled на обеих биржах). Спот – спот на разных биржах. Есть монета на бирже, где дороже, — продать там и одновременно купить там, где дешевле. Монеты нет — купить там, где дешевле, перевести по самой дешёвой общей сети и продать, когда придёт (spotArbTransfer)"
-  },
-  "spotArbCheckMs": {
-   "default": "200",
-   "min": 50.0,
-   "max": 60000.0,
-   "restart": true,
-   "help": "Как часто сравнивать стаканы, мс"
-  },
-  "spotArbMinProfitPercent": {
-   "default": "0.05",
-   "min": 0.0,
-   "max": 10.0,
-   "restart": false,
-   "help": "Вход: разница цен после двух комиссий тейкера не меньше, %"
-  },
-  "spotArbOrderQuote": {
-   "default": "50",
-   "min": 0.0,
-   "max": 1000000000.0,
-   "restart": false,
-   "help": "Размер сделки в котируемой валюте"
-  },
-  "spotArbMaxBookAgeMs": {
-   "default": "1000",
-   "min": 10.0,
-   "max": 60000.0,
-   "restart": false,
-   "help": "Оба стакана не старше, мс"
-  },
-  "spotArbDepthUsage": {
-   "default": "0.5",
-   "min": 0.01,
-   "max": 1.0,
-   "restart": false,
-   "help": "Какую долю объёма лучших уровней можно взять"
-  },
-  "spotArbCooldownMs": {
-   "default": "1000",
-   "min": 0.0,
-   "max": 600000.0,
-   "restart": false,
-   "help": "Пауза по монете после сделки, мс"
-  },
-  "spotArbSymbols": {
-   "default": "",
-   "format": "([A-Z0-9]+(,[A-Z0-9]+)*)?",
-   "restart": false,
-   "help": "Монеты или символы через запятую; пусто — все общие для бирж с market=spot"
-  },
-  "spotArbTransfer": {
-   "default": "true",
-   "restart": false,
-   "help": "Если монеты на бирже продажи нет — покупать там, где дешевле, и переводить по самой дешёвой общей сети (комиссия сети входит в расчёт выгоды; пока монета в пути, цена может уйти)"
-  },
-  "spotArbPaperTransferMinutes": {
-   "default": "10",
-   "min": 0.0,
-   "max": 1440.0,
-   "restart": false,
-   "help": "Бумага: сколько минут идёт перевод между биржами"
-  },
-  "spotArbPaperWithdrawFeeQuote": {
-   "default": "1",
-   "min": 0.0,
-   "max": 1000.0,
-   "restart": false,
-   "help": "Бумага: комиссия сети за перевод, в котируемой валюте"
-  },
-  "spotArbLiveWithdraw": {
-   "default": "false",
-   "restart": false,
-   "help": "Реальные выводы с биржи (live/testnet): нужны ключи с правом вывода и адреса депозита в белом списке биржи. Выключено — с переводом торгуется только бумага"
-  },
-  "spotArbTransferTimeoutMinutes": {
-   "default": "120",
-   "min": 1.0,
-   "max": 10080.0,
-   "restart": false,
-   "help": "Сколько ждать прихода реального перевода; дольше — круг помечается ошибкой (проверьте вывод на бирже)"
-  },
-  "spotArbMaxTransfers": {
-   "default": "3",
-   "min": 1.0,
-   "max": 50.0,
-   "restart": false,
-   "help": "Сколько переводов может идти одновременно"
-  },
-  "spotArbRebalance": {
-   "default": "false",
-   "restart": false,
-   "help": "Выравнивать котируемую валюту (USDT и т. п.) между биржами спот-арбитража: раз в spotArbRebalanceMinutes, когда кругов нет, половина разницы между самой богатой и самой бедной биржей переводится по самой дешёвой общей сети (комиссия сети ≤ 1% суммы). На бирже — только при spotArbLiveWithdraw"
-  },
-  "spotArbRebalanceMinQuote": {
-   "default": "200",
-   "min": 1.0,
-   "max": 1000000.0,
-   "restart": false,
-   "help": "С какой разницы свободной котируемой валюты между биржами выравнивать"
-  },
-  "spotArbRebalanceMinutes": {
-   "default": "30",
-   "min": 1.0,
-   "max": 1440.0,
-   "restart": false,
-   "help": "Как часто проверять, нужно ли выравнивание, мин"
-  },
   "leadLagEnabled": {
    "default": "true",
    "restart": false,
@@ -609,29 +499,6 @@
   }
  },
  "фильтры_стратегий": {
-  "mean-reversion": [
-   "discoveryMinVolume",
-   "discoveryMrMaxSpreadPercent",
-   "discoveryMrMinRangePercent",
-   "discoveryMrMaxRangePercent",
-   "discoveryMrMaxTrend",
-   "discoveryMinTrades24h",
-   "discoveryMaxFlatMinutesPercent",
-   "discoveryMinVolume1h",
-   "discoveryMinHourlyVolume",
-   "discoveryMinDepthMultiple",
-   "discoveryDepthBandPercent",
-   "discoveryMaxImpactPercent",
-   "discoveryMaxWallPercent",
-   "discoveryMinBookLevels",
-   "discoveryMaxTickPercent",
-   "discoveryMinBookBalance",
-   "discoveryMaxZeroVolumeMinutesPercent",
-   "discoveryExclude",
-   "discoveryBacktestPerExchange",
-   "discoveryBacktestWindow",
-   "discoveryBacktestMaxHoldBars"
-  ],
   "stat-arb": [
    "discoveryMinVolume",
    "discoveryMinTrades24h",
@@ -652,19 +519,6 @@
    "discoveryMinVolume1h",
    "discoveryMinHourlyVolume",
    "discoveryMaxZeroVolumeMinutesPercent",
-   "discoveryMinDepthMultiple",
-   "discoveryDepthBandPercent",
-   "discoveryMaxImpactPercent",
-   "discoveryMaxWallPercent",
-   "discoveryMinBookLevels",
-   "discoveryMaxTickPercent",
-   "discoveryMinBookBalance",
-   "discoveryExclude"
-  ],
-  "cross-exchange-arb": [
-   "discoveryArbMinVolume",
-   "discoveryArbMaxGrossPercent",
-   "discoveryMinTrades24h",
    "discoveryMinDepthMultiple",
    "discoveryDepthBandPercent",
    "discoveryMaxImpactPercent",

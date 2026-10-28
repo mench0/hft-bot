@@ -54,7 +54,6 @@ pub struct Bot {
     /// Статарб по биржам.
     statarbs: Mutex<HashMap<String, crate::strategy::statarb::StatArb>>,
     /// Межбиржевой арбитраж на споте (один на процесс).
-    spotarb: Mutex<crate::strategy::spotarb::SpotArb>,
     /// Lead-lag (один на процесс).
     leadlag: Mutex<crate::strategy::leadlag::LeadLag>,
     /// Арбитраж цен перпов между биржами (один на процесс).
@@ -129,7 +128,6 @@ impl Bot {
             matcher: Mutex::default(),
             spreads: Mutex::default(),
             statarbs: Mutex::default(),
-            spotarb: Mutex::default(),
             leadlag: Mutex::default(),
             perparb: Mutex::default(),
             screener: Arc::default(),
@@ -1054,16 +1052,15 @@ impl Bot {
                 self.guard_orphans(&ex, paper, &params, &owned, &books);
             }
         }
-        // межбиржевой арбитраж на споте: все счета сразу
-        let sp = crate::strategy::spotarb::Params::from(&self.settings());
+        // межбиржевые стратегии: все счета сразу
         let mut acc = self.accounts.lock().unwrap();
-        let mut venues: HashMap<String, crate::strategy::spotarb::Venue> = acc
+        let mut venues: HashMap<String, crate::strategy::Venue> = acc
             .iter_mut()
             .filter_map(|(ex, a)| {
                 let (books, lim) = cross.remove(ex)?;
                 Some((
                     ex.clone(),
-                    crate::strategy::spotarb::Venue {
+                    crate::strategy::Venue {
                         account: a,
                         trading: lim.trading_enabled,
                         lim,
@@ -1072,7 +1069,6 @@ impl Bot {
                 ))
             })
             .collect();
-        self.spotarb.lock().unwrap().step(&mut venues, &sp, now);
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -1177,9 +1173,6 @@ impl Bot {
         if crate::strategy::spread::Params::from(&p).enabled {
             ids.push(crate::strategy::spread::ID);
         }
-        if on("spotArbEnabled", false) {
-            ids.push("cross-exchange-arb");
-        }
         if on("perpArbEnabled", false) {
             ids.push("perp-arb");
         }
@@ -1203,7 +1196,6 @@ impl Bot {
             ("stat-arb", "статарбитраж"),
             ("perp-arb", "перп – перп на разных биржах"),
             ("spread-capture", "сбор спреда"),
-            ("cross-exchange-arb", "спот – спот на разных биржах"),
             ("lead-lag", "lead-lag"),
         ]
         .into();
@@ -1464,18 +1456,10 @@ impl Bot {
         });
     }
 
-    /// Межбиржевые стратегии для /arbitrage (как в Java): spotPrice — спот-арбитраж, perpPrice — перп-арбитраж,
+    /// Межбиржевые стратегии для /arbitrage (как в Java): perpPrice — перп-арбитраж,
     /// leadLag — lead-lag.
     pub fn arbitrage_json(&self) -> Value {
         let off = json!({"running": false});
-        let spot = if self.running() {
-            self.spotarb
-                .lock()
-                .unwrap()
-                .stats(&crate::strategy::spotarb::Params::from(&self.settings()))
-        } else {
-            off.clone()
-        };
         let ll = if self.running() {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1496,7 +1480,7 @@ impl Bot {
         } else {
             off.clone()
         };
-        json!({"perpPrice": pa, "spotPrice": spot, "leadLag": ll})
+        json!({"perpPrice": pa, "leadLag": ll})
     }
 
     /// Состояние стратегий биржи для админки (/strategies).

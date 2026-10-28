@@ -291,69 +291,6 @@ impl Client {
         }
     }
 
-    /// Сети вывода и депозита монеты.
-    pub async fn networks(
-        &self,
-        coin: &str,
-    ) -> Result<Vec<crate::exchange::transfer::Net>, String> {
-        let r = self
-            .call(false, "/v5/asset/coin/query-info", format!("coin={coin}"))
-            .await?;
-        Ok(crate::exchange::transfer::bybit_nets(&r))
-    }
-
-    /// Адрес депозита монеты в сети (адрес, тег).
-    pub async fn deposit_address(
-        &self,
-        coin: &str,
-        chain: &str,
-    ) -> Result<(String, String), String> {
-        let r = self
-            .call(
-                false,
-                "/v5/asset/deposit/query-address",
-                format!("chainType={chain}&coin={coin}"),
-            )
-            .await?;
-        let c = r["chains"]
-            .as_array()
-            .and_then(|a| {
-                a.iter()
-                    .find(|c| c["chainType"] == chain || c["chain"] == chain)
-                    .or(a.first())
-            })
-            .ok_or_else(|| format!("нет адреса: {r}"))?;
-        let a = c["addressDeposit"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| format!("нет адреса: {r}"))?;
-        Ok((
-            a.to_owned(),
-            c["tagDeposit"].as_str().unwrap_or("").to_owned(),
-        ))
-    }
-
-    /// Вывод с единого счёта; feeType 1 — комиссия из суммы (получатель получит amount − комиссия, как у Binance).
-    pub async fn withdraw(
-        &self,
-        coin: &str,
-        chain: &str,
-        address: &str,
-        tag: &str,
-        amount: f64,
-    ) -> Result<String, String> {
-        let ts = now_ms() + self.offset_ms.load(Ordering::Relaxed);
-        let mut b = json!({"coin": coin, "chain": chain, "address": address, "amount": dec(amount), "timestamp": ts,
-            "forceChain": 1, "accountType": "UNIFIED", "feeType": 1});
-        if !tag.is_empty() {
-            b["tag"] = Value::from(tag);
-        }
-        let r = self
-            .call(true, "/v5/asset/withdraw/create", b.to_string())
-            .await?;
-        Ok(r["id"].as_str().unwrap_or("").to_owned())
-    }
-
     /// Ордер по торговому сокету /v5/trade.
     pub fn ws_place(
         &self,
