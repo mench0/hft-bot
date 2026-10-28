@@ -7,7 +7,7 @@ use serde::Deserialize;
 /// Адрес по умолчанию.
 pub fn default_url(perp: bool, testnet: bool) -> &'static str {
     match (perp, testnet) {
-        (false, false) => "wss://stream.binance.com:9443/stream",
+        (false, false) => "wss://stream.binance.com:443/stream",
         (false, true) => "wss://stream.testnet.binance.vision/stream",
         (true, false) => "wss://fstream.binance.com/stream",
         (true, true) => "wss://fstream.binancefuture.com/stream",
