@@ -125,7 +125,12 @@ struct Pair {
     /// Последний спред выхода (для админки).
     last_exit: Option<f64>,
     opened_ms: u64,
+    /// Не повторять выход раньше (мс): биржа отклоняет — не слать ордер на каждом шаге движка.
+    retry_ms: u64,
 }
+
+/// Пауза между повторами выхода, мс.
+const RETRY_MS: u64 = 1_000;
 
 impl Pair {
     fn q(&self, ex: &str) -> f64 {
@@ -357,6 +362,7 @@ impl PerpArb {
             entry_spread: o.spread,
             last_exit: None,
             opened_ms: now_ms,
+            retry_ms: 0,
         };
         for (leg, side) in [(&o.short, Side::Sell), (&o.long, Side::Buy)] {
             let v = venues.get_mut(&leg.ex).unwrap();
@@ -490,8 +496,10 @@ impl PerpArb {
                         "[perp-arb] {c}: пара закрыта ({why}), результат {:.4}",
                         x.cash
                     );
-                } else {
-                    self.close(c, venues, why); // не всё закрылось — повтор
+                } else if now_ms >= pair.retry_ms {
+                    // не всё закрылось — повтор, не чаще раза в секунду
+                    self.pairs.get_mut(c).unwrap().retry_ms = now_ms + RETRY_MS;
+                    self.close(c, venues, why);
                 }
             }
             Stage::Open => {

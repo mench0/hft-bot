@@ -99,6 +99,9 @@ impl Params {
     }
 }
 
+/// Сколько раз пробовать продать монету после перевода.
+const SELL_TRIES: u32 = 10;
+
 /// Биржа для стратегии: счёт, торговля включена, стаканы выбранных монет.
 pub struct Venue<'a> {
     pub account: &'a mut Account,
@@ -158,6 +161,9 @@ struct Round {
     transit_ms: u64,
     /// Когда последний раз просили перенести депозит на торговый счёт.
     last_sweep: Option<Instant>,
+    /// Продажа после перевода: попыток и когда можно следующую.
+    sell_tries: u32,
+    retry_at: Option<Instant>,
 }
 
 impl Round {
@@ -514,6 +520,8 @@ impl SpotArb {
             rebalance: false,
             transit_ms: 0,
             last_sweep: None,
+            sell_tries: 0,
+            retry_at: None,
         });
         let v = venues.get_mut(buy).unwrap();
         let book = v.books.get(sym).cloned();
@@ -788,16 +796,31 @@ impl SpotArb {
                     set(self, Stage::Done);
                     return;
                 }
-                // продажа не прошла или исполнилась не целиком — продать остаток
+                // продажа не прошла или исполнилась не целиком — продать остаток: повтор раз в 5 с, после
+                // SELL_TRIES неудач круг — ошибка (монета остаётся на бирже продажи)
+                if r.retry_at.is_some_and(|t| now < t) {
+                    return;
+                }
+                if r.sell_tries >= SELL_TRIES {
+                    set(
+                        self,
+                        Stage::Failed(format!(
+                            "продажа {left} {coin} на {sell} не прошла за {SELL_TRIES} попыток — монета осталась на {sell}"
+                        )),
+                    );
+                    return;
+                }
+                if let Some(x) = self.rounds.iter_mut().find(|x| x.id == id) {
+                    x.sell_tries += 1;
+                    x.retry_at = Some(now + Duration::from_secs(5));
+                }
                 let v = venues.get_mut(&sell).unwrap();
                 let book = v.books.get(&sym).cloned();
                 match v.account.exit_market(&sym, Side::Sell, left, book.as_ref()) {
                     Ok(f) => self.track(id, &sell, f.order_id),
-                    Err(e) => set(
-                        self,
-                        Stage::Failed(format!(
-                            "продажа {left} {coin} на {sell}: {e} — монета осталась на {sell}"
-                        )),
+                    Err(e) => self.note(
+                        id,
+                        format!("продажа {left} {coin} на {sell}: {e} — повтор через 5 с"),
                     ),
                 }
             }
@@ -885,6 +908,8 @@ impl SpotArb {
                 rebalance: true,
                 transit_ms: 0,
                 last_sweep: None,
+                sell_tries: 0,
+                retry_at: None,
             });
             return;
         }

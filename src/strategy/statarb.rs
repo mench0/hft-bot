@@ -362,6 +362,19 @@ impl StatArb {
             return;
         }
         self.last_sample = Some(now);
+        // выход не прошёл (ошибка биржи или нет стакана) — повтор раз в statArbSampleMs, а не «закрывается» навсегда
+        let stuck: Vec<String> = self
+            .positions
+            .iter()
+            .filter(|(_, x)| x.closing && x.pending.is_empty() && !x.flat())
+            .map(|(n, _)| n.clone())
+            .collect();
+        for n in stuck {
+            if let Some(x) = self.positions.get_mut(&n) {
+                x.closing = false;
+            }
+            self.close(&n, books, acc, "повтор выхода");
+        }
         let max_age = p.max_data_age_ms.max(2 * p.sample.as_millis() as u64);
         let mid = |s: &str| {
             books
@@ -785,6 +798,96 @@ mod tests {
             "шорт A на сумму/β = {}: {short_a}",
             100.0 / beta
         );
+    }
+
+    /// Выход не прошёл (нет стакана одной ноги) — позиция не «закрывается» навсегда: повтор, когда стакан вернулся.
+    #[test]
+    fn failed_exit_is_retried() {
+        let mut paper = Paper::new(&["AAAUSDT".into(), "BBBUSDT".into()], 1000.0, 0.0, 0.0);
+        paper.set_perp(5.0);
+        let mut acc = Account::Paper(paper);
+        let mut sa = StatArb::default();
+        let p = Params {
+            order_quote: 100.0,
+            ..params()
+        };
+        let syms = vec!["AAAUSDT".to_string(), "BBBUSDT".to_string()];
+        let t0 = Instant::now();
+        let mut prices: Vec<(f64, f64)> = (0..30)
+            .map(|i| {
+                let x = (i as f64 * 0.7).sin();
+                (100.0 + x, 50.0 + x / 2.0 + (i as f64 * 1.3).cos() * 0.05)
+            })
+            .collect();
+        prices.extend([(96.0, 50.0), (96.0, 50.0)]); // вход
+        let mut i = 0u64;
+        let mut tick = |sa: &mut StatArb, acc: &mut Account, books: HashMap<String, Book>| {
+            sa.step(
+                &books,
+                acc,
+                &p,
+                &lim(),
+                &syms,
+                &HashSet::new(),
+                t0 + Duration::from_millis(20 * i),
+            );
+            i += 1;
+        };
+        for (a, b) in prices {
+            tick(
+                &mut sa,
+                &mut acc,
+                HashMap::from([
+                    ("AAAUSDT".to_string(), book(a)),
+                    ("BBBUSDT".to_string(), book(b)),
+                ]),
+            );
+        }
+        assert_eq!(sa.position_count(), 1, "вход был");
+        // ордера входа исполнены (бумага) — ждущих нет
+        sa.positions
+            .values_mut()
+            .for_each(|x| x.pending.retain(|id| acc.is_open(*id)));
+        // спред вернулся, но стакана B нет — выход по B не проходит
+        sa.close(
+            "AAAUSDT/BBBUSDT",
+            &HashMap::from([("AAAUSDT".to_string(), book(100.0))]),
+            &mut acc,
+            "тест",
+        );
+        let Account::Paper(pp) = &acc else {
+            unreachable!()
+        };
+        assert!(
+            pp.positions
+                .get("BBBUSDT")
+                .is_some_and(|x| x.qty.abs() > 1e-9),
+            "нога B осталась"
+        );
+        assert!(
+            sa.positions.values().all(|x| x.closing),
+            "позиция закрывается"
+        );
+        // стакан вернулся — повтор закрывает
+        for _ in 0..3 {
+            tick(
+                &mut sa,
+                &mut acc,
+                HashMap::from([
+                    ("AAAUSDT".to_string(), book(100.0)),
+                    ("BBBUSDT".to_string(), book(50.0)),
+                ]),
+            );
+        }
+        let Account::Paper(pp) = &acc else {
+            unreachable!()
+        };
+        assert!(
+            pp.positions.values().all(|x| x.qty.abs() < 1e-9),
+            "{:?}",
+            pp.positions
+        );
+        assert_eq!((sa.position_count(), sa.trades), (0, 1));
     }
 
     #[test]
