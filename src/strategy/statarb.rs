@@ -518,10 +518,16 @@ impl StatArb {
             }
         }
         if let (Some(h), Some(bid)) = (&hedge, hedge_bid) {
+            // спред ln A − β·ln B: на 1 у.е. в A — β у.е. в B. Лонг A — шорт B на β×сумма; лонг B — шорт A на сумма/β
+            let hedge_quote = if long_a {
+                p.order_quote * beta
+            } else {
+                p.order_quote / beta
+            };
             match acc.order(
                 h,
                 Side::Sell,
-                Amount::Qty(p.order_quote * beta / bid),
+                Amount::Qty(hedge_quote / bid),
                 None,
                 books.get(h),
                 lim,
@@ -714,6 +720,71 @@ mod tests {
         assert!(sa.total_pnl > 0.0, "{}", sa.total_pnl);
         assert!(!sa.active());
         assert!(!acc.balances().contains_key("AAAUSDT"));
+    }
+
+    /// z > 0 (A дорогая): лонг B на сумму, шорт A на сумму/β (β ≈ 2 — A движется вдвое сильнее B в логарифмах).
+    #[test]
+    fn perp_short_a_hedge_is_quote_over_beta() {
+        let mut paper = Paper::new(&["AAAUSDT".into(), "BBBUSDT".into()], 10_000.0, 0.0, 0.0);
+        paper.set_perp(5.0);
+        let mut acc = Account::Paper(paper);
+        let mut sa = StatArb::default();
+        let p = Params {
+            order_quote: 100.0,
+            ..params()
+        };
+        let syms = vec!["AAAUSDT".to_string(), "BBBUSDT".to_string()];
+        let t0 = Instant::now();
+        let mut prices: Vec<(f64, f64)> = (0..30)
+            .map(|i| {
+                let x = (i as f64 * 0.7).sin();
+                (100.0 + x, 50.0 + x / 4.0 + (i as f64 * 1.3).cos() * 0.005)
+            })
+            .collect();
+        prices.push((100.1, 50.0)); // A подорожала — вход: лонг B, шорт A
+        for (i, (a, b)) in prices.into_iter().enumerate() {
+            let books = HashMap::from([
+                ("AAAUSDT".to_string(), book(a)),
+                ("BBBUSDT".to_string(), book(b)),
+            ]);
+            sa.step(
+                &books,
+                &mut acc,
+                &p,
+                &lim(),
+                &syms,
+                &HashSet::new(),
+                t0 + Duration::from_millis(20 * i as u64),
+            );
+        }
+        let Account::Paper(pp) = &acc else {
+            unreachable!()
+        };
+        let buy_b: f64 = pp
+            .execs
+            .iter()
+            .filter(|e| e.symbol == "BBBUSDT" && e.side == Side::Buy)
+            .map(|e| e.qty * e.price)
+            .sum();
+        let short_a: f64 = pp
+            .execs
+            .iter()
+            .filter(|e| e.symbol == "AAAUSDT" && e.side == Side::Sell)
+            .map(|e| e.qty * e.price)
+            .sum();
+        let beta = sa.windows[0].beta.abs();
+        assert!(beta > 1.5 && beta < 2.5, "β = {beta}");
+        assert!(
+            (buy_b - 100.0).abs() < 2.0,
+            "лонг B на сумму: {buy_b}, z = {}, корр = {}",
+            sa.windows[0].z,
+            sa.windows[0].corr
+        );
+        assert!(
+            (short_a - 100.0 / beta).abs() < 5.0,
+            "шорт A на сумму/β = {}: {short_a}",
+            100.0 / beta
+        );
     }
 
     #[test]
