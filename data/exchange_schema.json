@@ -213,69 +213,6 @@
   "restart": false,
   "help": "Стакан старше — ордер отклоняется, мс"
  },
- "entryZ": {
-  "default": "2",
-  "min": 0.1,
-  "max": 20.0,
-  "restart": false,
-  "help": "Вход, когда цена ниже (лонг) или, на фьючерсах, выше (шорт) среднего на столько сигм"
- },
- "exitZ": {
-  "default": "0.3",
-  "min": -20.0,
-  "max": 20.0,
-  "restart": false,
-  "help": "Выход, когда отклонение вернулось к этому значению"
- },
- "stopLossPercent": {
-  "default": "0.5",
-  "min": 0.01,
-  "max": 100.0,
-  "restart": false,
-  "help": "Стоп-лосс, %"
- },
- "minImbalance": {
-  "default": "0.15",
-  "min": -1.0,
-  "max": 1.0,
-  "restart": false,
-  "help": "Минимальный перевес бидов (для шорта — асков) в стакане для входа"
- },
- "imbalanceLevels": {
-  "default": "5",
-  "min": 1.0,
-  "max": 1000.0,
-  "restart": false,
-  "help": "По скольким уровням считается перевес"
- },
- "orderQuote": {
-  "default": "20",
-  "min": 0.0,
-  "max": 1000000000.0,
-  "restart": false,
-  "help": "Размер сделки в котируемой валюте"
- },
- "maxBookAgeMs": {
-  "default": "2000",
-  "min": 10.0,
-  "max": 600000.0,
-  "restart": false,
-  "help": "Вход только по стакану не старше, мс"
- },
- "maxSpreadPercent": {
-  "default": "0.1",
-  "min": 0.0,
-  "max": 100.0,
-  "restart": false,
-  "help": "Не входить при спреде шире, %"
- },
- "positionTimeoutMs": {
-  "default": "3600000",
-  "min": 1000.0,
-  "max": 604800000.0,
-  "restart": false,
-  "help": "Закрыть позицию по таймауту, мс"
- },
  "bookDepth": {
   "default": "20",
   "min": 1.0,
