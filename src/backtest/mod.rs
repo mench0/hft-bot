@@ -89,12 +89,15 @@ pub fn run(recs: &[Rec], cfg: &Config) -> Value {
     let ex = cfg.exchange.as_str();
     let syms: Vec<String> = cfg.symbols.iter().map(|s| s.to_uppercase()).collect();
     let mine = |e: &Name, s: &Name| e.as_str() == ex && syms.iter().any(|x| x == s.as_str());
+    // лучшие цены других бирж по тем же монетам — для защиты от токсичного потока
+    let toxic = spread::Params::from(&cfg.params).toxic_move_percent > 0.0;
+    let other =
+        |e: &Name, s: &Name| toxic && e.as_str() != ex && syms.iter().any(|x| x == s.as_str());
     let mut recs: Vec<Rec> = recs
         .iter()
         .filter(|r| match &r.ev {
-            Event::Bbo { ex, sym, .. }
-            | Event::Trade { ex, sym, .. }
-            | Event::Depth { ex, sym, .. } => mine(ex, sym),
+            Event::Bbo { ex, sym, .. } => mine(ex, sym) || other(ex, sym),
+            Event::Trade { ex, sym, .. } | Event::Depth { ex, sym, .. } => mine(ex, sym),
             _ => false,
         })
         .cloned()
@@ -105,7 +108,8 @@ pub fn run(recs: &[Rec], cfg: &Config) -> Value {
     };
     let sim = Sim::start(first);
     let (truth, view) = (Market::default(), Market::default());
-    let mut delayed: VecDeque<(u64, Update)> = VecDeque::new();
+    let mut delayed: VecDeque<(u64, String, Update)> = VecDeque::new();
+    let mut other_bbo = 0u64;
     let lat_ns = cfg.latency_ms * 1_000_000;
     let mut acc = Account::Paper(Paper::new(
         &syms,
@@ -192,13 +196,16 @@ pub fn run(recs: &[Rec], cfg: &Config) -> Value {
         while next_tick <= r.ts {
             sim.set(next_tick);
             while delayed.front().is_some_and(|d| d.0 <= next_tick) {
-                let (_, u) = delayed.pop_front().unwrap();
-                apply(&view, ex, u);
+                let (_, e, u) = delayed.pop_front().unwrap();
+                apply(&view, &e, u);
             }
             let now_ms = clock::now_ms();
             for s in &syms {
                 let book = view.book(ex, s);
                 let mins = minutes.get(s).and_then(|m| m.last(now_ms));
+                if sp.toxic_move_percent > 0.0 {
+                    sc.note_move(s, view.move_bps(s, ex, sp.toxic_window));
+                }
                 sc.step(
                     s,
                     book.as_ref(),
@@ -223,6 +230,25 @@ pub fn run(recs: &[Rec], cfg: &Config) -> Value {
         sim.set(r.ts);
         events += 1;
         match r.ev {
+            // другая биржа: только то, что видит стратегия (с той же задержкой)
+            Event::Bbo {
+                ex: e,
+                sym,
+                bid,
+                bid_qty,
+                ask,
+                ask_qty,
+                ..
+            } if e.as_str() != ex => {
+                other_bbo += 1;
+                let u = Update::Best {
+                    sym: sym.as_str().to_owned(),
+                    bid: (bid, bid_qty),
+                    ask: (ask, ask_qty),
+                    id: 0,
+                };
+                delayed.push_back((r.ts + lat_ns, e.as_str().to_owned(), u));
+            }
             Event::Bbo {
                 sym,
                 bid,
@@ -239,7 +265,7 @@ pub fn run(recs: &[Rec], cfg: &Config) -> Value {
                     id: 0,
                 };
                 apply(&truth, ex, u.clone());
-                delayed.push_back((r.ts + lat_ns, u));
+                delayed.push_back((r.ts + lat_ns, ex.to_owned(), u));
                 if let Some(b) = truth.book(ex, &s) {
                     acc.match_book(&s, &b, &lim, strict);
                 }
@@ -266,7 +292,7 @@ pub fn run(recs: &[Rec], cfg: &Config) -> Value {
                     id: 0,
                 };
                 apply(&truth, ex, u.clone());
-                delayed.push_back((r.ts + lat_ns, u));
+                delayed.push_back((r.ts + lat_ns, ex.to_owned(), u));
             }
             Event::Trade {
                 sym, px, qty, buy, ..
@@ -313,6 +339,9 @@ pub fn run(recs: &[Rec], cfg: &Config) -> Value {
         .count();
     let mut report = crate::record::report::build(out_recs);
     let markout = report["markout"].take();
+    if toxic && other_bbo == 0 {
+        warnings.push("защита от токсичного потока включена, но в записи нет цен этих монет на других биржах — она не срабатывала".into());
+    }
     if cfg.fill != Fill::Touch && trades_seen == 0 {
         warnings.push("в записи нет сделок рынка по этим монетам: исполнение только когда стакан прошёл сквозь цену заявки (fill=touch — оптимистичнее)".into());
     }

@@ -42,6 +42,10 @@ pub struct Params {
     pub min_spread_presence_percent: f64,
     pub jump_ticks: f64,
     pub max_jumps_per_min: usize,
+    /// Защита от токсичного потока: движение на другой бирже, %, за окно — заявка против движения снимается на паузу.
+    pub toxic_move_percent: f64,
+    pub toxic_window: Duration,
+    pub toxic_pause: Duration,
 }
 
 impl Params {
@@ -69,6 +73,9 @@ impl Params {
             min_spread_presence_percent: f("scMinSpreadPresencePercent", 0.0),
             jump_ticks: f("scJumpTicks", 0.0),
             max_jumps_per_min: f("scMaxJumpsPerMin", 6.0) as usize,
+            toxic_move_percent: f("scToxicMovePercent", 0.0),
+            toxic_window: Duration::from_millis(f("scToxicWindowMs", 500.0) as u64),
+            toxic_pause: Duration::from_millis(f("scToxicPauseMs", 1000.0) as u64),
         }
     }
 }
@@ -120,6 +127,11 @@ struct State {
     decision: String,
     q_bid: Queue,
     q_ask: Queue,
+    /// Защита от токсичного потока: до какого момента не ставить покупку / продажу, почему, сколько раз срабатывала.
+    toxic_bid_until: Option<Instant>,
+    toxic_ask_until: Option<Instant>,
+    toxic_note: Option<String>,
+    toxic_pauses: u64,
 }
 
 /// Стратегия одной биржи.
@@ -131,6 +143,8 @@ pub struct SpreadCapture {
     own: HashMap<u64, String>,
     /// Последнее учтённое исполнение счёта.
     seen: u64,
+    /// Движение цены монеты на других биржах (б.п., биржа) — задаёт движок перед шагом (note_move).
+    moves: HashMap<String, (f64, String)>,
 }
 
 impl SpreadCapture {
@@ -141,6 +155,19 @@ impl SpreadCapture {
             states: HashMap::new(),
             own: HashMap::new(),
             seen: 0,
+            moves: HashMap::new(),
+        }
+    }
+
+    /// Движение цены монеты на других биржах за окно защиты (None — нет данных) — перед step.
+    pub fn note_move(&mut self, sym: &str, m: Option<(f64, String)>) {
+        match m {
+            Some(m) => {
+                self.moves.insert(sym.to_owned(), m);
+            }
+            None => {
+                self.moves.remove(sym);
+            }
         }
     }
 
@@ -260,6 +287,53 @@ impl SpreadCapture {
         let mid = (bid + ask) / 2.0;
         let s = self.states.entry(sym.to_owned()).or_default();
         count_top(s, bid, ask, now);
+        // защита от токсичного потока: сразу, не дожидаясь переставления заявок
+        if p.toxic_move_percent > 0.0
+            && let Some((bps, src)) = self.moves.get(sym).cloned()
+            && bps.abs() >= p.toxic_move_percent * 100.0
+        {
+            let s = self.states.get_mut(sym).unwrap();
+            let until = Some(now + p.toxic_pause);
+            let buy = bps < 0.0;
+            let was = if buy {
+                s.toxic_bid_until
+            } else {
+                s.toxic_ask_until
+            };
+            if was.is_none_or(|t| t <= now) {
+                s.toxic_pauses += 1;
+            }
+            if buy {
+                s.toxic_bid_until = until;
+            } else {
+                s.toxic_ask_until = until;
+            }
+            s.toxic_note = Some(format!(
+                "{src} сдвинулся на {:+.3}% — {} снята на {} мс",
+                bps / 100.0,
+                if buy {
+                    "покупка"
+                } else {
+                    "продажа"
+                },
+                p.toxic_pause.as_millis()
+            ));
+        }
+        let s = self.states.get_mut(sym).unwrap();
+        let (block_bid, block_ask) = (
+            s.toxic_bid_until.is_some_and(|t| t > now),
+            s.toxic_ask_until.is_some_and(|t| t > now),
+        );
+        if !block_bid && !block_ask {
+            s.toxic_note = None;
+        }
+        if block_bid && s.bid.is_some() {
+            self.cancel(paper, sym, true);
+        }
+        if block_ask && self.states[sym].ask.is_some() {
+            self.cancel(paper, sym, false);
+        }
+        let s = self.states.get_mut(sym).unwrap();
         if s.last_step
             .is_some_and(|t| now.duration_since(t) < p.requote)
         {
@@ -307,12 +381,15 @@ impl SpreadCapture {
         let s = &self.states[sym];
         let held = s.bid.map_or(0.0, |q| q.qty * q.price);
         let want_bid = qty > 0.0
+            && !block_bid
             && s.thin.is_none()
             && s.market.is_none()
             && s.flow.is_none()
             && s.inv * mid + qty * bid <= p.max_inventory_quote + 1e-9
             && paper.free(&quote) + held >= qty * bid * (1.0 + self.maker);
-        let decision = if want_bid {
+        let decision = if let Some(t) = &s.toxic_note {
+            format!("пауза: {t}")
+        } else if want_bid {
             "покупаем и продаём".to_owned()
         } else {
             format!(
@@ -351,7 +428,7 @@ impl SpreadCapture {
             paper,
             sym,
             Side::Sell,
-            ask_qty > 0.0,
+            ask_qty > 0.0 && !block_ask,
             ask_px,
             ask_qty,
             b,
@@ -481,7 +558,7 @@ impl SpreadCapture {
             "market": s.market.as_ref().map_or("можно покупать".to_owned(), |m| format!("{m} — только продажа")),
             "topChangesPerSec": (s.top_per_sec * 10.0).round() / 10.0,
             "decision": s.decision,
-            "bidQueue": queue_json(&s.q_bid), "askQueue": queue_json(&s.q_ask), "jumps": s.jumps,
+            "bidQueue": queue_json(&s.q_bid), "askQueue": queue_json(&s.q_ask), "jumps": s.jumps, "toxicPauses": s.toxic_pauses,
             "jumpPauseSec": s.jump_pause_until.filter(|t| *t > Instant::now()).map(|t| (t - Instant::now()).as_secs()),
             "flow": s.flow.as_ref().map_or("сделки и спред в порядке".to_owned(), |f| format!("{f} — только продажа")),
             "tradeMinutes": s.trade_minutes.map(|n| format!("{n} из 5")),

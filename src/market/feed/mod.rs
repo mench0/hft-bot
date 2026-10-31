@@ -418,6 +418,17 @@ pub fn start(
 
 /// Применить обновление к стакану; символ, чей стакан изменился (None — служебное или сделка).
 pub fn apply(market: &Market, ex: &str, u: Update) -> Option<String> {
+    let sym = apply_book(market, ex, u)?;
+    let mid = market.with_book(ex, &sym, |b| {
+        Some((b.best_bid()?.0 + b.best_ask()?.0) / 2.0)
+    });
+    if let Some(m) = mid {
+        market.note_mid(ex, &sym, m);
+    }
+    Some(sym)
+}
+
+fn apply_book(market: &Market, ex: &str, u: Update) -> Option<String> {
     Some(match u {
         Update::Time(ts) => {
             EX_TS.with(|t| t.set(ts));

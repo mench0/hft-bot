@@ -32,6 +32,8 @@ struct Acc {
     gaps: HashMap<String, u64>,
     /// Сделки: (кол-во, оборот, оборот покупок).
     flow: HashMap<Key, (u64, f64, f64)>,
+    /// Сделки рынка по времени: (мс, покупатель-агрессор).
+    trades: HashMap<Key, Vec<(u64, bool)>>,
 }
 
 impl Acc {
@@ -73,6 +75,10 @@ impl Acc {
                         .or_default()
                         .push(ms as i64 - *ts_ex as i64);
                 }
+                self.trades
+                    .entry((ex.as_str().to_owned(), sym.as_str().to_owned()))
+                    .or_default()
+                    .push((ms, *buy));
                 let f = self
                     .flow
                     .entry((ex.as_str().to_owned(), sym.as_str().to_owned()))
@@ -163,6 +169,108 @@ fn markout(a: &Acc) -> Value {
                     };
                 }
                 o
+            })
+            .collect(),
+    )
+}
+
+/// Окно «перед исполнением» для причин, мс, и порог движения другой биржи, б.п.
+const CAUSE_WINDOW_MS: u64 = 500;
+const CAUSE_MOVE_BPS: f64 = 3.0;
+
+/// Причины исполнения: что было перед ним. Против нас — для покупки цена шла вниз (и наоборот).
+fn causes(a: &Acc, ex: &str, sym: &str, t: u64, buy: bool) -> Vec<(&'static str, &'static str)> {
+    let sign = if buy { 1.0 } else { -1.0 };
+    // другая биржа по той же монете сдвинулась против нас за окно
+    let mut moved = None;
+    for ((e, s), m) in &a.mids {
+        if s != sym || e == ex {
+            continue;
+        }
+        if let (Some(a0), Some(a1)) = (mid_at(m, t.saturating_sub(CAUSE_WINDOW_MS)), mid_at(m, t)) {
+            let bps = sign * (a1 - a0) / a0 * 1e4;
+            moved = Some(moved.map_or(bps, |x: f64| x.min(bps)));
+        }
+    }
+    let other = match moved {
+        None => "нет данных другой биржи",
+        Some(b) if b <= -CAUSE_MOVE_BPS => "другая биржа сдвинулась против нас",
+        Some(b) if b >= CAUSE_MOVE_BPS => "другая биржа сдвинулась в нашу пользу",
+        Some(_) => "другие биржи спокойны",
+    };
+    // серия сделок, бьющих в нашу сторону (для покупки — продавцы-агрессоры), за окно
+    let run = match a.trades.get(&(ex.to_owned(), sym.to_owned())) {
+        None => "нет сделок рынка",
+        Some(v) => {
+            let from = v.partition_point(|x| x.0 < t.saturating_sub(CAUSE_WINDOW_MS));
+            let to = v.partition_point(|x| x.0 <= t);
+            let w = &v[from..to];
+            let against = w.iter().filter(|x| x.1 != buy).count();
+            if w.len() >= 3 && against * 10 >= w.len() * 8 {
+                "серия сделок в нашу заявку"
+            } else {
+                "без серии сделок"
+            }
+        }
+    };
+    // последние 3 минуты часа (по UTC)
+    let minute = (t / 60_000) % 60;
+    let hour = if minute >= 57 {
+        "последние 3 минуты часа"
+    } else {
+        "остальное время"
+    };
+    vec![
+        ("другая биржа за 500 мс", other),
+        ("сделки за 500 мс", run),
+        ("время", hour),
+    ]
+}
+
+/// Суммы по причине: исполнений, сумма и число markout на 1 с, на 5 с.
+type CauseSum = (u64, f64, u64, f64, u64);
+
+/// Markout через 1 и 5 с по причинам исполнения: где именно нас «забирают».
+fn markout_by_cause(a: &Acc) -> Value {
+    // (фактор, значение) → исполнений, суммы и число на 1 с и 5 с
+    let mut by: BTreeMap<(&str, &str), CauseSum> = BTreeMap::new();
+    for (ex, sym, t, px, _, buy, _) in &a.fills {
+        let Some(m) = a.mids.get(&(ex.clone(), sym.clone())) else {
+            continue;
+        };
+        let sign = if *buy { 1.0 } else { -1.0 };
+        let last = m.last().map_or(0, |x| x.0);
+        let mk = |h: u64| {
+            (t + h <= last)
+                .then(|| mid_at(m, t + h))
+                .flatten()
+                .map(|mh| sign * (mh - px) / px * 1e4)
+        };
+        let (m1, m5) = (mk(1_000), mk(5_000));
+        for c in causes(a, ex, sym, *t, *buy) {
+            let e = by.entry(c).or_default();
+            e.0 += 1;
+            if let Some(v) = m1 {
+                e.1 += v;
+                e.2 += 1;
+            }
+            if let Some(v) = m5 {
+                e.3 += v;
+                e.4 += 1;
+            }
+        }
+    }
+    let avg = |s: f64, n: u64| {
+        if n > 0 {
+            json!(r2(s / n as f64))
+        } else {
+            Value::Null
+        }
+    };
+    Value::Array(
+        by.into_iter()
+            .map(|((f, v), (n, s1, n1, s5, n5))| {
+                json!({"factor": f, "value": v, "fills": n, "markout1000msBps": avg(s1, n1), "markout5000msBps": avg(s5, n5)})
             })
             .collect(),
     )
@@ -284,7 +392,11 @@ pub fn build(recs: impl IntoIterator<Item = Rec>) -> Value {
     for v in a.mids.values_mut() {
         v.sort_by_key(|x| x.0);
     }
-    json!({"events": n, "fills": a.fills.len(), "markout": markout(&a), "latency": latency(&mut a),
+    for v in a.trades.values_mut() {
+        v.sort_by_key(|x| x.0);
+    }
+    json!({"events": n, "fills": a.fills.len(), "markout": markout(&a), "markoutByCause": markout_by_cause(&a),
+        "latency": latency(&mut a),
         "leaders": leaders(&a), "flow": flow(&a), "horizonsMs": HORIZONS})
 }
 
@@ -423,6 +535,15 @@ mod tests {
         );
         assert_eq!(l["lagMs"], 200);
         assert_eq!(v["flow"][0]["buyShare"], 1.0);
+        let by = v["markoutByCause"].as_array().unwrap();
+        assert!(
+            by.iter().any(|r| r["factor"] == "время" && r["fills"] == 2),
+            "{by:?}"
+        );
+        assert!(
+            by.iter().any(|r| r["factor"] == "другая биржа за 500 мс"),
+            "{by:?}"
+        );
     }
 
     #[test]
@@ -449,5 +570,74 @@ mod tests {
             v["markout"][0]["markout5000msBps"].as_f64().unwrap() < -40.0,
             "{v}"
         );
+    }
+}
+
+#[cfg(test)]
+mod cause_tests {
+    use super::super::event::{BUY, Event, Name, Rec};
+
+    fn bbo(ms: u64, ex: &str, mid: f64) -> Rec {
+        Rec {
+            ts: ms * 1_000_000,
+            ev: Event::Bbo {
+                ex: Name::new(ex),
+                sym: Name::new("XUSDT"),
+                ts_ex: 0,
+                bid: mid - 0.01,
+                bid_qty: 1.0,
+                ask: mid + 0.01,
+                ask_qty: 1.0,
+            },
+        }
+    }
+
+    #[test]
+    fn fills_after_leader_drop_are_marked_against_us() {
+        let mut recs = vec![bbo(0, "binance", 100.0), bbo(0, "okx", 100.0)];
+        // binance падает на 10 б.п. за 200 мс до нашей покупки на okx, okx догоняет через 300 мс
+        recs.push(bbo(9_800, "binance", 99.9));
+        recs.push(bbo(10_300, "okx", 99.9));
+        recs.push(bbo(20_000, "binance", 99.9));
+        recs.push(bbo(20_000, "okx", 99.9));
+        // три продажи-агрессора перед исполнением
+        for k in 0..3 {
+            recs.push(Rec {
+                ts: (9_900 + k * 10) * 1_000_000,
+                ev: Event::Trade {
+                    ex: Name::new("okx"),
+                    sym: Name::new("XUSDT"),
+                    ts_ex: 0,
+                    px: 99.99,
+                    qty: 1.0,
+                    buy: false,
+                },
+            });
+        }
+        recs.push(Rec {
+            ts: 10_000 * 1_000_000,
+            ev: Event::Fill {
+                ex: Name::new("okx"),
+                sym: Name::new("XUSDT"),
+                id: 1,
+                side: BUY,
+                qty: 1.0,
+                price: 99.99,
+                fee: 0.0,
+            },
+        });
+        recs.sort_by_key(|r| r.ts);
+        let v = super::build(recs);
+        let by = v["markoutByCause"].as_array().unwrap();
+        let row = |f: &str| by.iter().find(|r| r["factor"] == f).unwrap();
+        assert_eq!(
+            row("другая биржа за 500 мс")["value"],
+            "другая биржа сдвинулась против нас"
+        );
+        assert_eq!(
+            row("сделки за 500 мс")["value"],
+            "серия сделок в нашу заявку"
+        );
+        assert!(row("время")["markout1000msBps"].as_f64().unwrap() < -5.0);
     }
 }

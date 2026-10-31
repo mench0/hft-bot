@@ -173,3 +173,48 @@ fn validate_compares_with_recorded_fills() {
     );
     assert!(v["sim"]["equity"].is_null());
 }
+
+#[test]
+fn toxic_guard_pulls_bid_after_other_exchange_drops() {
+    let mut recs = market();
+    let t0 = 1_761_900_000_000_000_000u64;
+    // binance: каждые 10 с падает на 0.2 % и через 2 с возвращается
+    for k in 0..60u64 {
+        let ts = t0 + k * 10_000_000_000;
+        for (dt, mid) in [(0u64, 100.0), (7_900_000_000, 99.8), (9_900_000_000, 100.0)] {
+            recs.push(Rec {
+                ts: ts + dt,
+                ev: Event::Bbo {
+                    ex: Name::new("binance"),
+                    sym: Name::new("XUSDT"),
+                    ts_ex: 0,
+                    bid: mid - 0.01,
+                    bid_qty: 1.0,
+                    ask: mid + 0.01,
+                    ask_qty: 1.0,
+                },
+            });
+        }
+    }
+    let off = run(&recs, &cfg(Fill::Trade));
+    let mut c = cfg(Fill::Trade);
+    c.params.insert("scToxicMovePercent".into(), 0.1.into());
+    c.params.insert("scToxicPauseMs".into(), 1500.into());
+    let on = run(&recs, &c);
+    let pauses = on["strategy"][0]["toxicPauses"].as_u64().unwrap();
+    assert!(pauses >= 50, "{pauses}");
+    assert!(
+        on["fills"].as_u64() < off["fills"].as_u64(),
+        "on {} off {}",
+        on["fills"],
+        off["fills"]
+    );
+    assert_eq!(off["strategy"][0]["toxicPauses"], 0);
+    assert!(
+        on["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|w| !w.as_str().unwrap().contains("токсичного"))
+    );
+}

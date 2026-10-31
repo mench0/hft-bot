@@ -54,6 +54,8 @@ pub struct Market {
     minutes: Mutex<HashMap<(String, String), Minutes>>,
     /// Funding перпов по (биржа, символ).
     funding: Mutex<HashMap<(String, String), Funding>>,
+    /// Середина цены по (биржа, символ) за последние секунды — для защиты от токсичного потока.
+    moves: Mutex<HashMap<(String, String), Mids>>,
 }
 
 /// Ставка funding: текущая (доля), время следующего списания (мс), цена маркировки.
@@ -64,7 +66,58 @@ pub struct Funding {
     pub mark: f64,
 }
 
+/// Середины цены по времени.
+type Mids = std::collections::VecDeque<(std::time::Instant, f64)>;
+
+/// Сколько хранить середины для moves, с.
+const MOVES_KEEP_SECS: u64 = 10;
+
 impl Market {
+    /// Середина цены изменилась (фид).
+    pub fn note_mid(&self, ex: &str, sym: &str, mid: f64) {
+        let now = crate::infra::clock::now();
+        let mut m = self.moves.lock().unwrap();
+        let q = m.entry((ex.to_owned(), sym.to_owned())).or_default();
+        if q.back().is_some_and(|x| x.1 == mid) {
+            return;
+        }
+        q.push_back((now, mid));
+        while q
+            .front()
+            .is_some_and(|x| now.duration_since(x.0).as_secs() > MOVES_KEEP_SECS)
+        {
+            q.pop_front();
+        }
+    }
+
+    /// Самое сильное движение середины монеты на других биржах за окно, б.п. (минус — падение), и биржа.
+    pub fn move_bps(
+        &self,
+        sym: &str,
+        except: &str,
+        window: std::time::Duration,
+    ) -> Option<(f64, String)> {
+        let now = crate::infra::clock::now();
+        let from = now.checked_sub(window)?;
+        let m = self.moves.lock().unwrap();
+        let mut best: Option<(f64, String)> = None;
+        for ((ex, s), q) in m.iter() {
+            if s != sym || ex == except {
+                continue;
+            }
+            // цена на начало окна — последняя до него (или первая в окне), сейчас — последняя
+            let i = q.partition_point(|x| x.0 <= from);
+            let (Some(a), Some(b)) = (q.get(i.saturating_sub(1)), q.back()) else {
+                continue;
+            };
+            let bps = (b.1 - a.1) / a.1 * 1e4;
+            if best.as_ref().is_none_or(|x| bps.abs() > x.0.abs()) {
+                best = Some((bps, ex.clone()));
+            }
+        }
+        best
+    }
+
     /// Изменить стакан символа (создаётся при первом обращении).
     pub fn with_book<R>(&self, ex: &str, sym: &str, f: impl FnOnce(&mut Book) -> R) -> R {
         let mut all = self.books.lock().unwrap();

@@ -1006,6 +1006,9 @@ impl Bot {
                         self.market
                             .minutes(&ex, sym, std::time::Duration::from_secs(180));
                     let filter = paper.filter(sym);
+                    if sp.toxic_move_percent > 0.0 {
+                        sc.note_move(sym, self.market.move_bps(sym, &ex, sp.toxic_window));
+                    }
                     sc.step(sym, book, paper, &sp, &lim, now, minutes.as_deref(), filter);
                 } else if sc.active() {
                     sc.stop_symbol(paper, sym, book, "стратегия или торговля выключена");
