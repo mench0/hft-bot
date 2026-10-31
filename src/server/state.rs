@@ -341,6 +341,9 @@ impl Bot {
             .cloned()
             .unwrap_or_default();
         crate::infra::journal::set_on(v == true || v == "true");
+        // запись — одна на процесс; в тестах ботов много, её включает только тест записи
+        #[cfg(not(test))]
+        crate::record::configure(&self.settings());
     }
 
     pub fn update_settings(&self, upd: &Map<String, Value>) -> ActionResult<()> {

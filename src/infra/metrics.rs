@@ -389,12 +389,34 @@ fn runtime(o: &mut Out) {
 }
 
 /// Все метрики.
+/// Запись событий (record): включена, записано, потеряно, сжатых байт, в очереди.
+fn recorder(o: &mut Out) {
+    let (on, written, dropped, bytes, queue) = crate::record::metrics();
+    o.gauge(
+        "hft_record_enabled",
+        "1 если запись событий для исследований включена",
+    );
+    o.line("hft_record_enabled", &[], b(on));
+    o.counter("hft_record_events_total", "Событий записано в файлы");
+    o.line("hft_record_events_total", &[], written as f64);
+    o.counter(
+        "hft_record_dropped_total",
+        "Событий потеряно: очередь записи была полна (торговля не ждёт)",
+    );
+    o.line("hft_record_dropped_total", &[], dropped as f64);
+    o.counter("hft_record_bytes_total", "Сжатых байт записано на диск");
+    o.line("hft_record_bytes_total", &[], bytes as f64);
+    o.gauge("hft_record_queue", "Событий в очереди записи");
+    o.line("hft_record_queue", &[], queue as f64);
+}
+
 pub fn render(bot: &Bot) -> String {
     let mut o = Out(String::with_capacity(4096));
     process(&mut o);
     runtime(&mut o);
     calls(&mut o);
     rate_budgets(&mut o);
+    recorder(&mut o);
     let names = [
         (
             "hft_connected",

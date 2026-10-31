@@ -25,6 +25,7 @@ k256 = { version = "0.13", features = ["ecdsa"] }
 sha3 = "0.10"
 md-5 = "0.10"
 rusqlite = { version = "0.32", features = ["bundled"] }
+zstd = "0.13"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

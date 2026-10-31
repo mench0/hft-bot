@@ -187,6 +187,12 @@ impl Account {
             Account::Paper(p) => p.order(symbol, side, amount, limit, book, lim),
             Account::Live(l) => l.order(symbol, side, amount, limit, book, lim),
         };
+        let kind = if limit.is_some() {
+            crate::record::event::kind::LIMIT
+        } else {
+            crate::record::event::kind::MARKET
+        };
+        self.record_order(symbol, side, kind, &amount, limit, &r);
         if crate::infra::journal::on() {
             let what = format!(
                 "ордер {side:?} {amount:?}{}",
@@ -216,10 +222,13 @@ impl Account {
         qty: f64,
         book: Option<&Book>,
     ) -> Result<Fill, String> {
-        match self {
+        let r = match self {
             Account::Paper(p) => p.sell_exit(symbol, qty, book),
             Account::Live(l) => l.sell_exit(symbol, qty, book),
-        }
+        };
+        let k = crate::record::event::kind::EXIT;
+        self.record_order(symbol, Side::Sell, k, &Amount::Qty(qty), None, &r);
+        r
     }
 
     /// Рыночный выход без проверок торговли (спот — продажа, перп — уменьшение позиции в любую сторону).
@@ -230,10 +239,58 @@ impl Account {
         qty: f64,
         book: Option<&Book>,
     ) -> Result<Fill, String> {
-        match self {
+        let r = match self {
             Account::Paper(p) => p.exit_market(symbol, side, qty, book),
             Account::Live(l) => l.exit_market(symbol, side, qty, book),
+        };
+        let k = crate::record::event::kind::EXIT;
+        self.record_order(symbol, side, k, &Amount::Qty(qty), None, &r);
+        r
+    }
+
+    /// Ордер и его итог — в запись (record).
+    fn record_order(
+        &self,
+        symbol: &str,
+        side: Side,
+        kind: u8,
+        amount: &Amount,
+        limit: Option<f64>,
+        r: &Result<Fill, String>,
+    ) {
+        use crate::record::event::{Event, Name, status};
+        if !crate::record::enabled() {
+            return;
         }
+        let (id, st, executed, avg) = match r {
+            Ok(f) => (
+                f.order_id,
+                match f.status {
+                    "FILLED" => status::FILLED,
+                    "PARTIALLY_FILLED" => status::PARTIAL,
+                    "NEW" if self.is_live() && limit.is_none() => status::SENT,
+                    _ => status::NEW,
+                },
+                f.executed,
+                f.avg_price,
+            ),
+            Err(_) => (0, status::REJECTED, 0.0, 0.0),
+        };
+        crate::record::push(Event::Order {
+            ex: Name::new(&self.ledger().venue),
+            sym: Name::new(&symbol.to_uppercase()),
+            id,
+            side: side.code(),
+            kind,
+            qty: match amount {
+                Amount::Qty(q) => *q,
+                _ => f64::NAN,
+            },
+            price: limit.unwrap_or(f64::NAN),
+            status: st,
+            executed,
+            avg,
+        });
     }
 
     pub fn is_live(&self) -> bool {
@@ -265,10 +322,24 @@ impl Account {
     }
 
     pub fn cancel(&mut self, id: u64) -> bool {
-        match self {
+        let ok = match self {
             Account::Paper(p) => p.cancel(id),
             Account::Live(l) => l.cancel(id),
+        };
+        if ok {
+            self.record_cancel("", id, 1);
         }
+        ok
+    }
+
+    fn record_cancel(&self, symbol: &str, id: u64, n: usize) {
+        use crate::record::event::{Event, Name};
+        crate::record::push(Event::Cancel {
+            ex: Name::new(&self.ledger().venue),
+            sym: Name::new(&symbol.to_uppercase()),
+            id,
+            n: n as u32,
+        });
     }
 
     pub fn is_open(&self, id: u64) -> bool {
@@ -284,6 +355,7 @@ impl Account {
             Account::Live(l) => l.cancel_all(symbol),
         };
         if n > 0 {
+            self.record_cancel(symbol.unwrap_or(""), 0, n);
             crate::infra::journal::action(
                 &self.ledger().venue,
                 symbol,

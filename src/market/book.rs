@@ -14,6 +14,9 @@ pub struct Book {
     updated: Option<Instant>,
     /// Сколько обновлений отброшено как устаревшие.
     pub stale: u64,
+    /// Запись (record): последние записанные лучшие цены и время последнего снимка уровней, мс.
+    pub rec_top: (f64, f64, f64, f64),
+    pub rec_depth_ms: u64,
 }
 
 impl Book {

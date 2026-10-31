@@ -393,7 +393,11 @@ pub fn apply(market: &Market, ex: &str, u: Update) -> String {
             asks,
             id,
         } => {
-            market.with_book(ex, &sym, |b| b.apply_snapshot(bids, asks, id));
+            market.with_book(ex, &sym, |b| {
+                if b.apply_snapshot(bids, asks, id) {
+                    crate::record::book(ex, &sym, b)
+                }
+            });
             sym
         }
         Update::Delta {
@@ -402,12 +406,21 @@ pub fn apply(market: &Market, ex: &str, u: Update) -> String {
             asks,
             id,
         } => {
-            market.with_book(ex, &sym, |b| b.apply_delta(&bids, &asks, id));
+            market.with_book(ex, &sym, |b| {
+                if b.apply_delta(&bids, &asks, id) {
+                    crate::record::book(ex, &sym, b)
+                }
+            });
             sym
         }
         Update::Best { sym, bid, ask, id } => {
-            let fresh =
-                market.with_book(ex, &sym, |b| b.apply_best(bid.0, bid.1, ask.0, ask.1, id));
+            let fresh = market.with_book(ex, &sym, |b| {
+                let fresh = b.apply_best(bid.0, bid.1, ask.0, ask.1, id);
+                if fresh {
+                    crate::record::book(ex, &sym, b)
+                }
+                fresh
+            });
             market.with_feed(ex, |f| {
                 if fresh {
                     f.bbo_updates += 1
@@ -583,6 +596,9 @@ pub async fn run(market: Arc<Market>, ex: String, d: Arc<dyn Dialect>, tune: Tun
 
 /// Неудачное подключение: счёт подряд; на tune.max_failures — источник сдаётся.
 fn fail(market: &Market, ex: &str, e: &str, tune: &Tune) {
+    crate::record::push(crate::record::event::Event::FeedError {
+        ex: crate::record::event::Name::new(ex),
+    });
     market.with_feed(ex, |f| {
         f.last_error = e.to_owned();
         f.failures += 1;

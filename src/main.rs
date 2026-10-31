@@ -1,14 +1,16 @@
 //! HFT-бот на Rust: стаканы и ордера бирж (WebSocket в первую очередь, REST — запасной путь), бумажный и живой счёт,
 //! стратегии, подбор тикеров; админ-API в формате Java-бота (`hft-trader`) для той же админки (`hft-admin`).
-//! Код по папкам: server, exchange, market, trading, strategy, discovery, infra (см. README).
+//! Код по папкам: server, exchange, market, trading, strategy, discovery, record, infra (см. README).
 //!
 //! Переменные окружения: `ADMIN_PORT` (8080), `ADMIN_BIND` (127.0.0.1), `ADMIN_TOKEN`, `ADMIN_CORS_ORIGINS`
 //! (через запятую), `STATE_DB` (data/state.db, SQLite), `STATE_FILE` (JSON-файл вместо SQLite), `RUST_LOG` (info).
+//! `hft-bot record-cat <файл>...` — вывести файл записи событий (record) JSON-строками.
 
 mod discovery;
 mod exchange;
 mod infra;
 mod market;
+mod record;
 mod server;
 mod strategy;
 mod trading;
@@ -27,6 +29,11 @@ fn env(key: &str, def: &str) -> String {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // hft-bot record-cat <файл>... — события файла записи JSON-строками
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("record-cat") {
+        return record::reader::cat(&args[1..]).map_err(Into::into);
+    }
     let _ = rustls::crypto::ring::default_provider().install_default(); // TLS для wss:// бирж
     metrics::mark_start();
     tracing_subscriber::fmt()

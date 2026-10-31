@@ -28,6 +28,14 @@ pub enum Side {
 }
 
 impl Side {
+    /// Код стороны для записи (record::event::BUY / SELL).
+    pub fn code(self) -> u8 {
+        match self {
+            Side::Buy => crate::record::event::BUY,
+            Side::Sell => crate::record::event::SELL,
+        }
+    }
+
     pub fn parse(s: &str) -> Option<Side> {
         match s.to_uppercase().as_str() {
             "BUY" => Some(Side::Buy),
@@ -998,6 +1006,15 @@ impl Paper {
         }
         self.exec_seq += 1;
         let seq = self.exec_seq;
+        crate::record::push(crate::record::event::Event::Fill {
+            ex: crate::record::event::Name::new(&self.venue),
+            sym: crate::record::event::Name::new(&symbol.to_uppercase()),
+            id: order_id,
+            side: side.code(),
+            qty,
+            price,
+            fee,
+        });
         self.execs.push_back(Exec {
             seq,
             order_id,

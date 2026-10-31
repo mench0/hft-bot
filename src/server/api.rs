@@ -176,6 +176,7 @@ pub fn router(bot: Arc<Bot>, cfg: AdminConfig) -> Router {
             .route("/trading/stop", axum::routing::post(trading_stop))
             .route("/trading/panic", axum::routing::post(trading_panic))
             .route("/settings", get(settings).post(settings_update))
+            .route("/research/status", get(research_status))
             .route(
                 "/exchange/params/schema",
                 get(|| async { Json(Value::Object(data::exchange_schema().clone())) }),
@@ -922,6 +923,11 @@ fn settings_json(bot: &Bot) -> Value {
 
 async fn settings(State(a): State<App>) -> Json<Value> {
     Json(settings_json(&a.bot))
+}
+
+/// Исследования: состояние записи событий (включается настройкой recordEnabled).
+async fn research_status() -> Json<Value> {
+    Json(crate::record::status_json())
 }
 
 async fn settings_update(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiError> {
