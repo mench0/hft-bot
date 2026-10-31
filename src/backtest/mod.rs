@@ -22,7 +22,7 @@ use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 /// Шаг движка, нс.
-const TICK_NS: u64 = 50_000_000;
+pub(crate) const TICK_NS: u64 = 50_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Fill {
@@ -354,6 +354,7 @@ pub fn run(recs: &[Rec], cfg: &Config) -> Value {
         "maxDrawdown": r4(dd), "fills": fills,
         "realizedPnl": v["realizedPnl"], "fees": v["fees"], "closedTrades": v["closedTrades"], "winRatePercent": v["winRatePercent"],
         "ordersAccepted": acc.stats()["ордеров_принято"], "ordersRejected": acc.stats()["ордеров_отклонено"],
+        "lastReject": acc.stats()["последний_отказ"],
         "openPositions": v["openPositions"], "markout": markout, "strategy": sc.stats(true)["symbols"].clone(),
         "equity": curve, "warnings": warnings,
     })
@@ -402,7 +403,8 @@ pub fn fees(ex: &str) -> (f64, f64) {
 
 /// `hft-bot backtest --day ГГГГ-ММ-ДД --exchange okx --symbols BTCUSDT [--hours 9-12] [--latency-ms 50]
 /// [--fill trade|touch|through] [--set scMinEdgePercent=0.2,scOrderQuote=50] [--dir data/rec]
-/// [--sweep "scMinEdgePercent=0.05:0.3:0.05;scOrderQuote=20|50" [--threads N]] [--validate] [--no-save]` — итог JSON,
+/// [--sweep "scMinEdgePercent=0.05:0.3:0.05;scOrderQuote=20|50" [--threads N]] [--validate] [--no-save]
+/// [--strategy lead-lag|perp-arb --exchange binance,gate]` — итог JSON,
 /// прогон сохраняется в журнал (BACKTEST_DB).
 pub fn cli(args: &[String]) -> Result<(), String> {
     let get = |k: &str| {
@@ -425,6 +427,74 @@ pub fn cli(args: &[String]) -> Result<(), String> {
         let (a, b) = h.split_once('-').unwrap_or((&h, &h));
         Some((a.parse().ok()?, b.parse().ok()?))
     });
+    // lead-lag и перп – перп: несколько бирж через запятую, настройки процесса и параметры бирж — по умолчанию + --set
+    if let Some(st) = get("--strategy").filter(|s| s != "spread-capture") {
+        let st = cross::Strategy::parse(&st)
+            .ok_or("--strategy: spread-capture, lead-lag или perp-arb")?;
+        let exchanges: Vec<String> = ex
+            .split(',')
+            .map(|e| e.trim().to_owned())
+            .filter(|e| !e.is_empty())
+            .collect();
+        if exchanges.len() < 2 {
+            return Err(
+                "lead-lag и перп – перп — минимум две биржи: --exchange binance,gate".into(),
+            );
+        }
+        let mut over = Map::new();
+        for kv in get("--set")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|s| !s.is_empty())
+        {
+            let (k, v) = kv
+                .split_once('=')
+                .ok_or(format!("--set: {kv} — нужно ключ=значение"))?;
+            over.insert(k.trim().to_owned(), crate::infra::data::typed(v.trim()));
+        }
+        let ex_defaults = crate::infra::data::defaults(crate::infra::data::exchange_schema());
+        let base = cross::CrossConfig {
+            strategy: st,
+            params: exchanges
+                .iter()
+                .map(|e| (e.clone(), ex_defaults.clone()))
+                .collect(),
+            exchanges,
+            symbols,
+            settings: crate::infra::data::defaults(crate::infra::data::settings_specs()),
+            latency_ms: get("--latency-ms")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(50),
+            fill: Fill::parse(&get("--fill").unwrap_or_else(|| "trade".into()))
+                .ok_or("--fill: touch, trade или through")?,
+        };
+        let cfg = cross::with_overrides(&base, &over);
+        let recs = load(
+            std::path::Path::new(&get("--dir").unwrap_or_else(|| "data/rec".into())),
+            &day,
+            hours,
+        )?;
+        let (kind, mut v) = match get("--sweep") {
+            Some(spec) => {
+                let threads = get("--threads")
+                    .and_then(|t| t.parse().ok())
+                    .unwrap_or_else(|| {
+                        std::thread::available_parallelism()
+                            .map_or(1, |n| n.get().saturating_sub(1).max(1))
+                    });
+                (
+                    "sweep",
+                    cross::sweep(&recs, &cfg, &sweep::parse(&spec)?, threads),
+                )
+            }
+            None => ("run", cross::run(&recs, &cfg)),
+        };
+        if !args.iter().any(|a| a == "--no-save") && v["error"].is_null() {
+            v["runId"] = Value::from(runs::save(kind, &Value::from(args.join(" ")), &v));
+        }
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        return Ok(());
+    }
     let mut params = crate::infra::data::defaults(crate::infra::data::exchange_schema());
     for kv in get("--set")
         .unwrap_or_default()
@@ -475,6 +545,7 @@ pub fn cli(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+pub mod cross;
 pub mod runs;
 pub mod sweep;
 pub mod validate;

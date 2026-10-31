@@ -380,6 +380,13 @@ impl Account {
         }
     }
 
+    /// Бэктест: стаканы настоящего рынка для исполнения ордеров (только бумага).
+    pub fn set_exec_books(&mut self, books: Option<HashMap<String, Book>>) {
+        if let Account::Paper(p) = self {
+            p.exec_books = books
+        }
+    }
+
     /// Бэктест: исполнение заявок по стакану (strict — только сквозь цену) и по сделке рынка (только бумага).
     pub fn match_book(&mut self, symbol: &str, book: &Book, lim: &Limits, strict: bool) {
         if let Account::Paper(p) = self {

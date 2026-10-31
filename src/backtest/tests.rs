@@ -218,3 +218,127 @@ fn toxic_guard_pulls_bid_after_other_exchange_drops() {
             .all(|w| !w.as_str().unwrap().contains("токсичного"))
     );
 }
+
+/// Ведущая binance прыгает на +0.5 % каждые 20 с, ведомая gate догоняет через 1 с; через 10 с обе возвращаются.
+fn lead_lag_market() -> Vec<Rec> {
+    let mut v = Vec::new();
+    let t0 = 1_761_900_000_000_000_000u64;
+    let s = 1_000_000_000u64;
+    let bbo = |ts: u64, ex: &str, mid: f64| Rec {
+        ts,
+        ev: Event::Bbo {
+            ex: Name::new(ex),
+            sym: Name::new("XUSDT"),
+            ts_ex: 0,
+            bid: mid - 0.005,
+            bid_qty: 100.0,
+            ask: mid + 0.005,
+            ask_qty: 100.0,
+        },
+    };
+    for k in 0..30u64 {
+        let t = t0 + k * 20 * s;
+        // спокойные цены для базиса
+        for j in 0..10u64 {
+            v.push(bbo(t + j * s / 2, "binance", 100.0 + j as f64 * 1e-4));
+            v.push(bbo(t + j * s / 2 + 1, "gate", 100.0 + j as f64 * 1e-4));
+        }
+        v.push(bbo(t + 6 * s, "binance", 100.5));
+        v.push(bbo(t + 7 * s, "gate", 100.5));
+        v.push(bbo(t + 16 * s, "binance", 100.0));
+        v.push(bbo(t + 16 * s + 1, "gate", 100.0));
+    }
+    v
+}
+
+fn cross_cfg(latency_ms: u64) -> super::cross::CrossConfig {
+    let mut settings = crate::infra::data::defaults(crate::infra::data::settings_specs());
+    for (k, v) in [
+        ("leadLagLeader", serde_json::json!("binance")),
+        ("leadLagMinMovePercent", 0.2.into()),
+        ("leadLagWindowMs", 1000.into()),
+        ("leadLagMinProfitPercent", 0.05.into()),
+        ("leadLagBasisSec", 5.into()),
+        ("leadLagMaxHoldMs", 5000.into()),
+        ("leadLagOrderQuote", 100.into()),
+    ] {
+        settings.insert(k.into(), v);
+    }
+    let params = crate::infra::data::defaults(crate::infra::data::exchange_schema());
+    super::cross::CrossConfig {
+        strategy: super::cross::Strategy::LeadLag,
+        exchanges: vec!["binance".into(), "gate".into()],
+        symbols: vec!["XUSDT".into()],
+        settings,
+        params: [("binance".into(), params.clone()), ("gate".into(), params)].into(),
+        latency_ms,
+        fill: Fill::Trade,
+    }
+}
+
+#[test]
+fn lead_lag_earns_only_when_faster_than_follower() {
+    let fast = super::cross::run(&lead_lag_market(), &cross_cfg(50));
+    assert!(
+        fast["fills"].as_u64().unwrap() >= 10,
+        "{}",
+        fast["strategyState"]
+    );
+    assert!(fast["pnl"].as_f64().unwrap() > 0.0, "{fast}");
+    // задержка больше отставания ведомой: к моменту, когда бот видит движение, ведомая уже догнала
+    let slow = super::cross::run(&lead_lag_market(), &cross_cfg(1500));
+    assert!(
+        slow["pnl"].as_f64().unwrap() < fast["pnl"].as_f64().unwrap() / 2.0,
+        "fast {} slow {}",
+        fast["pnl"],
+        slow["pnl"]
+    );
+    assert_eq!(fast["byExchange"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn perp_arb_opens_and_closes_on_divergence() {
+    // перпы: gate дороже binance на 1.5 % (круг комиссий 0.6 %) по 5 с каждые 20 с, потом цены сходятся
+    let mut v = Vec::new();
+    let t0 = 1_761_900_000_000_000_000u64;
+    let s = 1_000_000_000u64;
+    let bbo = |ts: u64, ex: &str, mid: f64| Rec {
+        ts,
+        ev: Event::Bbo {
+            ex: Name::new(ex),
+            sym: Name::new("XUSDT"),
+            ts_ex: 0,
+            bid: mid - 0.005,
+            bid_qty: 100.0,
+            ask: mid + 0.005,
+            ask_qty: 100.0,
+        },
+    };
+    for k in 0..30u64 {
+        let t = t0 + k * 20 * s;
+        for j in 0..40u64 {
+            v.push(bbo(t + j * s / 2, "binance", 100.0));
+            let gap = if (10..20).contains(&j) { 101.5 } else { 100.0 };
+            v.push(bbo(t + j * s / 2 + 1, "gate", gap));
+        }
+    }
+    let mut c = cross_cfg(50);
+    c.strategy = super::cross::Strategy::PerpArb;
+    for p in c.params.values_mut() {
+        p.insert("market".into(), "perp".into());
+    }
+    c.settings
+        .insert("perpArbMinProfitPercent".into(), 0.1.into());
+    c.settings.insert("perpArbOrderQuote".into(), 100.into());
+    // выход при спреде ≤ 0: с бидом и аском обеих бирж сошедшиеся цены дают +0.01 % — пара ждала бы таймаута
+    c.settings
+        .insert("perpArbExitSpreadPercent".into(), 0.05.into());
+    let r = super::cross::run(&v, &c);
+    assert!(r["fills"].as_u64().unwrap() >= 20, "{}", r["strategyState"]);
+    assert!(r["pnl"].as_f64().unwrap() > 0.0, "{r}");
+    assert!(
+        r["warnings"].as_array().unwrap().is_empty(),
+        "{}",
+        r["warnings"]
+    );
+}

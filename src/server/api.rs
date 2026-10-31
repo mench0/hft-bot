@@ -990,14 +990,18 @@ async fn research_run(Query(q): Q) -> Result<Json<Value>, ApiError> {
 /// mode: run (по умолчанию), sweep (перебор sweep=ключ=от:до:шаг;ключ=a|b, не больше 2 потоков — торговля важнее),
 /// validate (сравнение с записанными своими исполнениями). Один запуск за раз; итог — в журнал прогонов.
 async fn research_backtest(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiError> {
+    use crate::backtest::cross::{self, CrossConfig, Strategy};
     static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let day = need(&q, "day")?.to_owned();
-    let ex = need(&q, "exchange")?.to_lowercase();
-    let symbols: Vec<String> = need(&q, "symbols")?
-        .split(',')
-        .map(|s| s.trim().to_uppercase())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let list = |k: &str| -> Result<Vec<String>, ApiError> {
+        Ok(need(&q, k)?
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect())
+    };
+    let exchanges: Vec<String> = list("exchange")?.iter().map(|e| e.to_lowercase()).collect();
+    let symbols: Vec<String> = list("symbols")?.iter().map(|s| s.to_uppercase()).collect();
     let hours = q
         .get("hours")
         .filter(|h| !h.trim().is_empty())
@@ -1007,7 +1011,11 @@ async fn research_backtest(State(a): State<App>, Query(q): Q) -> Result<Json<Val
         });
     let fill = crate::backtest::Fill::parse(q.get("fill").map_or("trade", String::as_str))
         .ok_or_else(|| bad("fill: touch, trade или through"))?;
-    let mut params = a.bot.params(&ex);
+    let latency_ms = q
+        .get("latencyMs")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+    let mut over = Map::new();
     for kv in q
         .get("set")
         .map_or("", String::as_str)
@@ -1017,7 +1025,7 @@ async fn research_backtest(State(a): State<App>, Query(q): Q) -> Result<Json<Val
         let (k, v) = kv
             .split_once('=')
             .ok_or_else(|| bad(format!("set: {kv} — нужно ключ=значение")))?;
-        params.insert(k.trim().to_owned(), crate::infra::data::typed(v.trim()));
+        over.insert(k.trim().to_owned(), crate::infra::data::typed(v.trim()));
     }
     let dir = a
         .bot
@@ -1027,24 +1035,60 @@ async fn research_backtest(State(a): State<App>, Query(q): Q) -> Result<Json<Val
         .filter(|d| !d.trim().is_empty())
         .unwrap_or("data/rec")
         .to_owned();
-    let (maker, taker) = crate::backtest::fees(&ex);
-    let cfg = crate::backtest::Config {
-        exchange: ex,
-        symbols,
-        start_balance: params
-            .get("paperStartBalance")
-            .and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse().ok()))
-            .unwrap_or(1000.0),
-        params,
-        latency_ms: q
-            .get("latencyMs")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(50),
-        fill,
-        maker_pct: maker,
-        taker_pct: taker,
-    };
+    let strategy = q.get("strategy").map_or("spread-capture", String::as_str);
     let mode = q.get("mode").map_or("run", String::as_str).to_owned();
+    // сбор спреда — одна биржа; lead-lag и перп – перп — несколько, параметры бирж и настройки процесса из бота
+    enum Job {
+        Spread(crate::backtest::Config),
+        Cross(CrossConfig),
+    }
+    let job = match Strategy::parse(strategy) {
+        None if strategy == "spread-capture" => {
+            let [ex] = &exchanges[..] else {
+                return Err(bad("сбор спреда — одна биржа"));
+            };
+            let mut params = a.bot.params(ex);
+            params.extend(over);
+            let (maker, taker) = crate::backtest::fees(ex);
+            Job::Spread(crate::backtest::Config {
+                exchange: ex.clone(),
+                symbols,
+                start_balance: params
+                    .get("paperStartBalance")
+                    .and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse().ok()))
+                    .unwrap_or(1000.0),
+                params,
+                latency_ms,
+                fill,
+                maker_pct: maker,
+                taker_pct: taker,
+            })
+        }
+        None => return Err(bad("strategy: spread-capture, lead-lag или perp-arb")),
+        Some(st) => {
+            if exchanges.len() < 2 {
+                return Err(bad(
+                    "lead-lag и перп – перп — минимум две биржи через запятую",
+                ));
+            }
+            if mode == "validate" {
+                return Err(bad("сверка с реальными — пока только для сбора спреда"));
+            }
+            let base = CrossConfig {
+                strategy: st,
+                params: exchanges
+                    .iter()
+                    .map(|e| (e.clone(), a.bot.params(e)))
+                    .collect(),
+                exchanges,
+                symbols,
+                settings: a.bot.settings(),
+                latency_ms,
+                fill,
+            };
+            Job::Cross(cross::with_overrides(&base, &over))
+        }
+    };
     let grid = match mode.as_str() {
         "sweep" => Some(crate::backtest::sweep::parse(need(&q, "sweep")?).map_err(bad)?),
         "run" | "validate" => None,
@@ -1059,10 +1103,14 @@ async fn research_backtest(State(a): State<App>, Query(q): Q) -> Result<Json<Val
         let threads = std::thread::available_parallelism()
             .map_or(1, |n| n.get().saturating_sub(1))
             .clamp(1, 2);
-        let mut v = match &grid {
-            Some(g) => crate::backtest::sweep::sweep(&recs, &cfg, g, threads),
-            None if mode == "validate" => crate::backtest::validate::validate(&recs, &cfg),
-            None => crate::backtest::run(&recs, &cfg),
+        let mut v = match (&job, &grid) {
+            (Job::Spread(c), Some(g)) => crate::backtest::sweep::sweep(&recs, c, g, threads),
+            (Job::Spread(c), None) if mode == "validate" => {
+                crate::backtest::validate::validate(&recs, c)
+            }
+            (Job::Spread(c), None) => crate::backtest::run(&recs, c),
+            (Job::Cross(c), Some(g)) => cross::sweep(&recs, c, g, threads),
+            (Job::Cross(c), None) => cross::run(&recs, c),
         };
         if v["error"].is_null() {
             v["runId"] = Value::from(crate::backtest::runs::save(&mode, &request, &v));

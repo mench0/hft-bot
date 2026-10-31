@@ -136,6 +136,8 @@ struct Lot {
 /// Бумажный счёт одной биржи.
 #[derive(Debug)]
 pub struct Paper {
+    /// Бэктест: стаканы настоящего рынка, по которым исполняются ордера (стратегия видит рынок с задержкой).
+    pub exec_books: Option<HashMap<String, Book>>,
     maker: f64,
     taker: f64,
     free: BTreeMap<String, f64>,
@@ -222,6 +224,7 @@ impl Paper {
             recent: VecDeque::new(),
             start: BTreeMap::new(),
             started_at: 0,
+            exec_books: None,
             day: utc_day(),
             daily_pnl: 0.0,
             realized: 0.0,
@@ -678,6 +681,8 @@ impl Paper {
         book: Option<&Book>,
         lim: &Limits,
     ) -> Result<Fill, String> {
+        let real = self.real_book(symbol);
+        let book = real.as_ref().or(book);
         let pr = self.prepare(symbol, side, amount, limit, book, lim)?;
         let Prepared {
             base,
@@ -944,6 +949,14 @@ impl Paper {
         }
     }
 
+    /// Бэктест: стакан настоящего рынка для исполнения ордера (None — вживую или нет такого символа).
+    fn real_book(&self, symbol: &str) -> Option<Book> {
+        self.exec_books
+            .as_ref()?
+            .get(&symbol.to_uppercase())
+            .cloned()
+    }
+
     /// Исполнить стоящие заявки, через которые прошла цена (как мейкер, по цене заявки).
     pub fn match_resting(&mut self, symbol: &str, book: &Book, lim: &Limits) {
         self.match_book(symbol, book, lim, false);
@@ -1097,6 +1110,8 @@ impl Paper {
         qty: f64,
         book: Option<&Book>,
     ) -> Result<Fill, String> {
+        let real = self.real_book(symbol);
+        let book = real.as_ref().or(book);
         let b = book.filter(|b| b.is_ready()).ok_or("стакан не готов")?;
         let (base, quote) = split(symbol).ok_or_else(|| format!("не разобрать символ {symbol}"))?;
         let qty = qty.min(self.exit_room(symbol, side));

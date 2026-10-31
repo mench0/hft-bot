@@ -86,8 +86,26 @@ fn markout_1s(r: &Value) -> Value {
     }
 }
 
-/// Прогнать сетку в threads потоках.
+/// Прогнать сетку в threads потоках (сбор спреда).
 pub fn sweep(recs: &[Rec], base: &Config, grid: &[(String, Vec<Value>)], threads: usize) -> Value {
+    let mut v = sweep_with(grid, threads, |p| {
+        let mut cfg = base.clone();
+        cfg.params.extend(p.clone());
+        run(recs, &cfg)
+    });
+    v["exchange"] = json!(base.exchange);
+    v["symbols"] = json!(base.symbols);
+    v["latencyMs"] = json!(base.latency_ms);
+    v["fill"] = json!(format!("{:?}", base.fill).to_lowercase());
+    v
+}
+
+/// Перебор с любым прогоном: run получает переопределения варианта.
+pub fn sweep_with(
+    grid: &[(String, Vec<Value>)],
+    threads: usize,
+    run: impl Fn(&Map<String, Value>) -> Value + Sync,
+) -> Value {
     let all = combos(grid);
     let next = AtomicUsize::new(0);
     let rows: Mutex<Vec<Value>> = Mutex::new(Vec::new());
@@ -97,9 +115,7 @@ pub fn sweep(recs: &[Rec], base: &Config, grid: &[(String, Vec<Value>)], threads
                 loop {
                     let i = next.fetch_add(1, Ordering::SeqCst);
                     let Some(p) = all.get(i) else { break };
-                    let mut cfg = base.clone();
-                    cfg.params.extend(p.clone());
-                    let r = run(recs, &cfg);
+                    let r = run(p);
                     rows.lock().unwrap().push(json!({"params": p, "pnl": r["pnl"], "pnlPercent": r["pnlPercent"],
                         "maxDrawdown": r["maxDrawdown"], "fills": r["fills"], "closedTrades": r["closedTrades"],
                         "winRatePercent": r["winRatePercent"], "fees": r["fees"], "markout1sBps": markout_1s(&r),
@@ -115,9 +131,7 @@ pub fn sweep(recs: &[Rec], base: &Config, grid: &[(String, Vec<Value>)], threads
             .unwrap_or(f64::MIN)
             .total_cmp(&a["pnl"].as_f64().unwrap_or(f64::MIN))
     });
-    json!({"variants": rows.len(), "keys": grid.iter().map(|g| &g.0).collect::<Vec<_>>(), "rows": rows,
-        "exchange": base.exchange, "symbols": base.symbols, "latencyMs": base.latency_ms,
-        "fill": format!("{:?}", base.fill).to_lowercase()})
+    json!({"variants": rows.len(), "keys": grid.iter().map(|g| &g.0).collect::<Vec<_>>(), "rows": rows})
 }
 
 #[cfg(test)]

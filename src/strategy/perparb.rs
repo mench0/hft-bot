@@ -322,7 +322,14 @@ impl PerpArb {
         p: &Params,
         now_ms: u64,
     ) {
-        let mut qty = (p.order_quote / o.mid).min(o.max_qty);
+        // объём — по цене дорогой ноги (середина + полспреда и запас), чтобы обе ноги уложились в perpArbOrderQuote
+        // и в лимит ордера каждой биржи (maxPositionQuote); по середине дорогая нога выходила больше лимита
+        let px_hi = o.mid * (1.0 + o.spread.abs() / 100.0);
+        let cap = [&o.short.ex, &o.long.ex]
+            .iter()
+            .map(|e| venues[*e].lim.max_order_quote)
+            .fold(p.order_quote, f64::min);
+        let mut qty = (cap * 0.999 / px_hi).min(o.max_qty);
         // общий шаг лота обеих бирж
         for _ in 0..4 {
             let qa = venues[&o.short.ex]
