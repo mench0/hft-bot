@@ -11,6 +11,7 @@ pub mod export;
 pub mod fetch;
 pub mod format;
 pub mod reader;
+pub mod report;
 mod writer;
 
 use crate::market::book::Book;

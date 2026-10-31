@@ -35,6 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args.first().map(String::as_str) {
         Some("record-cat") => return record::reader::cat(&args[1..]).map_err(Into::into),
         Some("export") => return record::export::cli(&args[1..]).map_err(Into::into),
+        Some("report") => return record::report::cli(&args[1..]).map_err(Into::into),
         Some("fetch") => return record::fetch::cli(&args[1..]).await.map_err(Into::into),
         _ => {}
     }

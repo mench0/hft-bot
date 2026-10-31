@@ -178,6 +178,7 @@ pub fn router(bot: Arc<Bot>, cfg: AdminConfig) -> Router {
             .route("/trading/panic", axum::routing::post(trading_panic))
             .route("/settings", get(settings).post(settings_update))
             .route("/research/status", get(research_status))
+            .route("/research/report", get(research_report))
             .route(
                 "/exchange/params/schema",
                 get(|| async { Json(Value::Object(data::exchange_schema().clone())) }),
@@ -940,6 +941,31 @@ async fn settings(State(a): State<App>) -> Json<Value> {
 /// Исследования: состояние записи событий (включается настройкой recordEnabled).
 async fn research_status() -> Json<Value> {
     Json(crate::record::status_json())
+}
+
+/// Отчёт по записи за день (часы from-to): markout, задержки бирж, ведущая биржа, поток сделок.
+async fn research_report(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiError> {
+    let day = need(&q, "day")?.to_owned();
+    let hours = q.get("hours").and_then(|h| {
+        let (a, b) = h.split_once('-').unwrap_or((h, h));
+        Some((a.parse().ok()?, b.parse().ok()?))
+    });
+    let dir = a
+        .bot
+        .settings()
+        .get("recordDir")
+        .and_then(Value::as_str)
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or("data/rec")
+        .to_owned();
+    // чтение файлов дня — в отдельном потоке, не в потоках сервера
+    let v = tokio::task::spawn_blocking(move || {
+        crate::record::report::day(std::path::Path::new(&dir), &day, hours)
+    })
+    .await
+    .map_err(|e| bad(e.to_string()))?
+    .map_err(bad)?;
+    Ok(Json(v))
 }
 
 async fn settings_update(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiError> {
