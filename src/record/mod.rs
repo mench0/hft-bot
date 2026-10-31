@@ -7,6 +7,8 @@
 //! `hft-bot record-cat <файл>`.
 
 pub mod event;
+pub mod export;
+pub mod fetch;
 pub mod format;
 pub mod reader;
 mod writer;

@@ -267,6 +267,31 @@ data/                  каталог бирж и схемы параметро�
 - Состояние: `GET /research/status`, метрики `hft_record_*`. Посмотреть файл: `hft-bot record-cat файл.bin.zst`
   (JSON-строки).
 
+### Выгрузка и история бирж
+
+- `hft-bot export --day 2026-10-31 [--dir data/rec] [--out data/export]` — запись за день в таблицы CSV (gzip):
+  `data/export/<таблица>/date=<день>/part-rec.csv.gz`, таблицы `bbo`, `trades`, `depth`, `orders`, `fills`, `cancels`,
+  `gaps`; время `ns` — получение (нс UTC), `ts_ex` — время биржи (мс).
+- `hft-bot fetch --source binance-perp-trades --symbols BTCUSDT,ETHUSDT --from 2026-10-01 --to 2026-10-07` — бесплатная
+  история в те же таблицы (`part-<источник>-<символ>.csv.gz`; `ns` = время биржи). Источники: `binance-spot-trades`,
+  `binance-perp-trades`, `binance-perp-bbo` (data.binance.vision), `bybit-perp-trades`, `bybit-spot-trades`
+  (public.bybit.com). Это файловые архивы, а не API: ключи не нужны, лимиты торгового API не тратятся.
+  **Бережно, чтобы не получить бан:** по одному файлу, пауза `--pause-ms` (1500, не меньше 200), не больше
+  `--max-files` (100) за запуск, скачанное и отсутствующее не запрашивается повторно (`out/.fetched`), ответ
+  429/418/403 — сразу остановка до следующего запуска, ошибки сервера — до 3 повторов с паузой 5/15/45 с. Запускайте
+  на исследовательской машине, а не на торговом сервере: скачивание не должно занимать канал бота.
+- В Parquet и для запросов — DuckDB:
+  ```sql
+  COPY (SELECT * FROM read_csv('data/export/trades/*/*.csv.gz', hive_partitioning = true))
+    TO 'data/parquet/trades' (FORMAT parquet, PARTITION_BY (date));
+  SELECT ex, sym, count(*), sum(px * qty) FROM read_parquet('data/parquet/trades/*/*.parquet') GROUP BY ALL;
+  ```
+
+**Лимиты подписок на рынок.** Сообщения подписки идут через ограничитель частоты каждой биржи (`wsMessages` в
+`infra/ratelimit.rs`). На одно соединение у бирж есть потолок тем: Binance — 1024 потока (3 на символ: стакан, лучшие
+цены, сделки → до ~340 символов), KuCoin — 300 тем (перпы: 2 на контракт → до 150), Hyperliquid — 1000 подписок на IP
+(2 на монету). Больше монет на бирже не выбирайте.
+
 ## Хранение состояния и окружение
 
 - **SQLite** (`STATE_DB`, по умолчанию `data/state.db`, WAL): таблица `app_state`, состояние — JSON под ключом `state`.
