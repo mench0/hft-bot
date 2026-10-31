@@ -46,6 +46,30 @@ pub enum Update {
         ask: (f64, f64),
         id: u64,
     },
+    /// Время биржи (мс эпохи) для следующих обновлений того же сообщения — для записи (record).
+    Time(u64),
+    /// Сделка рынка: buy — агрессор покупатель, ts — время сделки на бирже, мс (0 — неизвестно).
+    Trade {
+        sym: String,
+        px: f64,
+        qty: f64,
+        buy: bool,
+        ts: u64,
+    },
+}
+
+thread_local! {
+    /// Время биржи текущего сообщения (Update::Time); сбрасывается перед разбором следующего.
+    static EX_TS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Начало нового сообщения: время биржи ещё неизвестно.
+pub fn reset_ex_time() {
+    EX_TS.with(|t| t.set(0));
+}
+
+fn ex_time() -> u64 {
+    EX_TS.with(|t| t.get())
 }
 
 /// Разбор сообщения: обновления, служебное (пусто) или ошибка биржи (переподключиться).
@@ -384,9 +408,24 @@ pub fn start(
     }))
 }
 
-/// Применить обновление к стакану.
-pub fn apply(market: &Market, ex: &str, u: Update) -> String {
-    match u {
+/// Применить обновление к стакану; символ, чей стакан изменился (None — служебное или сделка).
+pub fn apply(market: &Market, ex: &str, u: Update) -> Option<String> {
+    Some(match u {
+        Update::Time(ts) => {
+            EX_TS.with(|t| t.set(ts));
+            return None;
+        }
+        Update::Trade {
+            sym,
+            px,
+            qty,
+            buy,
+            ts,
+        } => {
+            market.with_feed(ex, |f| f.trades += 1);
+            crate::record::trade(ex, &sym, px, qty, buy, if ts > 0 { ts } else { ex_time() });
+            return None;
+        }
         Update::Snapshot {
             sym,
             bids,
@@ -395,7 +434,7 @@ pub fn apply(market: &Market, ex: &str, u: Update) -> String {
         } => {
             market.with_book(ex, &sym, |b| {
                 if b.apply_snapshot(bids, asks, id) {
-                    crate::record::book(ex, &sym, b)
+                    crate::record::book(ex, &sym, b, ex_time())
                 }
             });
             sym
@@ -408,7 +447,7 @@ pub fn apply(market: &Market, ex: &str, u: Update) -> String {
         } => {
             market.with_book(ex, &sym, |b| {
                 if b.apply_delta(&bids, &asks, id) {
-                    crate::record::book(ex, &sym, b)
+                    crate::record::book(ex, &sym, b, ex_time())
                 }
             });
             sym
@@ -417,7 +456,7 @@ pub fn apply(market: &Market, ex: &str, u: Update) -> String {
             let fresh = market.with_book(ex, &sym, |b| {
                 let fresh = b.apply_best(bid.0, bid.1, ask.0, ask.1, id);
                 if fresh {
-                    crate::record::book(ex, &sym, b)
+                    crate::record::book(ex, &sym, b, ex_time())
                 }
                 fresh
             });
@@ -430,7 +469,7 @@ pub fn apply(market: &Market, ex: &str, u: Update) -> String {
             });
             sym
         }
-    }
+    })
 }
 
 /// Держать соединение: подписаться, читать сообщения, слать пинги; при обрыве или ошибке биржи — переподключиться.
@@ -561,8 +600,11 @@ pub async fn run(market: Arc<Market>, ex: String, d: Arc<dyn Dialect>, tune: Tun
                         Some(Ok(())) => parse_errors = 0,
                         None => {}
                     }
+                    reset_ex_time();
                     for u in ups {
-                        let sym = apply(&market, &ex, u);
+                        let Some(sym) = apply(&market, &ex, u) else {
+                            continue;
+                        };
                         let bad = market.with_book(&ex, &sym, |b| matches!((b.best_bid(), b.best_ask()), (Some(x), Some(y)) if x.0 >= y.0));
                         let n = crossed.entry(sym.clone()).or_default();
                         *n = if bad { *n + 1 } else { 0 };

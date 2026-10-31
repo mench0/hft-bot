@@ -1,5 +1,5 @@
-//! Binance (спот и USDⓈ-M перпы): комбинированные потоки `/stream?streams=` — частичный стакан `depth20@100ms`
-//! и лучшие цены `bookTicker`. Подписка — в адресе; номера обновлений общие, устаревшее не применяется.
+//! Binance (спот и USDⓈ-M перпы): комбинированные потоки `/stream?streams=` — частичный стакан `depth20@100ms`,
+//! лучшие цены `bookTicker` и сделки `aggTrade` (время сделки `T`; у перпов и в стакане, и в лучших ценах есть `T`). Подписка — в адресе; номера обновлений общие, устаревшее не применяется.
 
 use super::{Dialect, Parsed, Update};
 use serde::Deserialize;
@@ -23,6 +23,7 @@ pub fn stream_url(base: &str, symbols: &[String], book_ticker: bool) -> String {
         if book_ticker {
             streams.push(format!("{l}@bookTicker"));
         }
+        streams.push(format!("{l}@aggTrade"));
     }
     format!(
         "{}?streams={}",
@@ -53,6 +54,21 @@ struct Depth<'a> {
     bids: Vec<[&'a str; 2]>,
     #[serde(borrow, alias = "a")]
     asks: Vec<[&'a str; 2]>,
+    /// Время биржи (только перпы), мс.
+    #[serde(rename = "T", default)]
+    t: u64,
+}
+
+/// Сделка: m — покупатель мейкер (агрессор — продавец).
+#[derive(Deserialize)]
+struct AggTrade<'a> {
+    #[serde(borrow)]
+    p: &'a str,
+    #[serde(borrow)]
+    q: &'a str,
+    m: bool,
+    #[serde(rename = "T", default)]
+    t: u64,
 }
 
 #[derive(Deserialize)]
@@ -67,6 +83,13 @@ struct Ticker<'a> {
     a: &'a str,
     #[serde(borrow, rename = "A")]
     aq: &'a str,
+    #[serde(rename = "T", default)]
+    t: u64,
+}
+
+/// Время биржи, если есть (0 — нет).
+fn time(t: u64) -> Vec<Update> {
+    if t > 0 { vec![Update::Time(t)] } else { vec![] }
 }
 
 fn levels(raw: &[[&str; 2]]) -> Vec<(f64, f64)> {
@@ -91,12 +114,14 @@ impl Dialect for Binance {
         if kind.starts_with("depth") {
             let d: Depth =
                 serde_json::from_str(env.data.get()).map_err(|e| format!("Binance depth: {e}"))?;
-            Ok(vec![Update::Snapshot {
+            let mut out = time(d.t);
+            out.push(Update::Snapshot {
                 sym,
                 bids: levels(&d.bids),
                 asks: levels(&d.asks),
                 id: d.id,
-            }])
+            });
+            Ok(out)
         } else if kind == "bookTicker" {
             let t: Ticker = serde_json::from_str(env.data.get())
                 .map_err(|e| format!("Binance bookTicker: {e}"))?;
@@ -104,11 +129,27 @@ impl Dialect for Binance {
                 s.parse::<f64>()
                     .map_err(|e| format!("Binance bookTicker: {e}"))
             };
-            Ok(vec![Update::Best {
+            let mut out = time(t.t);
+            out.push(Update::Best {
                 sym,
                 bid: (p(t.b)?, p(t.bq)?),
                 ask: (p(t.a)?, p(t.aq)?),
                 id: t.u,
+            });
+            Ok(out)
+        } else if kind == "aggTrade" {
+            let t: AggTrade = serde_json::from_str(env.data.get())
+                .map_err(|e| format!("Binance aggTrade: {e}"))?;
+            let p = |s: &str| {
+                s.parse::<f64>()
+                    .map_err(|e| format!("Binance aggTrade: {e}"))
+            };
+            Ok(vec![Update::Trade {
+                sym,
+                px: p(t.p)?,
+                qty: p(t.q)?,
+                buy: !t.m,
+                ts: t.t,
             }])
         } else {
             Ok(vec![])
@@ -128,7 +169,7 @@ mod tests {
         let u = stream_url("wss://x/stream", &["BTCUSDT".into()], true);
         assert_eq!(
             u,
-            "wss://x/stream?streams=btcusdt@depth20@100ms/btcusdt@bookTicker"
+            "wss://x/stream?streams=btcusdt@depth20@100ms/btcusdt@bookTicker/btcusdt@aggTrade"
         );
         let d = Binance { url: u };
         let m = Market::default();
@@ -141,6 +182,15 @@ mod tests {
                 apply(&m, "binance", u);
             }
         }
+        assert_eq!(
+            d.parse(r#"{"stream":"btcusdt@aggTrade","data":{"e":"aggTrade","s":"BTCUSDT","p":"100.7","q":"0.5","m":true,"T":1700000000001}}"#),
+            Ok(vec![Update::Trade { sym: "BTCUSDT".into(), px: 100.7, qty: 0.5, buy: false, ts: 1_700_000_000_001 }])
+        );
+        assert_eq!(
+            d.parse(r#"{"stream":"btcusdt@bookTicker","data":{"u":7,"T":1700000000002,"b":"1","B":"1","a":"2","A":"1"}}"#).unwrap()[0],
+            Update::Time(1_700_000_000_002),
+            "перпы: время биржи перед лучшими ценами"
+        );
         let b = m.book("binance", "BTCUSDT").unwrap();
         assert_eq!(b.best_bid(), Some((100.5, 1.0)));
         assert_eq!(b.best_ask(), Some((100.9, 4.0)));

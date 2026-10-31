@@ -1,5 +1,5 @@
 //! Hyperliquid (перпы и спот): `l2Book` по монете (спот — по имени пары из spotMeta: PURR/USDC или @107) — каждое сообщение полный снимок (до 20 уровней с каждой стороны);
-//! пинг {"method":"ping"} раз в 20 с. Монета — базовая валюта символа (BTCUSDC → BTC).
+//! `trades` — сделки (side B — агрессор покупатель); время биржи — `time`. Пинг {"method":"ping"} раз в 20 с. Монета — базовая валюта символа (BTCUSDC → BTC).
 
 use super::{Dialect, Parsed, Update};
 use crate::trading::paper::split;
@@ -127,9 +127,11 @@ impl Dialect for Hyperliquid {
         let mut c: Vec<&String> = coins.keys().collect();
         c.sort();
         c.iter()
-            .map(|coin| {
-                json!({"method": "subscribe", "subscription": {"type": "l2Book", "coin": coin}})
-                    .to_string()
+            .flat_map(|coin| {
+                ["l2Book", "trades"].map(|t| {
+                    json!({"method": "subscribe", "subscription": {"type": t, "coin": coin}})
+                        .to_string()
+                })
             })
             .collect()
     }
@@ -153,12 +155,35 @@ impl Dialect for Hyperliquid {
                     .as_array()
                     .filter(|a| a.len() == 2)
                     .ok_or("Hyperliquid: levels не из двух сторон")?;
-                Ok(vec![Update::Snapshot {
-                    sym,
-                    bids: side(&lv[0]),
-                    asks: side(&lv[1]),
-                    id: d["time"].as_u64().unwrap_or(0),
-                }])
+                let ts = d["time"].as_u64().unwrap_or(0);
+                Ok(vec![
+                    Update::Time(ts),
+                    Update::Snapshot {
+                        sym,
+                        bids: side(&lv[0]),
+                        asks: side(&lv[1]),
+                        id: ts,
+                    },
+                ])
+            }
+            // сделки: side "B" — агрессор покупатель, "A" — продавец
+            Some("trades") => {
+                let coins = self.coins.lock().unwrap();
+                let n = |x: &Value| x.as_str().and_then(|s| s.parse::<f64>().ok());
+                Ok(v["data"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|t| {
+                        Some(Update::Trade {
+                            sym: coins.get(t["coin"].as_str()?)?.clone(),
+                            px: n(&t["px"])?,
+                            qty: n(&t["sz"])?,
+                            buy: t["side"] == "B",
+                            ts: t["time"].as_u64().unwrap_or(0),
+                        })
+                    })
+                    .collect())
             }
             _ => Ok(vec![]),
         }
@@ -176,18 +201,28 @@ mod tests {
             d.subscribe(),
             vec![
                 r#"{"method":"subscribe","subscription":{"type":"l2Book","coin":"BTC"}}"#
+                    .to_string(),
+                r#"{"method":"subscribe","subscription":{"type":"trades","coin":"BTC"}}"#
                     .to_string()
             ]
         );
         let m = r#"{"channel":"l2Book","data":{"coin":"BTC","time":5,"levels":[[{"px":"100","sz":"1.5","n":2}],[{"px":"101","sz":"2","n":1}]]}}"#;
         assert_eq!(
             d.parse(m),
-            Ok(vec![Update::Snapshot {
-                sym: "BTCUSDC".into(),
-                bids: vec![(100.0, 1.5)],
-                asks: vec![(101.0, 2.0)],
-                id: 5
-            }])
+            Ok(vec![
+                Update::Time(5),
+                Update::Snapshot {
+                    sym: "BTCUSDC".into(),
+                    bids: vec![(100.0, 1.5)],
+                    asks: vec![(101.0, 2.0)],
+                    id: 5
+                }
+            ])
+        );
+        assert_eq!(
+            d.parse(r#"{"channel":"trades","data":[{"coin":"BTC","side":"A","px":"100.2","sz":"0.7","time":6,"hash":"0x","tid":1},{"coin":"ETH","side":"B","px":"1","sz":"1","time":6}]}"#),
+            Ok(vec![Update::Trade { sym: "BTCUSDC".into(), px: 100.2, qty: 0.7, buy: false, ts: 6 }]),
+            "чужая монета пропускается"
         );
         assert_eq!(d.parse(r#"{"channel":"pong"}"#), Ok(vec![]));
         assert!(d.parse(r#"{"channel":"error","data":"bad"}"#).is_err());
@@ -210,7 +245,7 @@ mod tests {
         );
         let m = r#"{"channel":"l2Book","data":{"coin":"@107","time":1,"levels":[[{"px":"30","sz":"2","n":1}],[{"px":"30.1","sz":"1","n":1}]]}}"#;
         assert_eq!(
-            d.parse(m).unwrap()[0],
+            d.parse(m).unwrap()[1],
             Update::Snapshot {
                 sym: "HYPEUSDC".into(),
                 bids: vec![(30.0, 2.0)],

@@ -23,6 +23,8 @@ pub struct FeedState {
     pub bbo_enabled: bool,
     pub bbo_updates: u64,
     pub stale: u64,
+    /// Сделок рынка получено (поток сделок).
+    pub trades: u64,
     /// Ошибка REST (правила пар, свечи); пусто — в порядке.
     pub rest_error: String,
     /// Переподключений из-за тишины, ошибок разбора (сколько всего), перекрещённых стаканов.

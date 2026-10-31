@@ -1,4 +1,5 @@
-//! Bybit v5 (спот и линейные перпы): `orderbook.50` — снимок, затем изменения; `orderbook.1` — лучшие цены.
+//! Bybit v5 (спот и линейные перпы): `orderbook.50` — снимок, затем изменения; `orderbook.1` — лучшие цены;
+//! `publicTrade` — сделки. Время биржи — `ts` сообщения (у сделок — `T`).
 //! Номер `seq` общий для всех глубин. Пинг `{"op":"ping"}` раз в 20 с.
 
 use super::{Dialect, Parsed, Update, levels};
@@ -28,6 +29,7 @@ impl Bybit {
             if bbo {
                 topics.push(format!("orderbook.1.{}", s.to_uppercase()));
             }
+            topics.push(format!("publicTrade.{}", s.to_uppercase()));
         }
         Bybit { url, topics }
     }
@@ -59,25 +61,48 @@ impl Dialect for Bybit {
             return Ok(vec![]); // ответ на подписку или pong
         }
         let topic = v["topic"].as_str().unwrap_or("");
+        if topic.starts_with("publicTrade.") {
+            let n = |x: &Value| x.as_str().and_then(|s| s.parse::<f64>().ok());
+            return Ok(v["data"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|t| {
+                    Some(Update::Trade {
+                        sym: t["s"].as_str()?.to_owned(),
+                        px: n(&t["p"])?,
+                        qty: n(&t["v"])?,
+                        buy: t["S"] == "Buy",
+                        ts: t["T"].as_u64().unwrap_or(0),
+                    })
+                })
+                .collect());
+        }
         if !topic.starts_with("orderbook.") {
             return Ok(vec![]);
         }
+        let time: Vec<Update> = v["ts"].as_u64().map(Update::Time).into_iter().collect();
         let d = &v["data"];
         let sym = d["s"].as_str().ok_or("Bybit: нет символа")?.to_owned();
         let id = d["seq"].as_u64().unwrap_or(0);
         let (bids, asks) = (levels(d.get("b")), levels(d.get("a")));
         if topic.starts_with("orderbook.1.") {
             return Ok(match (bids.first(), asks.first()) {
-                (Some(b), Some(a)) => vec![Update::Best {
-                    sym,
-                    bid: *b,
-                    ask: *a,
-                    id,
-                }],
+                (Some(b), Some(a)) => [
+                    time,
+                    vec![Update::Best {
+                        sym,
+                        bid: *b,
+                        ask: *a,
+                        id,
+                    }],
+                ]
+                .concat(),
                 _ => vec![], // пустая сторона — не лучшие цены
             });
         }
-        Ok(vec![if v["type"] == "snapshot" {
+        let mut out = time;
+        out.push(if v["type"] == "snapshot" {
             Update::Snapshot {
                 sym,
                 bids,
@@ -91,7 +116,8 @@ impl Dialect for Bybit {
                 asks,
                 id,
             }
-        }])
+        });
+        Ok(out)
     }
 }
 
@@ -107,7 +133,9 @@ mod tests {
         let d = Bybit::new("wss://x".into(), &["BTCUSDT".into()], true);
         assert_eq!(
             d.subscribe(),
-            vec![r#"{"op":"subscribe","args":["orderbook.50.BTCUSDT","orderbook.1.BTCUSDT"]}"#]
+            vec![
+                r#"{"op":"subscribe","args":["orderbook.50.BTCUSDT","orderbook.1.BTCUSDT","publicTrade.BTCUSDT"]}"#
+            ]
         );
         assert_eq!(
             d.parse(r#"{"success":true,"ret_msg":"","op":"subscribe"}"#),
@@ -120,15 +148,38 @@ mod tests {
         let s = d.parse(r#"{"topic":"orderbook.50.BTCUSDT","type":"snapshot","ts":1,"data":{"s":"BTCUSDT","b":[["100","1"]],"a":[["101","2"]],"u":1,"seq":7}}"#).unwrap();
         assert_eq!(
             s,
-            vec![Update::Snapshot {
-                sym: "BTCUSDT".into(),
-                bids: vec![(100.0, 1.0)],
-                asks: vec![(101.0, 2.0)],
-                id: 7
-            }]
+            vec![
+                Update::Time(1),
+                Update::Snapshot {
+                    sym: "BTCUSDT".into(),
+                    bids: vec![(100.0, 1.0)],
+                    asks: vec![(101.0, 2.0)],
+                    id: 7
+                }
+            ]
         );
         let b = d.parse(r#"{"topic":"orderbook.1.BTCUSDT","type":"delta","data":{"s":"BTCUSDT","b":[["100.5","1"]],"a":[["100.9","1"]],"seq":8}}"#).unwrap();
         assert!(matches!(b[0], Update::Best { id: 8, .. }));
+        let t = d.parse(r#"{"topic":"publicTrade.BTCUSDT","type":"snapshot","ts":5,"data":[{"T":4,"s":"BTCUSDT","S":"Sell","v":"0.2","p":"100.6"},{"T":5,"s":"BTCUSDT","S":"Buy","v":"1","p":"100.9"}]}"#).unwrap();
+        assert_eq!(t.len(), 2);
+        assert_eq!(
+            t[0],
+            Update::Trade {
+                sym: "BTCUSDT".into(),
+                px: 100.6,
+                qty: 0.2,
+                buy: false,
+                ts: 4
+            }
+        );
+        assert!(matches!(
+            t[1],
+            Update::Trade {
+                buy: true,
+                ts: 5,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

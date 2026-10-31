@@ -1,6 +1,7 @@
 //! KuCoin: адрес и токен — POST /api/v1/bullet-public перед каждым подключением; стакан — 50 уровней снимками.
 //! Спот — тема /spotMarket/level2Depth50:BTC-USDT,… (до 100 пар в теме); перпы — /contractMarket/level2Depth50:XBTUSDTM
-//! (по теме на контракт, объём в лотах × multiplier из /api/v1/contracts/active). Пинг {"id","type":"ping"}.
+//! (по теме на контракт, объём в лотах × multiplier из /api/v1/contracts/active). Сделки — /market/match: (спот) и
+//! /contractMarket/execution: (перпы), время в наносекундах. Пинг {"id","type":"ping"}.
 
 use super::{Dialect, Parsed, Update, levels};
 use crate::trading::paper::split;
@@ -133,14 +134,21 @@ impl Dialect for Kucoin {
     fn subscribe(&self) -> Vec<String> {
         let mut ids: Vec<String> = self.inst.lock().unwrap().keys().cloned().collect();
         ids.sort();
-        let (topic, batch) = if self.perp {
-            ("/contractMarket/level2Depth50:", 1)
+        // стакан и сделки
+        let topics: &[&str] = if self.perp {
+            &[
+                "/contractMarket/level2Depth50:",
+                "/contractMarket/execution:",
+            ]
         } else {
-            ("/spotMarket/level2Depth50:", 100)
+            &["/spotMarket/level2Depth50:", "/market/match:"]
         };
-        ids.chunks(batch)
+        let batch = if self.perp { 1 } else { 100 };
+        topics
+            .iter()
+            .flat_map(|t| ids.chunks(batch).map(move |c| format!("{t}{}", c.join(","))))
             .enumerate()
-            .map(|(i, c)| json!({"id": format!("sub{i}"), "type": "subscribe", "topic": format!("{topic}{}", c.join(",")), "privateChannel": false, "response": true}).to_string())
+            .map(|(i, topic)| json!({"id": format!("sub{i}"), "type": "subscribe", "topic": topic, "privateChannel": false, "response": true}).to_string())
             .collect()
     }
 
@@ -164,13 +172,37 @@ impl Dialect for Kucoin {
                     return Ok(vec![]);
                 };
                 let d = &v["data"];
+                if topic.starts_with("/market/match:")
+                    || topic.starts_with("/contractMarket/execution:")
+                {
+                    let n = |x: &Value| {
+                        x.as_f64()
+                            .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+                    };
+                    // время сделки — в наносекундах (спот: time, перпы: ts)
+                    let ns = n(&d["time"]).or_else(|| n(&d["ts"])).unwrap_or(0.0);
+                    return Ok(match (n(&d["price"]), n(&d["size"])) {
+                        (Some(px), Some(q)) => vec![Update::Trade {
+                            sym,
+                            px,
+                            qty: q * k,
+                            buy: d["side"] == "buy",
+                            ts: (ns / 1e6) as u64,
+                        }],
+                        _ => vec![],
+                    });
+                }
                 let scale = |l: Vec<(f64, f64)>| l.into_iter().map(|(p, q)| (p, q * k)).collect();
-                Ok(vec![Update::Snapshot {
+                let ts = d["timestamp"].as_u64().unwrap_or(0);
+                let mut out: Vec<Update> =
+                    (ts > 0).then_some(Update::Time(ts)).into_iter().collect();
+                out.push(Update::Snapshot {
                     sym,
                     bids: scale(levels(d.get("bids"))),
                     asks: scale(levels(d.get("asks"))),
-                    id: d["timestamp"].as_u64().unwrap_or(0),
-                }])
+                    id: ts,
+                });
+                Ok(out)
             }
             _ => Ok(vec![]), // welcome, ack, pong
         }
@@ -189,17 +221,25 @@ mod tests {
             &["BTCUSDT".into(), "ETHUSDT".into()],
             false,
         );
-        assert_eq!(d.subscribe().len(), 1);
+        assert_eq!(d.subscribe().len(), 2);
         assert!(d.subscribe()[0].contains("/spotMarket/level2Depth50:BTC-USDT,ETH-USDT"));
+        assert!(d.subscribe()[1].contains("/market/match:BTC-USDT,ETH-USDT"));
+        assert_eq!(
+            d.parse(r#"{"type":"message","topic":"/market/match:BTC-USDT","subject":"trade.l3match","data":{"price":"100.3","size":"0.2","side":"sell","symbol":"BTC-USDT","time":"1700000000006000000"}}"#),
+            Ok(vec![Update::Trade { sym: "BTCUSDT".into(), px: 100.3, qty: 0.2, buy: false, ts: 1_700_000_000_006 }])
+        );
         let m = r#"{"type":"message","topic":"/spotMarket/level2Depth50:BTC-USDT","subject":"level2","data":{"asks":[["101","2"]],"bids":[["100","1"]],"timestamp":7}}"#;
         assert_eq!(
             d.parse(m),
-            Ok(vec![Update::Snapshot {
-                sym: "BTCUSDT".into(),
-                bids: vec![(100.0, 1.0)],
-                asks: vec![(101.0, 2.0)],
-                id: 7
-            }])
+            Ok(vec![
+                Update::Time(7),
+                Update::Snapshot {
+                    sym: "BTCUSDT".into(),
+                    bids: vec![(100.0, 1.0)],
+                    asks: vec![(101.0, 2.0)],
+                    id: 7
+                }
+            ])
         );
         assert!(
             d.parse(r#"{"type":"error","code":404,"data":"topic"}"#)
@@ -212,12 +252,20 @@ mod tests {
         let m = r#"{"type":"message","topic":"/contractMarket/level2Depth50:XBTUSDTM","data":{"asks":[[101,2000]],"bids":[[100,1000]],"timestamp":8}}"#;
         assert_eq!(
             f.parse(m),
-            Ok(vec![Update::Snapshot {
-                sym: "BTCUSDT".into(),
-                bids: vec![(100.0, 1.0)],
-                asks: vec![(101.0, 2.0)],
-                id: 8
-            }])
+            Ok(vec![
+                Update::Time(8),
+                Update::Snapshot {
+                    sym: "BTCUSDT".into(),
+                    bids: vec![(100.0, 1.0)],
+                    asks: vec![(101.0, 2.0)],
+                    id: 8
+                }
+            ])
+        );
+        assert!(f.subscribe()[1].contains("/contractMarket/execution:XBTUSDTM"));
+        assert_eq!(
+            f.parse(r#"{"type":"message","topic":"/contractMarket/execution:XBTUSDTM","data":{"symbol":"XBTUSDTM","side":"buy","size":3,"price":"100.1","ts":1700000000007000000}}"#),
+            Ok(vec![Update::Trade { sym: "BTCUSDT".into(), px: 100.1, qty: 0.003, buy: true, ts: 1_700_000_000_007 }])
         );
     }
 }

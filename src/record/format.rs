@@ -6,7 +6,7 @@ use super::event::{Event, Name, Rec};
 use std::collections::HashMap;
 
 pub const MAGIC: &[u8; 4] = b"HFTR";
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 const NAME: u8 = 0;
 const BBO: u8 = 1;
@@ -15,6 +15,7 @@ const ORDER: u8 = 3;
 const FILL: u8 = 4;
 const CANCEL: u8 = 5;
 const FEED_ERROR: u8 = 6;
+const TRADE: u8 = 7;
 
 pub fn header() -> Vec<u8> {
     let mut b = MAGIC.to_vec();
@@ -51,6 +52,7 @@ impl Encoder {
         let (ex, sym) = match &r.ev {
             Event::Bbo { ex, sym, .. }
             | Event::Depth { ex, sym, .. }
+            | Event::Trade { ex, sym, .. }
             | Event::Order { ex, sym, .. }
             | Event::Fill { ex, sym, .. }
             | Event::Cancel { ex, sym, .. } => (self.name(out, ex), Some(self.name(out, sym))),
@@ -59,6 +61,7 @@ impl Encoder {
         let tag = match r.ev {
             Event::Bbo { .. } => BBO,
             Event::Depth { .. } => DEPTH,
+            Event::Trade { .. } => TRADE,
             Event::Order { .. } => ORDER,
             Event::Fill { .. } => FILL,
             Event::Cancel { .. } => CANCEL,
@@ -72,23 +75,40 @@ impl Encoder {
         }
         match &r.ev {
             Event::Bbo {
+                ts_ex,
                 bid,
                 bid_qty,
                 ask,
                 ask_qty,
                 ..
             } => {
+                out.extend_from_slice(&ts_ex.to_le_bytes());
                 for v in [*bid, *bid_qty, *ask, *ask_qty] {
                     f(out, v)
                 }
             }
-            Event::Depth { bids, asks, .. } => {
+            Event::Depth {
+                ts_ex, bids, asks, ..
+            } => {
+                out.extend_from_slice(&ts_ex.to_le_bytes());
                 out.extend_from_slice(&(bids.len() as u16).to_le_bytes());
                 out.extend_from_slice(&(asks.len() as u16).to_le_bytes());
                 for (p, q) in bids.iter().chain(asks) {
                     f(out, *p);
                     f(out, *q);
                 }
+            }
+            Event::Trade {
+                ts_ex,
+                px,
+                qty,
+                buy,
+                ..
+            } => {
+                out.extend_from_slice(&ts_ex.to_le_bytes());
+                f(out, *px);
+                f(out, *qty);
+                out.push(*buy as u8);
             }
             Event::Order {
                 id,
@@ -202,12 +222,14 @@ impl Cursor<'_> {
                 BBO => Event::Bbo {
                     ex,
                     sym,
+                    ts_ex: self.u64()?,
                     bid: self.f64()?,
                     bid_qty: self.f64()?,
                     ask: self.f64()?,
                     ask_qty: self.f64()?,
                 },
                 DEPTH => {
+                    let ts_ex = self.u64()?;
                     let (nb, na) = (self.u16()? as usize, self.u16()? as usize);
                     let mut lv = Vec::with_capacity(nb + na);
                     for _ in 0..nb + na {
@@ -217,10 +239,19 @@ impl Cursor<'_> {
                     Event::Depth {
                         ex,
                         sym,
+                        ts_ex,
                         bids: lv,
                         asks,
                     }
                 }
+                TRADE => Event::Trade {
+                    ex,
+                    sym,
+                    ts_ex: self.u64()?,
+                    px: self.f64()?,
+                    qty: self.f64()?,
+                    buy: self.u8()? == 1,
+                },
                 ORDER => {
                     let id = self.u64()?;
                     let (side, kind, status) = (self.u8()?, self.u8()?, self.u8()?);

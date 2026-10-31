@@ -1,4 +1,5 @@
-//! Gate v4 USDT-перпы: `futures.order_book` — снимки 20 уровней (`all`), `futures.book_ticker` — лучшие цены;
+//! Gate v4 USDT-перпы: `futures.order_book` — снимки 20 уровней (`all`), `futures.book_ticker` — лучшие цены,
+//! `futures.trades` — сделки (объём со знаком: минус — продажа); время биржи — `t` / `create_time_ms`;
 //! контракт BTC_USDT, объёмы в контрактах переводятся в монеты по `quanto_multiplier`. Пинг `futures.ping` раз в 20 с.
 
 use super::okx::ContractSizes;
@@ -67,6 +68,7 @@ impl Dialect for GateFutures {
             if self.bbo {
                 out.push(json!({"time": now_s(), "channel": "futures.book_ticker", "event": "subscribe", "payload": [c]}).to_string());
             }
+            out.push(json!({"time": now_s(), "channel": "futures.trades", "event": "subscribe", "payload": [c]}).to_string());
         }
         out
     }
@@ -91,6 +93,26 @@ impl Dialect for GateFutures {
             return Ok(vec![]); // ответы на подписку, pong
         }
         let r = &v["result"];
+        if v["channel"] == "futures.trades" {
+            let sizes = self.sizes.lock().unwrap();
+            return Ok(r
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|t| {
+                    let sym = t["contract"].as_str()?.replace('_', "");
+                    let k = *sizes.get(&sym)?;
+                    let size = num(&t["size"])?;
+                    Some(Update::Trade {
+                        sym,
+                        px: num(&t["price"])?,
+                        qty: size.abs() * k,
+                        buy: size > 0.0,
+                        ts: num(&t["create_time_ms"]).unwrap_or(0.0) as u64,
+                    })
+                })
+                .collect());
+        }
         let c = r["contract"]
             .as_str()
             .or_else(|| r["s"].as_str())
@@ -100,23 +122,30 @@ impl Dialect for GateFutures {
             return Ok(vec![]); // размер контракта ещё не получен
         };
         let id = r["id"].as_u64().or_else(|| r["u"].as_u64()).unwrap_or(0);
+        let time: Vec<Update> = r["t"].as_u64().map(Update::Time).into_iter().collect();
         match v["channel"].as_str() {
-            Some("futures.order_book") if ev == "all" => Ok(vec![Update::Snapshot {
-                sym,
-                bids: levels(&r["bids"], k),
-                asks: levels(&r["asks"], k),
-                id,
-            }]),
+            Some("futures.order_book") if ev == "all" => Ok([
+                time,
+                vec![Update::Snapshot {
+                    sym,
+                    bids: levels(&r["bids"], k),
+                    asks: levels(&r["asks"], k),
+                    id,
+                }],
+            ]
+            .concat()),
             Some("futures.book_ticker") => {
                 match (num(&r["b"]), num(&r["B"]), num(&r["a"]), num(&r["A"])) {
-                    (Some(b), Some(bq), Some(a), Some(aq)) if b > 0.0 && a > 0.0 => {
-                        Ok(vec![Update::Best {
+                    (Some(b), Some(bq), Some(a), Some(aq)) if b > 0.0 && a > 0.0 => Ok([
+                        time,
+                        vec![Update::Best {
                             sym,
                             bid: (b, bq * k),
                             ask: (a, aq * k),
                             id,
-                        }])
-                    }
+                        }],
+                    ]
+                    .concat()),
                     _ => Ok(vec![]),
                 }
             }
@@ -139,22 +168,32 @@ mod tests {
         sizes.lock().unwrap().insert("BTCUSDT".into(), 0.5);
         assert_eq!(
             d.parse(ob),
-            Ok(vec![Update::Snapshot {
-                sym: "BTCUSDT".into(),
-                bids: vec![(100.0, 2.5)],
-                asks: vec![(101.0, 1.5)],
-                id: 5
-            }])
+            Ok(vec![
+                Update::Time(1),
+                Update::Snapshot {
+                    sym: "BTCUSDT".into(),
+                    bids: vec![(100.0, 2.5)],
+                    asks: vec![(101.0, 1.5)],
+                    id: 5
+                }
+            ])
         );
         let bt = r#"{"channel":"futures.book_ticker","event":"update","result":{"t":1,"u":6,"s":"BTC_USDT","b":"100.5","B":10,"a":"100.6","A":20}}"#;
         assert_eq!(
             d.parse(bt),
-            Ok(vec![Update::Best {
-                sym: "BTCUSDT".into(),
-                bid: (100.5, 5.0),
-                ask: (100.6, 10.0),
-                id: 6
-            }])
+            Ok(vec![
+                Update::Time(1),
+                Update::Best {
+                    sym: "BTCUSDT".into(),
+                    bid: (100.5, 5.0),
+                    ask: (100.6, 10.0),
+                    id: 6
+                }
+            ])
+        );
+        assert_eq!(
+            d.parse(r#"{"channel":"futures.trades","event":"update","result":[{"size":-4,"id":1,"create_time":1,"create_time_ms":1700000000005,"price":"100.4","contract":"BTC_USDT"}]}"#),
+            Ok(vec![Update::Trade { sym: "BTCUSDT".into(), px: 100.4, qty: 2.0, buy: false, ts: 1_700_000_000_005 }])
         );
         assert!(d.parse(r#"{"channel":"futures.order_book","event":"subscribe","error":{"code":2,"message":"bad"}}"#).is_err());
     }

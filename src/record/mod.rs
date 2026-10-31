@@ -134,7 +134,7 @@ pub fn push(ev: Event) {
 
 /// После обновления стакана: лучшие цены (если изменились) и, при recordDepthLevels > 0, снимок уровней не чаще
 /// recordDepthMs по символу.
-pub fn book(ex: &str, sym: &str, b: &mut Book) {
+pub fn book(ex: &str, sym: &str, b: &mut Book, ts_ex: u64) {
     if !enabled() {
         return;
     }
@@ -147,6 +147,7 @@ pub fn book(ex: &str, sym: &str, b: &mut Book) {
         push(Event::Bbo {
             ex: Name::new(ex),
             sym: Name::new(sym),
+            ts_ex,
             bid: bid.0,
             bid_qty: bid.1,
             ask: ask.0,
@@ -161,10 +162,25 @@ pub fn book(ex: &str, sym: &str, b: &mut Book) {
             push(Event::Depth {
                 ex: Name::new(ex),
                 sym: Name::new(sym),
+                ts_ex,
                 bids: b.levels(false).take(n).collect(),
                 asks: b.levels(true).take(n).collect(),
             });
         }
+    }
+}
+
+/// Сделка рынка.
+pub fn trade(ex: &str, sym: &str, px: f64, qty: f64, buy: bool, ts_ex: u64) {
+    if enabled() {
+        push(Event::Trade {
+            ex: Name::new(ex),
+            sym: Name::new(sym),
+            ts_ex,
+            px,
+            qty,
+            buy,
+        });
     }
 }
 
@@ -222,6 +238,7 @@ mod tests {
             Event::Bbo {
                 ex: n("binance"),
                 sym: n("BTCUSDT"),
+                ts_ex: 1_700_000_000_123,
                 bid: 100.5,
                 bid_qty: 1.0,
                 ask: 100.6,
@@ -230,6 +247,7 @@ mod tests {
             Event::Depth {
                 ex: n("okx"),
                 sym: n("ETHUSDT"),
+                ts_ex: 0,
                 bids: vec![(10.0, 1.0), (9.9, 2.0)],
                 asks: vec![(10.1, 3.0)],
             },
@@ -261,6 +279,14 @@ mod tests {
                 n: 3,
             },
             Event::FeedError { ex: n("okx") },
+            Event::Trade {
+                ex: n("okx"),
+                sym: n("ETHUSDT"),
+                ts_ex: 5,
+                px: 10.05,
+                qty: 0.3,
+                buy: true,
+            },
         ];
         let recs: Vec<Rec> = evs
             .into_iter()
@@ -277,7 +303,7 @@ mod tests {
         }
         assert_eq!(decode(&out).unwrap(), recs);
         // файл ещё пишется: последний кадр оборван — читаются целые
-        assert_eq!(decode(&out[..out.len() - 3]).unwrap(), recs[..5].to_vec());
+        assert_eq!(decode(&out[..out.len() - 3]).unwrap(), recs[..6].to_vec());
         assert!(decode(b"nope").is_err());
         assert!(n("абвгдежзийклмнопрстуф").as_str().len() <= 31);
     }
@@ -301,6 +327,7 @@ mod tests {
                 ev: Event::Bbo {
                     ex: n("gate"),
                     sym: n("XUSDT"),
+                    ts_ex: 0,
                     bid: i as f64,
                     bid_qty: 1.0,
                     ask: i as f64 + 1.0,
@@ -349,7 +376,25 @@ mod tests {
         };
         crate::market::feed::apply(&m, "rectest", best(99.0));
         crate::market::feed::apply(&m, "rectest", best(99.0)); // те же лучшие цены — не пишутся повторно
+        crate::market::feed::reset_ex_time();
+        crate::market::feed::apply(
+            &m,
+            "rectest",
+            crate::market::feed::Update::Time(1_700_000_000_000),
+        );
         crate::market::feed::apply(&m, "rectest", best(99.5));
+        crate::market::feed::apply(
+            &m,
+            "rectest",
+            crate::market::feed::Update::Trade {
+                sym: "RECUSDT".into(),
+                px: 99.7,
+                qty: 0.5,
+                buy: true,
+                ts: 0, // без своего времени — время сообщения
+            },
+        );
+        crate::market::feed::reset_ex_time();
         let mut a = Account::Paper(Paper::new(&["RECUSDT".into()], 1000.0, 0.0, 0.1));
         a.set_venue("rectest");
         let mut lim = Limits::from_params(&serde_json::Map::new());
@@ -388,6 +433,7 @@ mod tests {
             .filter(|e| match e {
                 Event::Bbo { ex, .. }
                 | Event::Depth { ex, .. }
+                | Event::Trade { ex, .. }
                 | Event::Order { ex, .. }
                 | Event::Fill { ex, .. }
                 | Event::Cancel { ex, .. }
@@ -396,6 +442,40 @@ mod tests {
             .collect();
         let count = |f: fn(&Event) -> bool| mine.iter().filter(|e| f(e)).count();
         assert_eq!(count(|e| matches!(e, Event::Bbo { .. })), 2, "{mine:?}");
+        assert_eq!(
+            count(|e| matches!(
+                e,
+                Event::Bbo {
+                    ts_ex: 0,
+                    bid: 99.0,
+                    ..
+                }
+            )),
+            1
+        );
+        assert_eq!(
+            count(|e| matches!(
+                e,
+                Event::Bbo {
+                    ts_ex: 1_700_000_000_000,
+                    bid: 99.5,
+                    ..
+                }
+            )),
+            1
+        );
+        assert_eq!(
+            count(|e| matches!(
+                e,
+                Event::Trade {
+                    ts_ex: 1_700_000_000_000,
+                    buy: true,
+                    ..
+                }
+            )),
+            1
+        );
+        assert_eq!(m.feed("rectest").unwrap().trades, 1);
         assert_eq!(
             count(|e| matches!(e, Event::Depth { .. })),
             1,

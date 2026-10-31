@@ -53,10 +53,11 @@ pub mod kind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    /// Лучшие цены после обновления стакана.
+    /// Лучшие цены после обновления стакана; ts_ex — время биржи, мс (0 — биржа его не прислала).
     Bbo {
         ex: Name,
         sym: Name,
+        ts_ex: u64,
         bid: f64,
         bid_qty: f64,
         ask: f64,
@@ -66,8 +67,18 @@ pub enum Event {
     Depth {
         ex: Name,
         sym: Name,
+        ts_ex: u64,
         bids: Vec<(f64, f64)>,
         asks: Vec<(f64, f64)>,
+    },
+    /// Сделка рынка: buy — агрессор покупатель; ts_ex — время сделки на бирже, мс.
+    Trade {
+        ex: Name,
+        sym: Name,
+        ts_ex: u64,
+        px: f64,
+        qty: f64,
+        buy: bool,
     },
     /// Свой ордер: объём NaN — «доля» или «всё», цена NaN — рыночный.
     Order {

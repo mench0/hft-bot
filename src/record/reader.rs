@@ -29,20 +29,32 @@ pub fn to_json(r: &Rec) -> Value {
         Event::Bbo {
             ex,
             sym,
+            ts_ex,
             bid,
             bid_qty,
             ask,
             ask_qty,
         } => {
-            json!({"t": t, "ns": r.ts, "type": "bbo", "ex": ex.as_str(), "sym": sym.as_str(), "bid": bid, "bidQty": bid_qty, "ask": ask, "askQty": ask_qty})
+            json!({"t": t, "ns": r.ts, "type": "bbo", "ex": ex.as_str(), "sym": sym.as_str(), "tsEx": ts_ex, "bid": bid, "bidQty": bid_qty, "ask": ask, "askQty": ask_qty})
+        }
+        Event::Trade {
+            ex,
+            sym,
+            ts_ex,
+            px,
+            qty,
+            buy,
+        } => {
+            json!({"t": t, "ns": r.ts, "type": "trade", "ex": ex.as_str(), "sym": sym.as_str(), "tsEx": ts_ex, "px": px, "qty": qty, "buy": buy})
         }
         Event::Depth {
             ex,
             sym,
+            ts_ex,
             bids,
             asks,
         } => {
-            json!({"t": t, "ns": r.ts, "type": "depth", "ex": ex.as_str(), "sym": sym.as_str(), "bids": bids, "asks": asks})
+            json!({"t": t, "ns": r.ts, "type": "depth", "ex": ex.as_str(), "sym": sym.as_str(), "tsEx": ts_ex, "bids": bids, "asks": asks})
         }
         Event::Order {
             ex,

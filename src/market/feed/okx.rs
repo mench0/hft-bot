@@ -1,4 +1,5 @@
-//! OKX v5 (спот и перпы SWAP — BTC-USDT-SWAP, объёмы в контрактах переводятся в монеты по ctVal): канал `books` (снимок, затем изменения по `action`) и `bbo-tbt` (лучшие цены), номер `seqId` общий.
+//! OKX v5 (спот и перпы SWAP — BTC-USDT-SWAP, объёмы в контрактах переводятся в монеты по ctVal): канал `books` (снимок, затем изменения по `action`), `bbo-tbt` (лучшие цены) и `trades` (сделки), номер `seqId`
+//! общий, время биржи — `ts`.
 //! Инструмент BTC-USDT. Пинг — текст `ping` раз в 20 с (без сообщений 30 с OKX закрывает соединение).
 
 use super::{Dialect, Parsed, Update, levels};
@@ -38,6 +39,7 @@ impl Okx {
             if bbo {
                 args.push(json!({"channel": "bbo-tbt", "instId": inst_id(s)}));
             }
+            args.push(json!({"channel": "trades", "instId": inst_id(s)}));
         }
         Okx {
             url,
@@ -55,6 +57,7 @@ impl Okx {
             if bbo {
                 args.push(json!({"channel": "bbo-tbt", "instId": id}));
             }
+            args.push(json!({"channel": "trades", "instId": id}));
         }
         Okx {
             url,
@@ -108,7 +111,27 @@ impl Dialect for Okx {
         };
         let scale = |l: Vec<(f64, f64)>| l.into_iter().map(|(p, q)| (p, q * k)).collect::<Vec<_>>();
         let mut out = Vec::new();
+        let num = |x: &Value| x.as_str().and_then(|s| s.parse::<f64>().ok());
         for d in v["data"].as_array().into_iter().flatten() {
+            let ts = d["ts"]
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            if ch == "trades" {
+                if let (Some(px), Some(sz)) = (num(&d["px"]), num(&d["sz"])) {
+                    out.push(Update::Trade {
+                        sym: sym.clone(),
+                        px,
+                        qty: sz * k,
+                        buy: d["side"] == "buy",
+                        ts,
+                    });
+                }
+                continue;
+            }
+            if ts > 0 {
+                out.push(Update::Time(ts));
+            }
             let id = d["seqId"].as_u64().unwrap_or(0);
             let (bids, asks) = (scale(levels(d.get("bids"))), scale(levels(d.get("asks"))));
             match ch {
@@ -162,17 +185,24 @@ mod tests {
         let s = d.parse(r#"{"arg":{"channel":"books","instId":"BTC-USDT"},"action":"snapshot","data":[{"bids":[["100","1","0","1"]],"asks":[["101","2","0","1"]],"ts":"1","seqId":5}]}"#).unwrap();
         assert_eq!(
             s,
-            vec![Update::Snapshot {
-                sym: "BTCUSDT".into(),
-                bids: vec![(100.0, 1.0)],
-                asks: vec![(101.0, 2.0)],
-                id: 5
-            }]
+            vec![
+                Update::Time(1),
+                Update::Snapshot {
+                    sym: "BTCUSDT".into(),
+                    bids: vec![(100.0, 1.0)],
+                    asks: vec![(101.0, 2.0)],
+                    id: 5
+                }
+            ]
         );
         let u = d.parse(r#"{"arg":{"channel":"books","instId":"BTC-USDT"},"action":"update","data":[{"bids":[["100","0","0","0"]],"asks":[],"seqId":6}]}"#).unwrap();
         assert!(matches!(&u[0], Update::Delta { id: 6, bids, .. } if bids == &vec![(100.0, 0.0)]));
         let b = d.parse(r#"{"arg":{"channel":"bbo-tbt","instId":"BTC-USDT"},"data":[{"bids":[["100.5","1","0","1"]],"asks":[["100.6","1","0","1"]],"seqId":7}]}"#).unwrap();
         assert!(matches!(b[0], Update::Best { id: 7, .. }));
+        assert_eq!(
+            d.parse(r#"{"arg":{"channel":"trades","instId":"BTC-USDT"},"data":[{"instId":"BTC-USDT","tradeId":"1","px":"100.55","sz":"0.3","side":"sell","ts":"1700000000003"}]}"#),
+            Ok(vec![Update::Trade { sym: "BTCUSDT".into(), px: 100.55, qty: 0.3, buy: false, ts: 1_700_000_000_003 }])
+        );
     }
 
     #[test]

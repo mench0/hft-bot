@@ -369,7 +369,7 @@ fn request_stats_json(bot: &Bot) -> Value {
                 "marketData": {"ws": {
                     "connected": f.connected, "transport": "tokio-tungstenite", "reconnects": f.reconnects,
                     "lastError": if f.last_error.is_empty() { Value::Null } else { Value::String(f.last_error.clone()) },
-                    "bboEnabled": f.bbo_enabled, "bboUpdates": f.bbo_updates, "bboStale": f.stale,
+                    "bboEnabled": f.bbo_enabled, "bboUpdates": f.bbo_updates, "bboStale": f.stale, "trades": f.trades,
                 }},
             }));
         }
