@@ -67,7 +67,7 @@ fn cfg(fill: Fill) -> Config {
 
 #[test]
 fn spread_capture_earns_on_wide_spread_with_trades() {
-    let r = run(market(), &cfg(Fill::Trade));
+    let r = run(&market(), &cfg(Fill::Trade));
     assert!(r["fills"].as_u64().unwrap() >= 4, "{r}");
     assert!(r["pnl"].as_f64().unwrap() > 0.0, "{r}");
     assert_eq!(r["minutes"], 9);
@@ -90,12 +90,86 @@ fn spread_capture_earns_on_wide_spread_with_trades() {
 #[test]
 fn fill_models_differ() {
     // сделки только по цене заявки: «сквозь» не исполняет, «касание» стакана тоже (стакан не прошёл через цену)
-    let n = |f| run(market(), &cfg(f))["fills"].as_u64().unwrap();
+    let n = |f| run(&market(), &cfg(f))["fills"].as_u64().unwrap();
     let (trade, through, touch) = (n(Fill::Trade), n(Fill::Through), n(Fill::Touch));
     // «сквозь»: продажа по 100.5 не исполняется никогда (сделки ровно по цене заявки) — только покупки, пока не упрёмся в лимит запаса
     assert!(through * 10 < trade, "trade {trade}, through {through}");
     // «касание» стакана: стакан ни разу не прошёл через цену заявки — исполнений нет
     assert_eq!(touch, 0);
-    let none = run(vec![], &cfg(Fill::Trade));
+    let none = run(&[], &cfg(Fill::Trade));
     assert!(none["error"].is_string());
+}
+
+#[test]
+fn sweep_ranks_variants_and_journal_keeps_runs() {
+    let grid = super::sweep::parse("scMinEdgePercent=0.1|0.9;scOrderQuote=20|40").unwrap();
+    let v = super::sweep::sweep(&market(), &cfg(Fill::Trade), &grid, 3);
+    let rows = v["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 4);
+    assert!(
+        rows[0]["pnl"].as_f64() >= rows[3]["pnl"].as_f64(),
+        "по убыванию результата"
+    );
+    // запас 0.9 % при спреде 1 % и комиссиях 0.2 % — продать с прибылью нельзя, сделок не закрыть
+    assert!(
+        rows.iter()
+            .filter(|r| r["params"]["scMinEdgePercent"] == 0.9)
+            .all(|r| r["closedTrades"] == 0)
+    );
+    assert_eq!(
+        rows[0]["params"]["scOrderQuote"], 40,
+        "крупнее сделка — больше результат: {}",
+        rows[0]
+    );
+    let dir = tempfile::tempdir().unwrap();
+    crate::infra::util::set_env(
+        "BACKTEST_DB",
+        &dir.path().join("b.db").display().to_string(),
+    );
+    let id = super::runs::save("sweep", &serde_json::json!({"day": "x"}), &v).unwrap();
+    let l = super::runs::list(10);
+    assert_eq!(
+        (l[0]["id"].as_i64(), l[0]["variants"].as_u64()),
+        (Some(id), Some(4))
+    );
+    assert_eq!(
+        super::runs::get(id).unwrap()["result"]["rows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+}
+
+#[test]
+fn validate_compares_with_recorded_fills() {
+    let mut recs = market();
+    // «реальные» исполнения того дня: купили по 99.5 и продали по 100.5
+    for (k, side, px) in [
+        (10u64, crate::record::event::BUY, 99.5),
+        (20, crate::record::event::SELL, 100.5),
+    ] {
+        recs.push(Rec {
+            ts: 1_761_900_000_000_000_000 + k * 1_000_000_000,
+            ev: Event::Fill {
+                ex: Name::new("gate"),
+                sym: Name::new("XUSDT"),
+                id: k,
+                side,
+                qty: 1.0,
+                price: px,
+                fee: 0.1,
+            },
+        });
+    }
+    let v = super::validate::validate(&recs, &cfg(Fill::Trade));
+    assert_eq!(v["real"]["fills"], 2);
+    assert_eq!(v["real"]["pnl"], 0.8, "1 − две комиссии по 0.1");
+    assert!(v["fillsRatio"].as_f64().unwrap() > 1.3);
+    assert!(
+        v["verdict"].as_str().unwrap().contains("чаще"),
+        "{}",
+        v["verdict"]
+    );
+    assert!(v["sim"]["equity"].is_null());
 }

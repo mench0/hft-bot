@@ -42,6 +42,7 @@ impl Fill {
     }
 }
 
+#[derive(Clone)]
 pub struct Config {
     pub exchange: String,
     pub symbols: Vec<String>,
@@ -84,18 +85,19 @@ fn r4(x: f64) -> f64 {
 }
 
 /// Прогон по событиям записи (по порядку времени получения).
-pub fn run(recs: Vec<Rec>, cfg: &Config) -> Value {
+pub fn run(recs: &[Rec], cfg: &Config) -> Value {
     let ex = cfg.exchange.as_str();
     let syms: Vec<String> = cfg.symbols.iter().map(|s| s.to_uppercase()).collect();
     let mine = |e: &Name, s: &Name| e.as_str() == ex && syms.iter().any(|x| x == s.as_str());
     let mut recs: Vec<Rec> = recs
-        .into_iter()
+        .iter()
         .filter(|r| match &r.ev {
             Event::Bbo { ex, sym, .. }
             | Event::Trade { ex, sym, .. }
             | Event::Depth { ex, sym, .. } => mine(ex, sym),
             _ => false,
         })
+        .cloned()
         .collect();
     recs.sort_by_key(|r| r.ts);
     let (Some(first), Some(last)) = (recs.first().map(|r| r.ts), recs.last().map(|r| r.ts)) else {
@@ -370,7 +372,9 @@ pub fn fees(ex: &str) -> (f64, f64) {
 }
 
 /// `hft-bot backtest --day ГГГГ-ММ-ДД --exchange okx --symbols BTCUSDT [--hours 9-12] [--latency-ms 50]
-/// [--fill trade|touch|through] [--set scMinEdgePercent=0.2,scOrderQuote=50] [--dir data/rec]` — итог JSON.
+/// [--fill trade|touch|through] [--set scMinEdgePercent=0.2,scOrderQuote=50] [--dir data/rec]
+/// [--sweep "scMinEdgePercent=0.05:0.3:0.05;scOrderQuote=20|50" [--threads N]] [--validate] [--no-save]` — итог JSON,
+/// прогон сохраняется в журнал (BACKTEST_DB).
 pub fn cli(args: &[String]) -> Result<(), String> {
     let get = |k: &str| {
         args.iter()
@@ -422,12 +426,29 @@ pub fn cli(args: &[String]) -> Result<(), String> {
     };
     let dir = get("--dir").unwrap_or_else(|| "data/rec".into());
     let recs = load(std::path::Path::new(&dir), &day, hours)?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&run(recs, &cfg)).unwrap_or_default()
-    );
+    let (kind, mut v) = if let Some(spec) = get("--sweep") {
+        let grid = sweep::parse(&spec)?;
+        let threads = get("--threads")
+            .and_then(|t| t.parse().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1).max(1))
+            });
+        ("sweep", sweep::sweep(&recs, &cfg, &grid, threads))
+    } else if args.iter().any(|a| a == "--validate") {
+        ("validate", validate::validate(&recs, &cfg))
+    } else {
+        ("run", run(&recs, &cfg))
+    };
+    if !args.iter().any(|a| a == "--no-save") && v["error"].is_null() {
+        v["runId"] = Value::from(runs::save(kind, &Value::from(args.join(" ")), &v));
+    }
+    println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
     Ok(())
 }
+
+pub mod runs;
+pub mod sweep;
+pub mod validate;
 
 #[cfg(test)]
 mod tests;

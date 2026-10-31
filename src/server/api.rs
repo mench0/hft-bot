@@ -180,6 +180,8 @@ pub fn router(bot: Arc<Bot>, cfg: AdminConfig) -> Router {
             .route("/research/status", get(research_status))
             .route("/research/report", get(research_report))
             .route("/research/backtest", axum::routing::post(research_backtest))
+            .route("/research/runs", get(research_runs))
+            .route("/research/run", get(research_run))
             .route(
                 "/exchange/params/schema",
                 get(|| async { Json(Value::Object(data::exchange_schema().clone())) }),
@@ -969,8 +971,24 @@ async fn research_report(State(a): State<App>, Query(q): Q) -> Result<Json<Value
     Ok(Json(v))
 }
 
+/// Журнал прогонов бэктеста: последние 50.
+async fn research_runs() -> Json<Value> {
+    Json(Value::from(crate::backtest::runs::list(50)))
+}
+
+/// Прогон из журнала целиком (?id=).
+async fn research_run(Query(q): Q) -> Result<Json<Value>, ApiError> {
+    let id: i64 = need(&q, "id")?
+        .parse()
+        .map_err(|_| bad("id — номер прогона"))?;
+    crate::backtest::runs::get(id)
+        .map(Json)
+        .ok_or_else(|| bad(format!("прогона {id} нет")))
+}
+
 /// Бэктест сбора спреда на записи: параметры биржи из бота плюс переопределения set=ключ=значение,…
-/// Один прогон за раз (отдельный поток), чтобы не отнимать процессор у торговли.
+/// mode: run (по умолчанию), sweep (перебор sweep=ключ=от:до:шаг;ключ=a|b, не больше 2 потоков — торговля важнее),
+/// validate (сравнение с записанными своими исполнениями). Один запуск за раз; итог — в журнал прогонов.
 async fn research_backtest(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiError> {
     static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let day = need(&q, "day")?.to_owned();
@@ -1026,12 +1044,30 @@ async fn research_backtest(State(a): State<App>, Query(q): Q) -> Result<Json<Val
         maker_pct: maker,
         taker_pct: taker,
     };
+    let mode = q.get("mode").map_or("run", String::as_str).to_owned();
+    let grid = match mode.as_str() {
+        "sweep" => Some(crate::backtest::sweep::parse(need(&q, "sweep")?).map_err(bad)?),
+        "run" | "validate" => None,
+        _ => return Err(bad("mode: run, sweep или validate")),
+    };
+    let request = serde_json::to_value(&q).unwrap_or_default();
     if BUSY.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return Err(bad("Бэктест уже идёт — дождитесь окончания"));
     }
     let r = tokio::task::spawn_blocking(move || {
-        crate::backtest::load(std::path::Path::new(&dir), &day, hours)
-            .map(|recs| crate::backtest::run(recs, &cfg))
+        let recs = crate::backtest::load(std::path::Path::new(&dir), &day, hours)?;
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get().saturating_sub(1))
+            .clamp(1, 2);
+        let mut v = match &grid {
+            Some(g) => crate::backtest::sweep::sweep(&recs, &cfg, g, threads),
+            None if mode == "validate" => crate::backtest::validate::validate(&recs, &cfg),
+            None => crate::backtest::run(&recs, &cfg),
+        };
+        if v["error"].is_null() {
+            v["runId"] = Value::from(crate::backtest::runs::save(&mode, &request, &v));
+        }
+        Ok::<Value, String>(v)
     })
     .await;
     BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
