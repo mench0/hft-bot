@@ -6,6 +6,7 @@
 //! `recordDir/ГГГГ-ММ-ДД/ЧЧ.bin.zst` (время UTC). Дни старше recordKeepDays удаляются. Чтение — reader.rs и
 //! `hft-bot record-cat <файл>`.
 
+pub mod daily;
 pub mod event;
 pub mod export;
 pub mod fetch;

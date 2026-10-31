@@ -179,6 +179,7 @@ pub fn router(bot: Arc<Bot>, cfg: AdminConfig) -> Router {
             .route("/settings", get(settings).post(settings_update))
             .route("/research/status", get(research_status))
             .route("/research/report", get(research_report))
+            .route("/research/report/send", axum::routing::post(research_report_send))
             .route("/research/backtest", axum::routing::post(research_backtest))
             .route("/research/runs", get(research_runs))
             .route("/research/run", get(research_run))
@@ -432,6 +433,8 @@ fn known_env_keys() -> Vec<String> {
         "METRICS_AUTH",
         "STATE_DB",
         "STATE_FILE",
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_CHAT_ID",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -472,6 +475,7 @@ fn mask_env(key: &str, v: &str) -> String {
         "METRICS_AUTH",
         "STATE_DB",
         "STATE_FILE",
+        "TELEGRAM_CHAT_ID",
     ]
     .contains(&key)
         || key.ends_with("_TESTNET")
@@ -969,6 +973,25 @@ async fn research_report(State(a): State<App>, Query(q): Q) -> Result<Json<Value
     .map_err(|e| bad(e.to_string()))?
     .map_err(bad)?;
     Ok(Json(v))
+}
+
+/// Отправить отчёт за день (?day=, по умолчанию вчера) в Telegram сейчас — проверка настройки.
+async fn research_report_send(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiError> {
+    let day = q.get("day").cloned().unwrap_or_else(|| {
+        crate::infra::util::iso_ms(crate::infra::util::now_ms() - 86_400_000)[..10].to_owned()
+    });
+    let dir = a
+        .bot
+        .settings()
+        .get("recordDir")
+        .and_then(Value::as_str)
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or("data/rec")
+        .to_owned();
+    let text = crate::record::daily::report_and_send(std::path::Path::new(&dir), &day)
+        .await
+        .map_err(bad)?;
+    Ok(Json(json!({"результат": "ок", "день": day, "текст": text})))
 }
 
 /// Журнал прогонов бэктеста: последние 50.

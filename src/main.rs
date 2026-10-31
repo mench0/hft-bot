@@ -81,6 +81,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bot = Arc::new(state::Bot::load(state_path));
     bot.spawn_screener();
     bot.spawn_signals();
+    {
+        let weak = Arc::downgrade(&bot);
+        record::daily::spawn(move || weak.upgrade().map(|b| b.settings()));
+    }
     let addr: SocketAddr = format!("{bind}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("Админка: http://{addr}/control/status (заголовок X-Admin-Token)");

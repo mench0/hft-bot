@@ -55,6 +55,18 @@
    "restart": false,
    "help": "Снимок уровней стакана по символу не чаще раза в N мс (при recordDepthLevels > 0)"
   },
+  "reportDailyEnabled": {
+   "default": "false",
+   "restart": false,
+   "help": "Исследования: раз в сутки отправлять в Telegram отчёт по записи за вчера (задержки и обрывы бирж, markout своих исполнений и причины, кто ведёт, поток сделок). Бот и чат — TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID во вкладке «Окружение»"
+  },
+  "reportDailyHourUtc": {
+   "default": "1",
+   "min": 0.0,
+   "max": 23.0,
+   "restart": false,
+   "help": "Исследования: в каком часу (UTC) отправлять ежедневный отчёт за вчера"
+  },
   "timeSyncMin": {
    "default": "30",
    "min": 1.0,
