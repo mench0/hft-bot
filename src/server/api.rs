@@ -134,6 +134,7 @@ pub fn router(bot: Arc<Bot>, cfg: AdminConfig) -> Router {
             .route("/discovery", get(discovery))
             .route("/discovery/refresh", axum::routing::post(discovery_refresh))
             .route("/market", get(market))
+            .route("/market/tape", get(market_tape))
             .route("/strategies", get(strategies))
             .route("/arbitrage", get(arbitrage))
             .route("/order", axum::routing::post(order))
@@ -836,6 +837,17 @@ async fn market(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiErr
         return Err(bad("Соединения не подняты"));
     }
     Ok(Json(a.bot.market.market_json(ex)))
+}
+
+/// Лента символа для графика: лучшие цены, сделки рынка, свои исполнения с sinceMs или за последние windowMs
+/// (по умолчанию — за 5 минут).
+async fn market_tape(Query(q): Q) -> Result<Json<Value>, ApiError> {
+    let (ex, sym) = (need(&q, "exchange")?, need(&q, "symbol")?);
+    let num = |k: &str| q.get(k).and_then(|v| v.parse::<u64>().ok());
+    let since = num("sinceMs").unwrap_or_else(|| {
+        crate::infra::util::now_ms().saturating_sub(num("windowMs").unwrap_or(5 * 60_000))
+    });
+    Ok(Json(crate::market::tape::json(ex, sym, since)))
 }
 
 /// Параметры из строки запроса без служебных ключей.

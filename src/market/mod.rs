@@ -2,6 +2,7 @@
 
 pub mod book;
 pub mod feed;
+pub mod tape;
 
 use crate::exchange::rest::Filter;
 use crate::market::book::Book;

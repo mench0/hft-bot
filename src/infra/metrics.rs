@@ -417,6 +417,7 @@ pub fn render(bot: &Bot) -> String {
     calls(&mut o);
     rate_budgets(&mut o);
     recorder(&mut o);
+    tape(&mut o);
     let names = [
         (
             "hft_connected",
@@ -788,6 +789,39 @@ fn books(o: &mut Out, bot: &Bot, exchanges: &[String]) {
                 _ => bk.age_ms().map_or(f64::NAN, |x| x as f64),
             };
             o.line(name, &[("exchange", ex), ("symbol", s)], v);
+        }
+    }
+}
+
+/// Поток сделок рынка и свои исполнения по символам (с запуска).
+fn tape(o: &mut Out) {
+    let rows = crate::market::tape::counters();
+    for (i, (name, help)) in [
+        (
+            "hft_market_trades_total",
+            "Сделок рынка по символу (side: buy — агрессор покупатель)",
+        ),
+        (
+            "hft_market_volume_quote_total",
+            "Оборот сделок рынка в котируемой валюте",
+        ),
+        ("hft_own_fills_total", "Своих исполнений по символу"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        o.counter(name, help);
+        for (ex, s, c) in &rows {
+            o.line(
+                name,
+                &[("exchange", ex), ("symbol", s), ("side", "buy")],
+                c[i * 2],
+            );
+            o.line(
+                name,
+                &[("exchange", ex), ("symbol", s), ("side", "sell")],
+                c[i * 2 + 1],
+            );
         }
     }
 }

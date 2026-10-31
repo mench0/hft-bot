@@ -260,6 +260,10 @@ data/                  каталог бирж и схемы параметро�
   у MEXC, BingX, LBank, Upbit и Uniswap поток сделок пока не подключён. Подписка идёт всегда (счётчик `trades` в
   `/exchanges/request-stats` и на «Обзоре»), записываются сделки только при включённой записи. Время биржи — из
   сообщения (`T`, `ts`, `t`, `time`, `timestamp`); нет — 0 (у спота Binance в стакане и лучших ценах его нет).
+- График на вкладке «Рынок»: `GET /market/tape?exchange=&symbol=&windowMs=` — лучшие цены при изменении, сделки рынка
+  и свои исполнения за последние 10 минут (в памяти, не зависит от записи). Счётчики сделок и оборота по агрессору и
+  свои исполнения — в `/metrics` (`hft_market_trades_total`, `hft_market_volume_quote_total`, `hft_own_fills_total`),
+  панели «Сделки рынка» на дашборде Grafana «HFT · Рынок».
 - Состояние: `GET /research/status`, метрики `hft_record_*`. Посмотреть файл: `hft-bot record-cat файл.bin.zst`
   (JSON-строки).
 

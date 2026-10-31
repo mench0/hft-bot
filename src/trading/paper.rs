@@ -1006,6 +1006,13 @@ impl Paper {
         }
         self.exec_seq += 1;
         let seq = self.exec_seq;
+        crate::market::tape::fill(
+            &self.venue,
+            &symbol.to_uppercase(),
+            price,
+            qty,
+            side == Side::Buy,
+        );
         crate::record::push(crate::record::event::Event::Fill {
             ex: crate::record::event::Name::new(&self.venue),
             sym: crate::record::event::Name::new(&symbol.to_uppercase()),

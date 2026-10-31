@@ -72,6 +72,14 @@ fn ex_time() -> u64 {
     EX_TS.with(|t| t.get())
 }
 
+/// Стакан изменился: лента для графика и запись.
+fn on_book(ex: &str, sym: &str, b: &mut crate::market::book::Book) {
+    if let (Some(bid), Some(ask)) = (b.best_bid(), b.best_ask()) {
+        super::tape::bbo(ex, sym, bid.0, ask.0);
+    }
+    crate::record::book(ex, sym, b, ex_time());
+}
+
 /// Разбор сообщения: обновления, служебное (пусто) или ошибка биржи (переподключиться).
 pub type Parsed = Result<Vec<Update>, String>;
 
@@ -423,6 +431,7 @@ pub fn apply(market: &Market, ex: &str, u: Update) -> Option<String> {
             ts,
         } => {
             market.with_feed(ex, |f| f.trades += 1);
+            super::tape::trade(ex, &sym, px, qty, buy);
             crate::record::trade(ex, &sym, px, qty, buy, if ts > 0 { ts } else { ex_time() });
             return None;
         }
@@ -434,7 +443,7 @@ pub fn apply(market: &Market, ex: &str, u: Update) -> Option<String> {
         } => {
             market.with_book(ex, &sym, |b| {
                 if b.apply_snapshot(bids, asks, id) {
-                    crate::record::book(ex, &sym, b, ex_time())
+                    on_book(ex, &sym, b)
                 }
             });
             sym
@@ -447,7 +456,7 @@ pub fn apply(market: &Market, ex: &str, u: Update) -> Option<String> {
         } => {
             market.with_book(ex, &sym, |b| {
                 if b.apply_delta(&bids, &asks, id) {
-                    crate::record::book(ex, &sym, b, ex_time())
+                    on_book(ex, &sym, b)
                 }
             });
             sym
@@ -456,7 +465,7 @@ pub fn apply(market: &Market, ex: &str, u: Update) -> Option<String> {
             let fresh = market.with_book(ex, &sym, |b| {
                 let fresh = b.apply_best(bid.0, bid.1, ask.0, ask.1, id);
                 if fresh {
-                    crate::record::book(ex, &sym, b, ex_time())
+                    on_book(ex, &sym, b)
                 }
                 fresh
             });
