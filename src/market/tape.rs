@@ -42,7 +42,11 @@ type Key = (String, String);
 
 static TAPES: OnceLock<Mutex<HashMap<Key, Tape>>> = OnceLock::new();
 
-fn with<R>(ex: &str, sym: &str, f: impl FnOnce(&mut Tape) -> R) -> R {
+fn with(ex: &str, sym: &str, f: impl FnOnce(&mut Tape)) {
+    // бэктест не попадает в живую ленту
+    if crate::infra::clock::simulated() {
+        return;
+    }
     let mut m = TAPES.get_or_init(Default::default).lock().unwrap();
     let t = match m.get_mut(&(ex.to_owned(), sym.to_owned())) {
         Some(t) => t,

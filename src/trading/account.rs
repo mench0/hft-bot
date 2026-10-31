@@ -380,6 +380,28 @@ impl Account {
         }
     }
 
+    /// Бэктест: исполнение заявок по стакану (strict — только сквозь цену) и по сделке рынка (только бумага).
+    pub fn match_book(&mut self, symbol: &str, book: &Book, lim: &Limits, strict: bool) {
+        if let Account::Paper(p) = self {
+            p.match_book(symbol, book, lim, strict)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn match_trade(
+        &mut self,
+        symbol: &str,
+        px: f64,
+        buy: bool,
+        mid: f64,
+        lim: &Limits,
+        strict: bool,
+    ) {
+        if let Account::Paper(p) = self {
+            p.match_trade(symbol, px, buy, mid, lim, strict)
+        }
+    }
+
     /// Стартовый баланс валюты новой монеты (только бумага).
     pub fn ensure_quote(&mut self, symbol: &str, start: f64) {
         if let Account::Paper(p) = self {

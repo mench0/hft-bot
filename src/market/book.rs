@@ -38,7 +38,7 @@ impl Book {
         self.bids = bids;
         self.asks = asks;
         self.update_id = update_id.max(self.update_id);
-        self.updated = Some(Instant::now());
+        self.updated = Some(crate::infra::clock::now());
         true
     }
 
@@ -77,7 +77,7 @@ impl Book {
             upsert(&mut self.asks, *l, false);
         }
         self.update_id = update_id.max(self.update_id);
-        self.updated = Some(Instant::now());
+        self.updated = Some(crate::infra::clock::now());
         true
     }
 
@@ -99,7 +99,7 @@ impl Book {
         self.asks.retain(|l| l.0 > ask);
         self.asks.insert(0, (ask, ask_qty));
         self.update_id = update_id.max(self.update_id);
-        self.updated = Some(Instant::now());
+        self.updated = Some(crate::infra::clock::now());
         true
     }
 
@@ -140,7 +140,11 @@ impl Book {
 
     /// Сколько миллисекунд назад было последнее обновление (None — не было).
     pub fn age_ms(&self) -> Option<u64> {
-        self.updated.map(|t| t.elapsed().as_millis() as u64)
+        self.updated.map(|t| {
+            crate::infra::clock::now()
+                .saturating_duration_since(t)
+                .as_millis() as u64
+        })
     }
 }
 

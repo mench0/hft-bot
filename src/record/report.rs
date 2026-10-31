@@ -292,7 +292,7 @@ pub fn build(recs: impl IntoIterator<Item = Rec>) -> Value {
 pub fn day(dir: &Path, day: &str, hours: Option<(u32, u32)>) -> Result<Value, String> {
     let d = dir.join(day);
     let mut files: Vec<_> = std::fs::read_dir(&d)
-        .map_err(|e| format!("{}: {e}", d.display()))?
+        .map_err(|_| format!("за {day} записи нет (папка {})", d.display()))?
         .flatten()
         .map(|e| e.path())
         .filter(|p| {

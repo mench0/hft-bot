@@ -5,7 +5,7 @@ use crate::exchange::rest::Filter;
 use crate::market::book::Book;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 /// Известные котируемые валюты (как BalanceStore.QUOTE_ASSETS в Java), по порядку проверки.
 const QUOTES: &[&str] = &[
@@ -201,10 +201,7 @@ pub struct Exec {
 const EXECS_KEEP: usize = 10_000;
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    crate::infra::clock::now_ms()
 }
 
 fn utc_day() -> u64 {
@@ -507,7 +504,7 @@ impl Paper {
         if self.kill_switch {
             return Err("kill switch: дневной лимит убытка исчерпан".into());
         }
-        let cut = Instant::now() - Duration::from_secs(60);
+        let cut = crate::infra::clock::now() - Duration::from_secs(60);
         while self.recent.front().is_some_and(|t| *t < cut) {
             self.recent.pop_front();
         }
@@ -661,7 +658,7 @@ impl Paper {
 
     /// Ордер принят (для частоты и счётчика).
     pub fn note_accepted(&mut self) {
-        self.recent.push_back(Instant::now());
+        self.recent.push_back(crate::infra::clock::now());
         self.accepted += 1;
     }
 
@@ -857,7 +854,7 @@ impl Paper {
             Ok(l) => l,
             Err(e) => return self.reject(e),
         };
-        self.recent.push_back(Instant::now());
+        self.recent.push_back(crate::infra::clock::now());
         self.accepted += 1;
         let id = self.next_id;
         self.next_id += 1;
@@ -949,21 +946,59 @@ impl Paper {
 
     /// Исполнить стоящие заявки, через которые прошла цена (как мейкер, по цене заявки).
     pub fn match_resting(&mut self, symbol: &str, book: &Book, lim: &Limits) {
+        self.match_book(symbol, book, lim, false);
+    }
+
+    /// По стакану: заявка исполняется, когда противоположная лучшая цена дошла до её цены (strict — прошла сквозь:
+    /// бэктест без места в очереди — на уровне заявки стоят раньше нас).
+    pub fn match_book(&mut self, symbol: &str, book: &Book, lim: &Limits, strict: bool) {
         let (Some((bid, _)), Some((ask, _))) = (book.best_bid(), book.best_ask()) else {
             return;
         };
+        self.match_where(symbol, (bid + ask) / 2.0, lim, |side, price| {
+            match (side, strict) {
+                (Side::Buy, false) => ask <= price,
+                (Side::Buy, true) => ask < price,
+                (Side::Sell, false) => bid >= price,
+                (Side::Sell, true) => bid > price,
+            }
+        });
+    }
+
+    /// По сделке рынка (бэктест): продавец-агрессор по цене px исполняет заявки на покупку не ниже px, покупатель —
+    /// заявки на продажу не выше px; strict — только когда сделка прошла сквозь цену заявки.
+    pub fn match_trade(
+        &mut self,
+        symbol: &str,
+        px: f64,
+        buy: bool,
+        mid: f64,
+        lim: &Limits,
+        strict: bool,
+    ) {
+        self.match_where(symbol, mid, lim, |side, price| match (side, buy, strict) {
+            (Side::Buy, false, false) => px <= price,
+            (Side::Buy, false, true) => px < price,
+            (Side::Sell, true, false) => px >= price,
+            (Side::Sell, true, true) => px > price,
+            _ => false,
+        });
+    }
+
+    fn match_where(
+        &mut self,
+        symbol: &str,
+        mid: f64,
+        lim: &Limits,
+        hit: impl Fn(Side, f64) -> bool,
+    ) {
         let Some((base, quote)) = split(symbol) else {
             return;
         };
         let mut i = 0;
         while i < self.orders.len() {
             let o = &self.orders[i];
-            let hit = o.symbol == symbol
-                && match o.side {
-                    Side::Buy => ask <= o.price,
-                    Side::Sell => bid >= o.price,
-                };
-            if !hit {
+            if !(o.symbol == symbol && hit(o.side, o.price)) {
                 i += 1;
                 continue;
             }
@@ -982,7 +1017,7 @@ impl Paper {
             }
         }
         if self.leverage.is_some() {
-            self.check_liquidation(symbol, (bid + ask) / 2.0);
+            self.check_liquidation(symbol, mid);
         }
         self.check_loss(lim);
     }

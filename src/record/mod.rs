@@ -118,7 +118,7 @@ pub fn enabled() -> bool {
 
 /// Положить событие в очередь (не ждёт).
 pub fn push(ev: Event) {
-    if !enabled() {
+    if !enabled() || crate::infra::clock::simulated() {
         return;
     }
     let Some(s) = SHARED.get() else { return };

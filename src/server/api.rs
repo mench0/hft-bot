@@ -179,6 +179,7 @@ pub fn router(bot: Arc<Bot>, cfg: AdminConfig) -> Router {
             .route("/settings", get(settings).post(settings_update))
             .route("/research/status", get(research_status))
             .route("/research/report", get(research_report))
+            .route("/research/backtest", axum::routing::post(research_backtest))
             .route(
                 "/exchange/params/schema",
                 get(|| async { Json(Value::Object(data::exchange_schema().clone())) }),
@@ -966,6 +967,75 @@ async fn research_report(State(a): State<App>, Query(q): Q) -> Result<Json<Value
     .map_err(|e| bad(e.to_string()))?
     .map_err(bad)?;
     Ok(Json(v))
+}
+
+/// Бэктест сбора спреда на записи: параметры биржи из бота плюс переопределения set=ключ=значение,…
+/// Один прогон за раз (отдельный поток), чтобы не отнимать процессор у торговли.
+async fn research_backtest(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiError> {
+    static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let day = need(&q, "day")?.to_owned();
+    let ex = need(&q, "exchange")?.to_lowercase();
+    let symbols: Vec<String> = need(&q, "symbols")?
+        .split(',')
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let hours = q
+        .get("hours")
+        .filter(|h| !h.trim().is_empty())
+        .and_then(|h| {
+            let (x, y) = h.split_once('-').unwrap_or((h, h));
+            Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+        });
+    let fill = crate::backtest::Fill::parse(q.get("fill").map_or("trade", String::as_str))
+        .ok_or_else(|| bad("fill: touch, trade или through"))?;
+    let mut params = a.bot.params(&ex);
+    for kv in q
+        .get("set")
+        .map_or("", String::as_str)
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+    {
+        let (k, v) = kv
+            .split_once('=')
+            .ok_or_else(|| bad(format!("set: {kv} — нужно ключ=значение")))?;
+        params.insert(k.trim().to_owned(), crate::infra::data::typed(v.trim()));
+    }
+    let dir = a
+        .bot
+        .settings()
+        .get("recordDir")
+        .and_then(Value::as_str)
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or("data/rec")
+        .to_owned();
+    let (maker, taker) = crate::backtest::fees(&ex);
+    let cfg = crate::backtest::Config {
+        exchange: ex,
+        symbols,
+        start_balance: params
+            .get("paperStartBalance")
+            .and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse().ok()))
+            .unwrap_or(1000.0),
+        params,
+        latency_ms: q
+            .get("latencyMs")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50),
+        fill,
+        maker_pct: maker,
+        taker_pct: taker,
+    };
+    if BUSY.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Err(bad("Бэктест уже идёт — дождитесь окончания"));
+    }
+    let r = tokio::task::spawn_blocking(move || {
+        crate::backtest::load(std::path::Path::new(&dir), &day, hours)
+            .map(|recs| crate::backtest::run(recs, &cfg))
+    })
+    .await;
+    BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
+    Ok(Json(r.map_err(|e| bad(e.to_string()))?.map_err(bad)?))
 }
 
 async fn settings_update(State(a): State<App>, Query(q): Q) -> Result<Json<Value>, ApiError> {
